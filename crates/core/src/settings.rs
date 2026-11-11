@@ -31,11 +31,13 @@ pub struct Settings {
     pub proxy: String,
     /// Changed shortcuts by id; an empty key means the shortcut is removed.
     pub shortcuts: BTreeMap<String, String>,
+    /// How wide the reader made the detail panel, in logical pixels; 0 is the width it comes with.
+    pub detail_width: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { data_dir: String::new(), profiles: vec![], tasks: Tasks::default(), screen_workers: 3, translation_prompt: String::new(), auto_update: true, appearance: String::new(), density: String::new(), proxy: String::new(), shortcuts: BTreeMap::new() }
+        Settings { data_dir: String::new(), profiles: vec![], tasks: Tasks::default(), screen_workers: 3, translation_prompt: String::new(), auto_update: true, appearance: String::new(), density: String::new(), proxy: String::new(), shortcuts: BTreeMap::new(), detail_width: 0. }
     }
 }
 
@@ -173,6 +175,7 @@ impl Settings {
             if !self.profiles.iter().any(|p| p.id == self.tasks.get(task)) { self.tasks.set(task, "") }
         }
         self.screen_workers = self.screen_workers.clamp(1, MAX_SCREEN_WORKERS);
+        if !self.detail_width.is_finite() || self.detail_width < 0. { self.detail_width = 0. }
     }
 
     /// The first of `m1`, `m2`, … no profile has yet.

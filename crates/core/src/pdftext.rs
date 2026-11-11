@@ -9,7 +9,7 @@
 
 use hayro_interpret::font::{Glyph, GlyphRun};
 use hayro_interpret::hayro_cmap::BfString;
-use hayro_interpret::hayro_syntax::Pdf;
+use hayro_interpret::hayro_syntax::{DecryptionError, LoadPdfError, Pdf};
 use hayro_interpret::kurbo::{BezPath, Point, Rect};
 use hayro_interpret::{BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterCache, InterpreterSettings, SoftMask, TransformExt, interpret_page};
 
@@ -85,7 +85,11 @@ impl<'a> Device<'a> for Marks {
 /// parsed, or when too many of its glyphs name no character for the text
 /// to be trusted.
 pub fn pages(data: Vec<u8>) -> Result<Vec<String>, String> {
-    let pdf = Pdf::new(data).map_err(|err| format!("无法解析这个 PDF（{err:?}）。"))?;
+    let pdf = Pdf::new(data).map_err(|err| match err {
+        LoadPdfError::Decryption(DecryptionError::PasswordProtected) => crate::fulltext::LOCKED.to_string(),
+        LoadPdfError::Decryption(other) => format!("这个 PDF 加了密，用的方式这里解不开（{other:?}）。"),
+        LoadPdfError::Invalid => "无法解析这个 PDF 的结构。".to_string(),
+    })?;
     let cache = InterpreterCache::new();
     let mut out = vec![];
     let (mut read, mut unreadable) = (0, 0);
@@ -102,7 +106,7 @@ pub fn pages(data: Vec<u8>) -> Result<Vec<String>, String> {
         unreadable += marks.unreadable;
         out.push(page_text(&marks.marks));
     }
-    if unreadable > read { return Err("这个 PDF 的字体没有给出文字编码，无法提取文字。".into()) }
+    if unreadable > read { return Err(crate::fulltext::NO_ENCODING.into()) }
     Ok(out)
 }
 

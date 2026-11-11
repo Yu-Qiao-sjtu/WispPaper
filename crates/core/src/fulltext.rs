@@ -6,6 +6,53 @@ use std::path::Path;
 /// What one paper's text may occupy; a longer text is cut and says so.
 pub const MAX_TEXT_BYTES: usize = 8 << 20;
 
+/// Why a file gave no text, in the words kept with it and shown. Each
+/// says what was found and no more: a file the parsers stumble over is
+/// not thereby a scan, and a scan is not thereby locked.
+pub const LOCKED: &str = "这个 PDF 设了打开密码，读不了文字。去掉密码后重新添加即可。";
+pub const NO_ENCODING: &str = "这个 PDF 的字体没有给出文字编码，页面看得见字，却提取不出来。可以让能看图的模型读页面。";
+pub const NO_TEXT_LAYER: &str = "页面上没有文字层，多半是扫描件或图片。可以让能看图的模型读页面。";
+const PARSER: &str = "两种读取方式都解析不了这个 PDF。这是解析的问题，不说明它是扫描件或加了密：在别的阅读器里能选中文字的话，文字是有的。";
+
+/// What kind of failure a kept message tells of, for those who act on it
+/// (the window, an agent): `file` (it could not be opened), `locked`,
+/// `parser` (the readers could not make sense of it), `encoding` (text
+/// that cannot be told from its glyphs), `no_text` (nothing but pictures),
+/// `unsupported`. Messages kept by earlier builds are known too.
+pub fn failure_kind(message: &str) -> &'static str {
+    if message == LOCKED || message.starts_with("这个 PDF 加了密") {
+        "locked"
+    } else if message == NO_ENCODING {
+        "encoding"
+    } else if message == NO_TEXT_LAYER || message.starts_with("文件里没有可提取的文字") {
+        "no_text"
+    } else if message.starts_with("无法读取文件") {
+        "file"
+    } else if message.starts_with("不支持提取") {
+        "unsupported"
+    } else {
+        "parser"
+    }
+}
+
+/// A kept failure in a few words, for a list.
+pub fn failure_brief(message: &str) -> &'static str {
+    match failure_kind(message) {
+        "locked" => "有打开密码",
+        "encoding" => "字体没有文字编码",
+        "no_text" => "页面没有文字层",
+        "file" => "文件读不了",
+        "unsupported" => "不支持这种文件",
+        _ => "解析不了",
+    }
+}
+
+/// Whether a model that sees pictures could still read the file: the
+/// pages can be drawn, only their text cannot be had.
+pub fn readable_by_eye(message: &str) -> bool {
+    matches!(failure_kind(message), "encoding" | "no_text" | "parser")
+}
+
 /// The text of a file, page by page. A plain-text or Markdown file is one
 /// page. A PDF that cannot be read is an error, never an empty text: an
 /// answer should not silently rest on less than the reader thinks.
@@ -17,16 +64,20 @@ pub fn file_pages(path: &Path) -> Result<Vec<String>, String> {
             let bytes = std::fs::read(path).map_err(|e| format!("无法读取文件：{e}"))?;
             // Read off the glyphs first: that keeps the breaks the page shows. pdf-extract
             // is the second try; it panics on some files hayro reads, and reads some it does not.
-            let laid_out = std::panic::catch_unwind(|| crate::pdftext::pages(bytes.clone())).unwrap_or_else(|_| Err("PDF 结构异常，无法提取文字。".into()));
+            let laid_out = std::panic::catch_unwind(|| crate::pdftext::pages(bytes.clone())).unwrap_or_else(|_| Err(PARSER.into()));
             match laid_out {
                 Ok(pages) if pages.iter().any(|p| !p.trim().is_empty()) => pages.into_iter().map(|p| tidy(&p)).collect(),
+                // A password stops the second reader as well.
+                Err(locked) if failure_kind(&locked) == "locked" => return Err(locked),
                 first => {
-                    let plain = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes)).map_err(|_| "PDF 结构异常，无法提取文字。".to_string()).and_then(|pages| pages.map_err(|e| format!("无法提取 PDF 文字：{e}")));
+                    let plain = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes)).ok().and_then(Result::ok);
                     match (plain, first) {
-                        (Ok(pages), _) => pages.into_iter().map(|p| tidy(&p)).collect(),
-                        // Both read it and found no text: said below.
-                        (Err(_), Ok(pages)) => pages,
-                        (Err(error), Err(_)) => return Err(error),
+                        (Some(pages), _) => pages.into_iter().map(|p| tidy(&p)).collect(),
+                        // The first read it and found no text: said below.
+                        (None, Ok(pages)) => pages,
+                        // What the first reader found out is the more exact of the two.
+                        (None, Err(first)) if first == NO_ENCODING => return Err(first),
+                        (None, Err(_)) => return Err(PARSER.into()),
                     }
                 }
             }
@@ -34,7 +85,7 @@ pub fn file_pages(path: &Path) -> Result<Vec<String>, String> {
         other => return Err(format!("不支持提取 .{other} 文件的文字。")),
     };
     if pages.iter().all(|p| p.trim().is_empty()) {
-        return Err("文件里没有可提取的文字（可能是扫描件）。".into());
+        return Err(NO_TEXT_LAYER.into());
     }
     let mut total = 0;
     let mut kept = vec![];
@@ -203,8 +254,16 @@ mod tests {
         assert_eq!(file_pages(&txt).unwrap(), ["hello\nworld"]);
         let bad = dir.join("bad.pdf");
         std::fs::write(&bad, "not a pdf").unwrap();
-        assert!(file_pages(&bad).is_err());
-        assert!(file_pages(&dir.join("x.docx")).is_err());
+        // Neither reader makes sense of it: a parsing failure, which is not called a scan.
+        let failure = file_pages(&bad).unwrap_err();
+        assert_eq!((failure_kind(&failure), readable_by_eye(&failure)), ("parser", true));
+        assert!(!failure.contains("可能是扫描件"));
+        assert_eq!(failure_kind(&file_pages(&dir.join("x.docx")).unwrap_err()), "unsupported");
+        assert_eq!(failure_kind(&file_pages(&dir.join("gone.pdf")).unwrap_err()), "file");
+        assert_eq!((failure_kind(LOCKED), readable_by_eye(LOCKED), failure_brief(LOCKED)), ("locked", false, "有打开密码"));
+        assert_eq!((failure_kind(NO_ENCODING), failure_kind(NO_TEXT_LAYER)), ("encoding", "no_text"));
+        // What earlier builds kept.
+        assert_eq!((failure_kind("文件里没有可提取的文字（可能是扫描件）。"), failure_kind("PDF 结构异常，无法提取文字。")), ("no_text", "parser"));
         std::fs::remove_dir_all(dir).ok();
     }
 

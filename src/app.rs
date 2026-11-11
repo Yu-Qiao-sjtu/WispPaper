@@ -3,7 +3,7 @@
 //! by `run`, and the other modules render parts of it.
 
 use crate::input::{InputEvent, TextInput};
-use crate::pdf::PdfView;
+use crate::pdf::{PdfView, Zoom, ZoomTo};
 use crate::settings::{SettingsPage, SettingsView, UpdateState};
 use crate::shortcuts::{self, Dismiss};
 use crate::theme;
@@ -76,6 +76,8 @@ pub enum MenuKind {
     LibraryCard(String),
     /// Which model a task uses (设置 › AI).
     TaskModel(Task),
+    /// How large the PDF's pages are drawn.
+    PdfZoom,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +122,14 @@ pub enum Cmd {
     AddManual,
     ImportReferences,
     ImportPdfs,
+    /// Show what came of each file of the last import.
+    ShowImport,
+    /// Put the report of the last import away.
+    CloseImport,
+    /// List the papers whose PDF gave no text.
+    ShowTextless,
+    /// Open a paper named in the import's report.
+    OpenImported(String),
     // The list
     SetView(View),
     SetPage(Page),
@@ -142,8 +152,14 @@ pub enum Cmd {
     AttachPdf(String),
     OpenFile(String),
     RemoveFile(String),
+    /// Try once more to get the text of a stored file.
+    RereadFile(String),
+    /// Have a model that sees pictures read the pages of a file that gave no text.
+    ReadPages(String),
     SetTab(Tab),
     ToggleWide,
+    /// Draw the pages of the PDF on show larger, smaller, or at a given size.
+    PdfZoom(ZoomTo),
     /// Show the selected paper's title and abstract translated, or stop showing it.
     ToggleTranslation,
     RetryTranslation,
@@ -177,6 +193,8 @@ pub enum Cmd {
     /// Unfold or fold the tool calls that start at this place in the conversation.
     ToggleTools(bool, usize),
     CopyText(String),
+    /// Make a note of the selected paper out of an answer about it: the question, and the answer.
+    AnswerToNote(String, String),
     /// Show every source of an answer (by its place in the conversation), or the first few again.
     ToggleSources(bool, usize),
     /// Open a paper; with a page, its PDF there; with a quoted sentence too, that sentence highlighted.
@@ -444,6 +462,73 @@ pub struct PendingTools {
     first: usize,
 }
 
+/// The PDFs of an import read at the same time.
+const IMPORT_WORKERS: usize = 3;
+
+/// What became of one PDF of an import.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Imported {
+    Added,
+    /// The library already held its paper: the file was attached to that.
+    Attached,
+    /// Its paper is in the trash: nothing was imported.
+    InTrash,
+    Failed(String),
+}
+
+pub struct ImportRow {
+    /// The file's name.
+    pub name: String,
+    pub outcome: Imported,
+    pub paper_id: Option<String>,
+    /// No DOI was found in the file: its title and authors are still to be filled in.
+    pub unrecognised: bool,
+    /// Why no text came of the file; empty when it did.
+    pub textless: String,
+}
+
+impl ImportRow {
+    /// Whether the person still has something to do about this file.
+    pub fn open(&self) -> bool {
+        self.unrecognised || !self.textless.is_empty() || matches!(self.outcome, Imported::Failed(_) | Imported::InTrash)
+    }
+}
+
+/// The PDFs dropped or picked in one go (more dropped meanwhile join it):
+/// how far the reading is, then what came of each, until it is put away.
+#[derive(Default)]
+pub struct ImportRun {
+    pub total: usize,
+    /// The file being read.
+    pub current: String,
+    pub rows: Vec<ImportRow>,
+}
+
+impl ImportRun {
+    pub fn running(&self) -> bool {
+        self.rows.len() < self.total
+    }
+
+    /// How many files came to this.
+    pub fn count(&self, of: impl Fn(&ImportRow) -> bool) -> usize {
+        self.rows.iter().filter(|row| of(row)).count()
+    }
+
+    /// What came of the files, in a line: 「新增 15 · 附到已有文献 3」.
+    pub fn summary(&self) -> String {
+        let mut facts = vec![];
+        for (n, text) in [
+            (self.count(|row| row.outcome == Imported::Added), "新增"),
+            (self.count(|row| row.outcome == Imported::Attached), "附到已有文献"),
+            (self.count(|row| row.outcome == Imported::InTrash), "在回收站里、未导入"),
+            (self.count(|row| matches!(row.outcome, Imported::Failed(_))), "没有成功"),
+        ] {
+            if n > 0 { facts.push(format!("{text} {n}")) }
+        }
+        facts.join(" · ")
+    }
+}
+
 /// One conversation: with the library (the current list) or with one paper.
 pub struct Chat {
     pub input: Entity<TextInput>,
@@ -468,6 +553,8 @@ pub struct Chat {
     pub generation: u64,
     /// The conversation in the library's history this is; empty until a question was asked.
     pub id: String,
+    /// The conversation as it stands is in the library's history.
+    kept: bool,
     created_at: String,
     /// What the labels of a conversation taken up again name, until its context is built anew.
     known: Vec<ai::Source>,
@@ -519,6 +606,10 @@ pub enum Modal {
     Fields { editing: Option<String>, name: Entity<TextInput>, options: Entity<TextInput>, kind: FieldKind, in_table: bool },
     Search { editing: Option<String>, kind: String, name: Entity<TextInput>, query: Entity<TextInput>, max: Entity<TextInput> },
     Confirm { title: String, message: String, action: String, cmd: Cmd },
+    /// What came of each PDF of the last import (`Library::import`).
+    ImportReport,
+    /// An answer about a paper, to be looked over before it joins that paper's notes.
+    Note { paper_id: String, text: Entity<TextInput> },
 }
 
 pub struct Library {
@@ -539,6 +630,8 @@ pub struct Library {
     pub wide: bool,
     pub notes: Entity<TextInput>,
     pub pdf: Option<Entity<PdfView>>,
+    /// How large PDF pages are drawn; it stays from paper to paper.
+    pub zoom: Zoom,
     pub library_chat: Chat,
     pub paper_chat: Chat,
     pub table_scroll: UniformListScrollHandle,
@@ -561,8 +654,8 @@ pub struct Library {
     pub trial: Option<(String, Option<Result<Value, String>>)>,
     /// Searches being run right now.
     pub running: HashSet<String>,
-    /// How many dropped or picked files are still being read.
-    pub importing: usize,
+    /// The PDFs being read in, or what came of the last lot until it is put away.
+    pub import: Option<ImportRun>,
     pub writing: Writing,
     _subscriptions: Vec<Subscription>,
 }
@@ -585,6 +678,8 @@ pub struct Workspace {
     pub menu: Option<Menu>,
     pub toast: Option<Toast>,
     pub home_scroll: ScrollHandle,
+    /// The edge between the list and the detail panel is being dragged.
+    pub resizing: bool,
 }
 
 impl Chat {
@@ -609,6 +704,7 @@ impl Chat {
             sources_open: Default::default(),
             generation: 0,
             id: String::new(),
+            kept: false,
             created_at: String::new(),
             known: vec![],
             stored_images: Default::default(),
@@ -691,6 +787,7 @@ impl Chat {
         self.sources_open.clear();
         self.generation += 1;
         self.id.clear();
+        self.kept = false;
         self.created_at.clear();
         self.known.clear();
         self.stored_images.clear();
@@ -766,6 +863,14 @@ impl Library {
         (queue.into_iter().filter(|p| self.screen_group(&p.id) == filter).collect(), filter)
     }
 
+    /// A full text was read that could not be before: the next question
+    /// is given the library as it is now. An answer on its way keeps what it has.
+    fn texts_changed(&mut self) {
+        for chat in [&mut self.paper_chat, &mut self.library_chat] {
+            if !chat.busy { chat.forget_context() }
+        }
+    }
+
     pub fn refilter(&mut self) {
         self.shown = filter::filter_papers(&self.papers, &self.filters, time::now_millis());
     }
@@ -808,7 +913,7 @@ impl Workspace {
         theme::set_accent("blue");
         shortcuts::rebuild(&settings.shortcuts, cx);
         let libraries = libraries::list(&root);
-        let mut this = Workspace { focus, settings, settings_path, root, libraries, lib: None, settings_view: None, update: UpdateState::Idle, update_told: None, modal: None, modal_error: String::new(), modal_subscriptions: vec![], menu: None, toast, home_scroll: ScrollHandle::new() };
+        let mut this = Workspace { focus, settings, settings_path, root, libraries, lib: None, settings_view: None, update: UpdateState::Idle, update_told: None, modal: None, modal_error: String::new(), modal_subscriptions: vec![], menu: None, toast, home_scroll: ScrollHandle::new(), resizing: false };
         this.apply_appearance(window);
         cx.observe_window_appearance(window, |this, window, _| this.apply_appearance(window)).detach();
         this.watch_updates(cx);
@@ -891,6 +996,14 @@ impl Workspace {
                 items.push(item("打开", Cmd::OpenLibrary(id.clone())));
                 items.push(item("编辑名称与主题…", Cmd::EditLibrary(id.clone())));
                 items.push(item("移除文献库…", Cmd::AskRemoveLibrary(id)));
+            }
+            MenuKind::PdfZoom => {
+                let Some(current) = self.lib.as_ref().and_then(|lib| lib.pdf.as_ref()).map(|pdf| pdf.read(cx).zoom()) else { return };
+                let fits = [("适应宽度", Zoom::FitWidth), ("适应整页", Zoom::FitPage)].map(|(label, zoom)| (label.to_string(), zoom));
+                let sizes = [50., 75., 100., 125., 150., 200., 300., 400.].map(|percent| (if percent == 100. { "100%（实际大小）".to_string() } else { format!("{percent}%") }, Zoom::Percent(percent)));
+                for (label, zoom) in fits.into_iter().chain(sizes) {
+                    items.push(MenuItem { label: label.into(), checked: current == zoom, note: None, cmd: Cmd::PdfZoom(ZoomTo::Set(zoom)) });
+                }
             }
             MenuKind::Sort => {
                 let Some(lib) = &self.lib else { return };
@@ -1053,6 +1166,29 @@ impl Workspace {
             Cmd::EditPaper(id) => self.paper_dialog(Some(id), window, cx),
             Cmd::ImportReferences => self.pick_files("导入", false, cx),
             Cmd::ImportPdfs => self.pick_files("导入", true, cx),
+            Cmd::ShowImport => {
+                self.modal_subscriptions.clear();
+                self.modal_error.clear();
+                self.modal = Some(Modal::ImportReport);
+            }
+            Cmd::CloseImport => {
+                if let Some(lib) = self.lib.as_mut() && lib.import.as_ref().is_some_and(|run| !run.running()) { lib.import = None }
+                if matches!(self.modal, Some(Modal::ImportReport)) { self.run(Cmd::CloseModal, window, cx) }
+            }
+            Cmd::OpenImported(id) => {
+                self.run(Cmd::CloseModal, window, cx);
+                if let Some(lib) = self.lib.as_mut() && matches!(lib.page, Page::Trash | Page::Sources | Page::Guide) { lib.page = Page::Papers }
+                self.select(Some(id), window, cx);
+            }
+            Cmd::ShowTextless => {
+                if matches!(self.modal, Some(Modal::ImportReport)) { self.run(Cmd::CloseModal, window, cx) }
+                if let Some(lib) = self.lib.as_mut() {
+                    lib.filters = Filters { fulltext: "textless".into(), ..Default::default() };
+                    lib.search.update(cx, |input, cx| input.set_text("", cx));
+                    lib.page = Page::Papers;
+                    lib.refilter();
+                }
+            }
 
             Cmd::SetView(view) => {
                 if let Some(lib) = self.lib.as_mut() {
@@ -1093,7 +1229,7 @@ impl Workspace {
                     lib.writing.editor.read(cx).focus(window);
                 }
             }
-            Cmd::WriteRun(reading) => self.write_run_start(reading, cx),
+            Cmd::WriteRun(reading) => self.write_run_start(reading, None, cx),
             Cmd::WriteStop => {
                 if let Some(lib) = self.lib.as_mut() {
                     let sorting = &mut lib.writing.sorting;
@@ -1179,6 +1315,8 @@ impl Workspace {
                     self.say("附件已移除（文件移到了 removed 文件夹）。", cx);
                 }
             }
+            Cmd::RereadFile(id) => self.reread_file(id, cx),
+            Cmd::ReadPages(id) => self.write_run_start(true, Some(id), cx),
             Cmd::SetTab(tab) => {
                 if let Some(lib) = self.lib.as_mut() {
                     lib.tab = tab;
@@ -1188,6 +1326,9 @@ impl Workspace {
             }
             Cmd::ToggleWide => {
                 if let Some(lib) = self.lib.as_mut() { lib.wide = !lib.wide }
+            }
+            Cmd::PdfZoom(to) => {
+                if let Some(pdf) = self.lib.as_ref().filter(|lib| lib.tab == Tab::Pdf).and_then(|lib| lib.pdf.clone()) { pdf.update(cx, |pdf, cx| pdf.zoom_to(to, cx)) }
             }
             Cmd::ToggleTranslation => {
                 if let Some(lib) = self.lib.as_mut() { lib.show_translation = !lib.show_translation }
@@ -1233,11 +1374,16 @@ impl Workspace {
             Cmd::NewChat(paper) => {
                 // An answer still arriving is stopped first, so that what there is of it is kept.
                 self.stop_chat(paper, cx);
+                // A conversation whose last save failed is tried once more; if that fails too, it says so itself.
+                if self.lib.as_ref().is_some_and(|lib| !lib.chat(paper).kept) { self.save_chat(paper, cx) }
+                let mut kept = false;
                 if let Some(lib) = self.lib.as_mut() {
                     let chat = if paper { &mut lib.paper_chat } else { &mut lib.library_chat };
+                    kept = chat.kept;
                     chat.reset(cx);
                     chat.input.read(cx).focus(window);
                 }
+                if kept { self.say("上一段对话已保存，在「历史」里可以找到。", cx) }
             }
             Cmd::StopChat(paper) => self.stop_chat(paper, cx),
             Cmd::ToggleHistory(paper) => {
@@ -1317,6 +1463,16 @@ impl Workspace {
             Cmd::CopyText(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.say("已复制", cx);
+            }
+            Cmd::AnswerToNote(question, answer) => {
+                let Some(lib) = self.lib.as_ref() else { return };
+                let Some(paper_id) = lib.selected.clone() else { return };
+                let note = ai::note_from_answer(&question, &answer, lib.paper_chat.sources(), &paper_id, &time::date_text(&time::now_iso()));
+                self.modal_subscriptions.clear();
+                self.modal_error.clear();
+                let text = cx.new(|cx| TextInput::new("要记下的内容", cx).multiline(8).with_text(&note));
+                text.read(cx).focus(window);
+                self.modal = Some(Modal::Note { paper_id, text });
             }
             Cmd::ToggleSources(paper, at) => {
                 if let Some(lib) = self.lib.as_mut() {
@@ -1571,6 +1727,10 @@ impl Workspace {
             "import-pdf" => Cmd::ImportPdfs,
             "ask" => Cmd::SetPage(Page::Ask),
             "detail" if self.lib.as_ref().is_some_and(|l| l.selected.is_some()) => Cmd::ToggleWide,
+            // The PDF's size, while a PDF is on show.
+            "zoom-in" => Cmd::PdfZoom(ZoomTo::In),
+            "zoom-out" => Cmd::PdfZoom(ZoomTo::Out),
+            "zoom-fit" => Cmd::PdfZoom(ZoomTo::Set(Zoom::FitWidth)),
             _ => return,
         };
         self.run(cmd, window, cx);
@@ -1646,6 +1806,7 @@ impl Workspace {
             wide: false,
             notes,
             pdf: None,
+            zoom: Zoom::FitWidth,
             library_chat,
             paper_chat,
             table_scroll: UniformListScrollHandle::new(),
@@ -1660,7 +1821,7 @@ impl Workspace {
             batches: vec![],
             trial: None,
             running: HashSet::new(),
-            importing: 0,
+            import: None,
             writing,
             _subscriptions: subscriptions,
         };
@@ -1759,7 +1920,8 @@ impl Workspace {
         let Some(lib) = self.lib.as_mut() else { return };
         if lib.tab != Tab::Pdf || lib.pdf.is_some() { return }
         let Some(path) = lib.selected.as_deref().and_then(|id| lib.pdf_file(id)).map(|f| lib.store.file_path(f)) else { return };
-        lib.pdf = Some(cx.new(|cx| PdfView::new(&path, cx)));
+        let zoom = lib.zoom;
+        lib.pdf = Some(cx.new(|cx| PdfView::new(&path, zoom, cx)));
     }
 
     /// Change one paper and save it.
@@ -1845,42 +2007,63 @@ impl Workspace {
             self.say(format!("导入 {} 篇{}。", added.len(), if skipped > 0 { format!("，跳过 {skipped} 篇已有的") } else { String::new() }), cx);
         }
         if pdfs.is_empty() { return }
-        if let Some(lib) = self.lib.as_mut() { lib.importing += pdfs.len() }
-        let library = self.lib.as_ref().map(|l| l.info.id.clone()).unwrap_or_default();
-        cx.spawn(async move |this, cx| {
-            for path in pdfs {
-                // Read the text, look for a DOI on the first pages, and ask Crossref about it.
-                let file = path.clone();
-                let (pages, found) = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let pages = fulltext::file_pages(&file);
-                        let doi = pages.as_ref().ok().and_then(|pages| lookup::find_doi(&pages.iter().take(2).cloned().collect::<Vec<_>>().join("\n")));
-                        let found = doi.and_then(|doi| wisp_net::lookup_paper(&Identifier::Doi(doi)).ok());
-                        (pages, found)
-                    })
-                    .await;
-                let done = this.update(cx, |this, cx| {
-                    if this.lib.as_ref().is_none_or(|l| l.info.id != library) { return false }
-                    this.add_pdf(&path, pages, found, cx);
-                    true
-                });
-                if !matches!(done, Ok(true)) { break }
-            }
-        })
-        .detach();
+        let Some(lib) = self.lib.as_mut() else { return };
+        // More files while some are still being read join them; a report already read gives way.
+        match lib.import.as_mut().filter(|run| run.running()) {
+            Some(run) => run.total += pdfs.len(),
+            None => lib.import = Some(ImportRun { total: pdfs.len(), ..Default::default() }),
+        }
+        let library = lib.info.id.clone();
+        cx.notify();
+        // Most of the wait is the two services asked about each DOI: a few files are read side by side.
+        let queue = std::rc::Rc::new(std::cell::RefCell::new(pdfs.into_iter().rev().collect::<Vec<_>>()));
+        for _ in 0..IMPORT_WORKERS.min(queue.borrow().len()) {
+            let (queue, library) = (queue.clone(), library.clone());
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let Some(path) = queue.borrow_mut().pop() else { break };
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let known = this.update(cx, |this, cx| {
+                        let Some(run) = this.lib.as_mut().filter(|l| l.info.id == library).and_then(|l| l.import.as_mut()) else { return false };
+                        run.current = name;
+                        cx.notify();
+                        true
+                    });
+                    if !matches!(known, Ok(true)) { break }
+                    // Read the text, look for a DOI on the first pages, and ask Crossref about it.
+                    let file = path.clone();
+                    let (pages, found) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let pages = fulltext::file_pages(&file);
+                            let doi = pages.as_ref().ok().and_then(|pages| lookup::find_doi(&pages.iter().take(2).cloned().collect::<Vec<_>>().join("\n")));
+                            let found = doi.and_then(|doi| wisp_net::lookup_paper(&Identifier::Doi(doi)).ok());
+                            (pages, found)
+                        })
+                        .await;
+                    let done = this.update(cx, |this, cx| {
+                        if this.lib.as_ref().is_none_or(|l| l.info.id != library) { return false }
+                        this.add_pdf(&path, pages, found, cx);
+                        true
+                    });
+                    if !matches!(done, Ok(true)) { break }
+                }
+            })
+            .detach();
+        }
     }
 
     /// One read PDF: a new paper with the file attached, or the file attached
-    /// to the paper the library already holds for its DOI.
+    /// to the paper the library already holds for its DOI. What came of it
+    /// joins the import's report; a single file says so at once instead.
     fn add_pdf(&mut self, path: &std::path::Path, pages: Result<Vec<String>, String>, found: Option<Paper>, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut() else { return };
         let stem = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "未命名文献".into());
         let recognised = found.is_some();
         let mut paper = found.unwrap_or_else(|| Paper { title: stem.clone(), ..Default::default() });
         paper.source = "PDF 导入".into();
-        let mut outcome = String::new();
-        let mut selected = None;
-        self.change(cx, |lib| {
+        let mut row = ImportRow { name: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| stem.clone()), outcome: Imported::Added, paper_id: None, unrecognised: false, textless: String::new() };
+        let stored = (|| -> anyhow::Result<()> {
             let target = match lib.store.existing_paper(&{
                 let mut probe = paper.clone();
                 probe.normalize();
@@ -1888,33 +2071,86 @@ impl Workspace {
             })? {
                 Some(existing) => {
                     if lib.trash.iter().any(|t| t.paper.id == existing) {
-                        outcome = format!("「{stem}」对应的文献在回收站中，未导入。");
+                        row.outcome = Imported::InTrash;
                         return Ok(());
                     }
-                    outcome = format!("「{stem}」已在文献库中，PDF 已附到原条目。");
+                    row.outcome = Imported::Attached;
                     existing
                 }
                 None => {
-                    let added = lib.store.add_paper(paper)?;
-                    outcome = if recognised { format!("已添加：{}", added.title) } else { format!("已添加「{stem}」。没有识别出 DOI，请补全题目和作者。") };
-                    added.id
+                    row.unrecognised = !recognised;
+                    lib.store.add_paper(paper)?.id
                 }
             };
             let kind = if lib.store.paper_files(&target)?.iter().any(|f| f.kind == "fulltext") { "supplement" } else { "fulltext" };
             let file = lib.store.import_file(&target, path, kind)?;
             if lib.store.needs_structure(&file.id)? { lib.store.save_fulltext_pages(&file.id, &pages)? }
-            selected = Some(target);
+            // A supplement without text takes nothing from the questions: the paper's own text is there.
+            if kind == "fulltext" && let Err(reason) = &pages { row.textless = reason.clone() }
+            row.paper_id = Some(target);
             Ok(())
-        });
-        if let Some(lib) = self.lib.as_mut() {
-            lib.importing = lib.importing.saturating_sub(1);
-            if let Some(id) = selected && lib.importing == 0 && lib.selected.is_none() {
+        })()
+        .and_then(|()| lib.reload());
+        if let Err(err) = stored { row.outcome = Imported::Failed(format!("{err:#}")) }
+        let title = row.paper_id.as_deref().and_then(|id| lib.paper(id)).map(|p| p.title.clone()).unwrap_or_default();
+        let said = match &row.outcome {
+            Imported::Added if row.unrecognised => format!("已添加「{stem}」。没有识别出 DOI，请补全题目和作者。"),
+            Imported::Added => format!("已添加：{title}"),
+            Imported::Attached => format!("「{stem}」已在文献库中，PDF 已附到原条目。"),
+            Imported::InTrash => format!("「{stem}」对应的文献在回收站中，未导入。"),
+            Imported::Failed(err) => format!("「{stem}」没有导入：{err}"),
+        };
+        let said = if row.textless.is_empty() { said } else { format!("{said} 但没有读出文字（{}），全文暂时不能用于提问。", fulltext::failure_brief(&row.textless)) };
+        let failed = matches!(row.outcome, Imported::Failed(_));
+        let Some(run) = lib.import.as_mut() else { return };
+        run.rows.push(row);
+        let (single, finished) = (run.total == 1, !run.running());
+        if finished {
+            run.current.clear();
+            // The paper the last file became is opened when nothing else is.
+            if let Some(id) = run.rows.iter().rev().find_map(|row| row.paper_id.clone()) && lib.selected.is_none() {
                 lib.selected = Some(id);
                 let notes = lib.selected_paper().map(|p| p.notes.clone()).unwrap_or_default();
                 lib.notes.update(cx, |input, cx| input.set_text(&notes, cx));
             }
         }
-        if !outcome.is_empty() { self.say(outcome, cx) }
+        // One file is one sentence; several are a report that stays until it is read.
+        if single {
+            lib.import = None;
+            if failed { self.fail(said, cx) } else { self.say(said, cx) }
+        }
+        cx.notify();
+    }
+
+    /// Try once more to get the text of a stored file: after the reader has
+    /// improved, or the file was put right outside the app.
+    fn reread_file(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut() else { return };
+        let Some(file) = lib.files.iter().find(|f| f.id == id) else { return };
+        if !lib.extracting.insert(id.clone()) { return }
+        let (library, path) = (lib.info.id.clone(), lib.store.file_path(file));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let pages = cx.background_executor().spawn(async move { fulltext::file_pages(&path) }).await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library) else { return };
+                lib.extracting.remove(&id);
+                let said = match &pages {
+                    Ok(pages) => Ok(format!("读出了 {} 页文字，现在可以用于提问。", pages.len())),
+                    Err(reason) => Err(format!("还是没有读出文字：{reason}")),
+                };
+                let kept = lib.store.save_fulltext_pages(&id, &pages).and_then(|()| lib.reload());
+                lib.texts_changed();
+                match (kept, said) {
+                    (Err(err), _) => this.fail(format!("{err:#}"), cx),
+                    (Ok(()), Ok(said)) => this.say(said, cx),
+                    (Ok(()), Err(said)) => this.fail(said, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Read the text of the stored full texts that have not been read and
@@ -1940,7 +2176,8 @@ impl Workspace {
                     let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library) else { return false };
                     lib.extracting.remove(&id);
                     let _ = lib.store.save_fulltext_pages(&id, &pages);
-                    lib.writing.structures = lib.store.structures().unwrap_or_default();
+                    // Whether a text came of it shows in the list.
+                    let _ = lib.reload();
                     // The candidates on show were found without this paper.
                     if lib.extracting.is_empty() {
                         lib.writing.asked = None;
@@ -2399,6 +2636,7 @@ impl Workspace {
         });
         chat.stored_images.extend(kept);
         (chat.id, chat.created_at) = (conversation.id, conversation.created_at);
+        chat.kept = result.is_ok();
         if let Err(err) = result { self.fail(format!("这次对话没能保存：{err:#}"), cx) }
     }
 
@@ -2433,6 +2671,7 @@ impl Workspace {
         }
         chat.known = conversation.transcript.sources;
         (chat.id, chat.created_at) = (conversation.id, conversation.created_at);
+        chat.kept = true;
         chat.scroll = ScrollHandle::new();
         chat.scroll.scroll_to_bottom();
         cx.notify();
@@ -2790,7 +3029,7 @@ impl Workspace {
 
     /// Start the model on the full texts: sorting those the rules sorted
     /// into parts, or reading the pages of those that gave no text.
-    fn write_run_start(&mut self, reading: bool, cx: &mut Context<Self>) {
+    fn write_run_start(&mut self, reading: bool, only: Option<String>, cx: &mut Context<Self>) {
         let profile = self.settings.profile_for_or_default(Task::Structure);
         let workers = self.settings.screen_workers;
         let Some(lib) = self.lib.as_mut() else { return };
@@ -2801,7 +3040,7 @@ impl Workspace {
             return cx.notify();
         }
         // Pages to look at: only a PDF has them. Parts to sort: the texts the rules had to guess at.
-        let mut todo: Vec<String> = lib.writing.structures.iter().filter(|(id, info)| if reading { info.method == "none" && lib.files.iter().any(|f| f.id == **id && f.format == "pdf") } else { info.method == "rules" && info.open >= structure::OPEN_ENOUGH }).map(|(id, _)| id.clone()).collect();
+        let mut todo: Vec<String> = lib.writing.structures.iter().filter(|(id, _)| only.as_ref().is_none_or(|only| only == *id)).filter(|(id, info)| if reading { info.method == "none" && lib.files.iter().any(|f| f.id == **id && f.format == "pdf") } else { info.method == "rules" && info.open >= structure::OPEN_ENOUGH }).map(|(id, _)| id.clone()).collect();
         if todo.is_empty() { return }
         todo.reverse();
         let sorting = &mut lib.writing.sorting;
@@ -2868,7 +3107,9 @@ impl Workspace {
                 match saved {
                     Ok(()) => {
                         sorting.streak = 0;
-                        lib.writing.structures = lib.store.structures().unwrap_or_default();
+                        // A paper whose pages were read has a text now, and says so in the list.
+                        let _ = lib.reload();
+                        lib.texts_changed();
                         lib.writing.asked = None;
                         this.write_run_next(run, cx);
                         this.writing_changed(cx);
@@ -2925,6 +3166,7 @@ impl Workspace {
                 let cmd = cmd.clone();
                 self.run(cmd, window, cx);
             }
+            Modal::ImportReport => self.run(Cmd::CloseImport, window, cx),
             Modal::Library { editing, name, topic, color } => {
                 let (name, topic, color) = (text(name, cx), text(topic, cx), color.clone());
                 let mut created = None;
@@ -2957,6 +3199,24 @@ impl Workspace {
                     }
                     Err(err) => self.modal_error = format!("{err:#}"),
                 }
+            }
+            Modal::Note { paper_id, text: input } => {
+                let (paper_id, note) = (paper_id.clone(), text(input, cx));
+                if note.is_empty() {
+                    self.modal_error = "没有内容可以记下。".into();
+                    return;
+                }
+                // Added after what is there: the reader's own notes are never written over.
+                let mut joined = String::new();
+                let saved = self.edit_paper(&paper_id, cx, |paper| {
+                    let before = paper.notes.trim_end();
+                    paper.notes = if before.is_empty() { note.clone() } else { format!("{before}\n\n{note}") };
+                    joined = paper.notes.clone();
+                });
+                if !saved { return }
+                if let Some(lib) = self.lib.as_ref().filter(|lib| lib.selected.as_deref() == Some(paper_id.as_str())) { lib.notes.update(cx, |input, cx| input.set_text(&joined, cx)) }
+                self.run(Cmd::CloseModal, window, cx);
+                self.say("已记到这篇文献的「我的笔记」里。", cx);
             }
             Modal::AddById { input, busy } => {
                 if *busy { return }
@@ -3093,6 +3353,23 @@ impl Workspace {
     pub fn dev_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Ok(steps) = std::env::var("WISP_PAPER_DEV") else { return };
         for step in steps.split(',') {
+            // `8@shot:/tmp/a.png` takes the step eight seconds after the start: what it is
+            // to show (an import, an answer) needs that long to come about.
+            match step.split_once('@').and_then(|(seconds, later)| Some((seconds.parse::<u64>().ok()?, later.to_string()))) {
+                Some((seconds, later)) => {
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor().timer(std::time::Duration::from_secs(seconds)).await;
+                        this.update_in(cx, |this, window, cx| this.dev_step(&later, window, cx)).ok();
+                    })
+                    .detach();
+                }
+                None => self.dev_step(step, window, cx),
+            }
+        }
+    }
+
+    fn dev_step(&mut self, step: &str, window: &mut Window, cx: &mut Context<Self>) {
+        {
             let (name, arg) = step.split_once(':').unwrap_or((step, ""));
             let cmd = match name {
                 "open" => self.libraries.get(arg.parse::<usize>().unwrap_or(0)).map(|l| Cmd::OpenLibrary(l.id.clone())),
@@ -3105,6 +3382,76 @@ impl Workspace {
                     if let Some(lib) = self.lib.as_ref() { lib.writing.editor.update(cx, |input, cx| input.insert(arg, cx)) }
                     return;
                 }
+                // `import:<folder>` takes in every PDF of a folder, as if they were dropped on the window.
+                "import" => {
+                    let mut paths: Vec<PathBuf> = std::fs::read_dir(arg).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))).collect();
+                    paths.sort();
+                    self.import_paths(paths, cx);
+                    return;
+                }
+                // `shot:<file.png>` writes the window as it is drawn to a picture, without the screen:
+                // the frame is rendered off it. macOS only.
+                "shot" => {
+                    let path = PathBuf::from(arg);
+                    window.defer(cx, move |window, cx| {
+                        let Some((width, height, mut pixels)) = window.render_offscreen(cx) else { return eprintln!("shot: this platform cannot render off the screen") };
+                        for pixel in pixels.as_chunks_mut::<4>().0 {
+                            pixel.swap(0, 2);
+                        }
+                        match image::RgbaImage::from_raw(width as u32, height as u32, pixels).map(|picture| picture.save(&path)) {
+                            Some(Ok(())) => eprintln!("shot: {}", path.display()),
+                            other => eprintln!("shot: not written ({other:?})"),
+                        }
+                    });
+                    return;
+                }
+                // The pointer, as the window hears of it: `press:x;y`, `move:x;y` (the button held), `release:x;y`,
+                // `click:x;y`, and `wheel:x;y;dy;cmd` (dy in pixels; `cmd` or `shift` held, or nothing).
+                "press" | "move" | "release" | "click" | "wheel" => {
+                    let mut numbers = arg.split(';');
+                    let mut number = || numbers.next().and_then(|n| n.parse::<f32>().ok()).unwrap_or(0.);
+                    let position = point(px(number()), px(number()));
+                    let turned = number();
+                    let held = arg.rsplit(';').next().unwrap_or("");
+                    let modifiers = Modifiers { platform: held == "cmd", control: held == "ctrl", shift: held == "shift", ..Default::default() };
+                    let events = match name {
+                        "press" => vec![PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position, modifiers, click_count: 1, first_mouse: false })],
+                        "move" => vec![PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: Some(MouseButton::Left), modifiers })],
+                        "release" => vec![PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position, modifiers, click_count: 1 })],
+                        "wheel" => vec![PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }), PlatformInput::ScrollWheel(ScrollWheelEvent { position, delta: ScrollDelta::Pixels(point(px(0.), px(turned))), modifiers, touch_phase: TouchPhase::Moved })],
+                        _ => vec![
+                            PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }),
+                            PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position, modifiers, click_count: 1, first_mouse: false }),
+                            PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position, modifiers, click_count: 1 }),
+                        ],
+                    };
+                    window.defer(cx, move |window, cx| {
+                        for event in events {
+                            window.dispatch_event(event, cx);
+                        }
+                    });
+                    return;
+                }
+                // `click:<command>` for what has no step of its own.
+                "textless" => Some(Cmd::ShowTextless),
+                "history-paper" => Some(Cmd::ToggleHistory(true)),
+                "newchat" => Some(Cmd::NewChat(arg == "paper")),
+                "note" => {
+                    let Some(answer) = self.lib.as_ref().and_then(|lib| lib.paper_chat.messages.iter().rev().find_map(|item| if let ChatItem::Answer(text) = item { Some(text.clone()) } else { None })) else { return };
+                    Some(Cmd::AnswerToNote("（脚本）".into(), answer))
+                }
+                "submit" => Some(Cmd::SubmitModal),
+                "reread" | "byeye" => {
+                    let Some(file) = self.lib.as_ref().and_then(|lib| lib.selected.as_deref().and_then(|id| lib.pdf_file(id)).map(|file| file.id.clone())) else { return };
+                    Some(if name == "reread" { Cmd::RereadFile(file) } else { Cmd::ReadPages(file) })
+                }
+                "width" => {
+                    self.settings.detail_width = arg.parse().unwrap_or(0.);
+                    cx.notify();
+                    return;
+                }
+                // `report` shows what came of the last import.
+                "report" => Some(Cmd::ShowImport),
                 "screen" => Some(Cmd::ScreenStart),
                 // `sort` has the model sort the full texts into parts, `read` has it read the pages of those without text.
                 "sort" => Some(Cmd::WriteRun(false)),
@@ -3119,12 +3466,20 @@ impl Workspace {
                 // `try:0` runs the first saved search as a trial.
                 "try" => self.lib.as_ref().and_then(|l| l.searches.get(arg.parse::<usize>().unwrap_or(0)).map(|s| Cmd::TrySearch(s.id.clone()))),
                 "wide" => Some(Cmd::ToggleWide),
+                // `zoom:150`, `zoom:page`, `zoom:width`, `zoom:in`, `zoom:out`
+                "zoom" => Some(Cmd::PdfZoom(match arg {
+                    "in" => ZoomTo::In,
+                    "out" => ZoomTo::Out,
+                    "page" => ZoomTo::Set(Zoom::FitPage),
+                    "width" => ZoomTo::Set(Zoom::FitWidth),
+                    percent => ZoomTo::Set(Zoom::Percent(percent.parse().unwrap_or(100.))),
+                })),
                 "translate" => Some(Cmd::ToggleTranslation),
                 // `profile:1` shows the second model service on the AI page.
                 "profile" => Some(Cmd::SelectProfile(arg.parse().unwrap_or(0))),
                 "menu" => {
-                    let kind = match arg { "sort" => MenuKind::Sort, "year" => MenuKind::Filter(FilterKey::Year), _ => MenuKind::Add };
-                    self.open_menu(kind, point(px(20.), px(120.)), cx);
+                    let kind = match arg { "sort" => MenuKind::Sort, "year" => MenuKind::Filter(FilterKey::Year), "zoom" => MenuKind::PdfZoom, "fulltext" => MenuKind::Filter(FilterKey::Fulltext), _ => MenuKind::Add };
+                    self.open_menu(kind, point(px(if arg == "zoom" { 900. } else { 20. }), px(120.)), cx);
                     return;
                 }
                 "search" => {
@@ -3139,6 +3494,11 @@ impl Workspace {
                 "ask" => {
                     if let Some(lib) = self.lib.as_ref() { lib.library_chat.input.update(cx, |input, cx| input.set_text(arg, cx)) }
                     Some(Cmd::Ask(false))
+                }
+                // The same of the selected paper.
+                "askpaper" => {
+                    if let Some(lib) = self.lib.as_ref() { lib.paper_chat.input.update(cx, |input, cx| input.set_text(arg, cx)) }
+                    Some(Cmd::Ask(true))
                 }
                 // `type:/se` leaves text in the library's question box, as if typed (the slash commands show).
                 "type" => {

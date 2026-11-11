@@ -7,7 +7,7 @@
 //! first time it is searched fills a cache; it changes nothing a person sees.
 
 use crate::filter::{Filters, filter_papers};
-use crate::fulltext::terms;
+use crate::fulltext::{self, terms};
 use crate::libraries::{self, LibraryInfo};
 use crate::model::{FULLTEXTS, Paper, READINGS, SCREENINGS, one_of};
 use crate::sources::{self, Fetch};
@@ -79,7 +79,7 @@ pub fn catalog() -> Vec<ToolDef> {
                 "query": {"type": "string", "description": "在题目、作者、DOI、期刊、摘要、标签、词条和笔记中搜索；空格分开的每个词都必须出现。"},
                 "screening": {"type": "string", "enum": keys(&SCREENINGS), "description": "收录判断。"},
                 "reading": {"type": "string", "enum": keys(&READINGS), "description": "阅读状态。"},
-                "fulltext": {"type": "string", "enum": keys(&FULLTEXTS), "description": "全文状态：stored 表示已保存 PDF。"},
+                "fulltext": {"type": "string", "enum": keys(&FULLTEXTS), "description": "全文状态：stored 表示已保存 PDF 并读出了文字，textless 表示有 PDF 但没有读出文字。"},
                 "tag": {"type": "string", "description": "带有这个标签。"},
                 "year": {"type": "integer", "description": "发表年份。"},
                 "sort": {"type": "string", "description": "newest（默认），或 title / year / journal / authors 加上 -asc、-desc，例如 year-desc。"},
@@ -552,14 +552,27 @@ fn search_fulltext(store: &mut Store, args: &Value) -> Result<Value> {
     hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)).then(a.2.cmp(&b.2)));
     let total = hits.len();
     let shown: Vec<Value> = hits.into_iter().take(limit).map(|(_, id, n, text, exact)| json!({"paperId": id, "title": titles.get(id).copied().unwrap_or(""), "page": n + 1, "exact": exact, "snippet": text})).collect();
-    Ok(json!({
+    // The papers with a PDF whose text could not be had: the search did not see into them.
+    let mut unreadable: Vec<Value> = vec![];
+    for (_, paper_id, reason) in store.fulltext_failures()?.into_iter().filter(|(_, id, _)| only.is_empty() || id.as_str() == only) {
+        if unreadable.last().is_some_and(|last| last["paperId"] == paper_id.as_str()) { continue }
+        unreadable.push(json!({"paperId": paper_id, "title": titles.get(paper_id.as_str()).copied().unwrap_or(""), "kind": fulltext::failure_kind(&reason), "reason": reason}));
+    }
+    let mut found = json!({
         "query": query,
         "total": total,
         "hits": shown,
         // What the search could see: an answer must not pass for "the library says nothing".
         "papersSearched": texts.keys().filter(|id| only.is_empty() || id.as_str() == only).count(),
         "papersWithoutText": papers.iter().filter(|p| (only.is_empty() || p.id == only) && !texts.contains_key(&p.id)).count(),
-    }))
+    });
+    if !unreadable.is_empty() {
+        found["unreadableCount"] = json!(unreadable.len());
+        unreadable.truncate(UNREADABLE_LISTED);
+        found["unreadable"] = json!(unreadable);
+        found["note"] = json!("unreadable 里的文献有 PDF，但文字没有读出来，这次检索看不到它们的正文：没有命中不说明它们没有相关内容。reason 是读取时得到的结果，不要据此推测文件的其他情况。");
+    }
+    Ok(found)
 }
 
 fn read_fulltext(store: &mut Store, args: &Value) -> Result<Value> {
@@ -579,7 +592,8 @@ fn read_fulltext(store: &mut Store, args: &Value) -> Result<Value> {
     }
     let Some(pages) = found else {
         if failure.is_empty() { bail!("「{}」没有保存全文，只有书目信息和摘要。", paper.title) }
-        bail!("「{}」的全文无法读取：{failure}", paper.title)
+        // Said to a model as much as to a person: what is known, and where the knowledge ends.
+        bail!("「{}」有 PDF，但全文的文字没有读出来：{failure}现在只有它的书目信息和摘要可用；这句话说的是读取的结果，不要据此推测文件的其他情况。", paper.title)
     };
     let from = number(args, "page", 1, usize::MAX)?.max(1);
     let count = number(args, "pages", 4, 8)?.max(1);
@@ -611,6 +625,8 @@ fn sentences(text: &str) -> Vec<String> {
     out
 }
 
+/// The papers without readable text that a search names; the rest are counted.
+const UNREADABLE_LISTED: usize = 20;
 const MAX_SENTENCES: usize = 40;
 
 fn find_citations(store: &mut Store, args: &Value) -> Result<Value> {
@@ -1033,6 +1049,19 @@ pub(crate) mod tests {
         assert!(call(&root, "read_fulltext", &json!({"paperId": id, "page": 3})).unwrap_err().contains("只有 2 页"));
         let leaf = call(&root, "list_papers", &json!({"screening": "irrelevant"})).unwrap()["papers"][0]["id"].as_str().unwrap().to_string();
         assert!(call(&root, "read_fulltext", &json!({"paperId": leaf})).unwrap_err().contains("没有保存全文"));
+
+        // A PDF neither reader makes sense of: the paper says so in its status, and a
+        // search names it as not seen into, without guessing at what the file is.
+        let broken = root.join("leaf.pdf");
+        std::fs::write(&broken, "not a pdf").unwrap();
+        Store::open(&libraries::list(&root)[0].dir).unwrap().import_file(&leaf, &broken, "fulltext").unwrap();
+        let unread = call(&root, "read_fulltext", &json!({"paperId": leaf})).unwrap_err();
+        assert!(unread.contains("文字没有读出来") && unread.contains("不要据此推测") && !unread.contains("扫描件。"), "{unread}");
+        let found = call(&root, "search_fulltext", &json!({"query": "chromium"})).unwrap();
+        assert_eq!((found["total"].as_u64(), found["unreadableCount"].as_u64(), found["unreadable"][0]["paperId"].as_str(), found["unreadable"][0]["kind"].as_str()), (Some(1), Some(1), Some(leaf.as_str()), Some("parser")));
+        assert!(found["note"].as_str().unwrap().contains("没有命中不说明"));
+        assert_eq!(call(&root, "search_fulltext", &json!({"query": "chromium", "paperId": id})).unwrap().get("unreadable"), None);
+        assert_eq!(call(&root, "list_papers", &json!({"fulltext": "textless", "screening": "irrelevant"})).unwrap()["papers"][0]["id"].as_str(), Some(leaf.as_str()));
         std::fs::remove_dir_all(root).ok();
     }
 

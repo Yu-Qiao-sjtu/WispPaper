@@ -57,6 +57,9 @@ impl Workspace {
         // Ids of the two conversations' elements must differ: both can be on screen.
         let side = if about_paper { "paper" } else { "library" };
 
+        // The papers in scope that have a PDF no text came of: said, so that nobody takes them for read.
+        let textless = lib.shown.iter().filter(|&&i| lib.papers[i].fulltext == "textless").count();
+        let textless_note = if textless > 0 && !about_paper { format!("；其中 {textless} 篇的 PDF 没读出文字，只有记录和摘要") } else { String::new() };
         // What the model has been given, or will be given with the first question.
         let scope = match &chat.ctx {
             Some(ctx) if about_paper => {
@@ -69,7 +72,7 @@ impl Workspace {
                 if ctx.titles_only > 0 { line.push_str(&format!("，{} 篇仅题目", ctx.titles_only)) }
                 if ctx.omitted > 0 { line.push_str(&format!("，{} 篇未提供", ctx.omitted)) }
                 if ctx.pages > 0 { line.push_str(&format!("，{} 页相关全文", ctx.pages)) }
-                line
+                line + &textless_note
             }
             None if !chat.messages.is_empty() => "历史对话：接着提问时，会按文献库现在的内容重新提供材料".to_string(),
             None if about_paper => {
@@ -81,13 +84,14 @@ impl Workspace {
                     None => "这篇文献没有 PDF，将只提供记录和摘要".to_string(),
                 }
             }
-            None => format!("范围：当前列表的 {} 篇文献（受左侧视图、搜索和筛选影响），以及其中已存 PDF 的相关页面", lib.shown.len()),
+            None => format!("范围：当前列表的 {} 篇文献（受左侧视图、搜索和筛选影响），以及其中已存 PDF 的相关页面{textless_note}", lib.shown.len()),
         };
 
-        let body = if !configured {
-            ui::empty_state("sparkle", "还没有配置模型", "提问需要一个模型服务：Claude API，或任何 OpenAI 兼容的服务。API Key 只保存在本机。").child(ui::primary_button(SharedString::from(format!("chat-settings-{side}")), "打开设置").on_click(self.on(Cmd::OpenSettings(SettingsPage::Ai), cx))).into_any_element()
-        } else if let Some(history) = &chat.history {
+        // What was asked before can be read without a model; only asking needs one.
+        let body = if let Some(history) = &chat.history {
             self.render_history(about_paper, chat, history, cx)
+        } else if !configured && chat.messages.is_empty() {
+            ui::empty_state("sparkle", "还没有配置模型", "提问需要一个模型服务：Claude API，或任何 OpenAI 兼容的服务。API Key 只保存在本机。以前的对话在右上角的「历史」里，不配置也能看。").child(ui::primary_button(SharedString::from(format!("chat-settings-{side}")), "打开设置").on_click(self.on(Cmd::OpenSettings(SettingsPage::Ai), cx))).into_any_element()
         } else if chat.messages.is_empty() && chat.error.is_empty() {
             let suggestions: &[&str] = if about_paper { &["这篇文献的研究问题、方法和主要结论是什么？", "作者的结论有哪些证据支持？有什么局限？", "用三句话向同行介绍这篇文章。"] } else { &["这些文献主要在研究哪些问题？按主题归类。", "哪些文献的结论相互支持或矛盾？", "我还没读的文献里，哪几篇最值得先读？为什么？"] };
             ui::empty_state("sparkle", if about_paper { "就这篇文献提问" } else { "向文献库提问" }, "回答依据文献库里的记录、笔记和已存 PDF 的全文，并标出出处。需要时助手会自己检索和翻阅全文。")
@@ -118,16 +122,38 @@ impl Workspace {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .when(!about_paper, |d| d.child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(if listing { "历史对话" } else { "向文献库提问" })))
-                            .child(div().text_size(px(12.)).line_height(px(17.)).text_color(Theme::text_tertiary()).child(if listing { "这个文献库里提过的问题和回答；点开一次对话可以接着问".to_string() } else { scope })),
+                            .when(!about_paper, |d| d.child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(if listing { "文献库的历史对话" } else { "向文献库提问" })))
+                            // The paper's panel has its title above; its history says whose it is.
+                            .when(about_paper && listing, |d| d.child(div().font_weight(FontWeight::MEDIUM).child("这篇文献的历史对话")))
+                            .child(div().text_size(px(12.)).line_height(px(17.)).text_color(Theme::text_tertiary()).child(match (listing, about_paper) {
+                                (true, false) => "向整个文献库提过的问题和回答；点开一次对话可以接着问。单篇文献的对话在各自的「提问」里".to_string(),
+                                (true, true) => "就这篇文献提过的问题和回答；点开一次对话可以接着问".to_string(),
+                                (false, _) => scope,
+                            })),
                     )
-                    .when(configured, |d| {
-                        d.child(ui::ghost_button(SharedString::from(format!("chat-history-{side}")), Some(if listing { "arrow-left" } else { "history" }), Some(if listing { "返回".into() } else { "历史".into() })).on_click(self.on(Cmd::ToggleHistory(about_paper), cx)))
-                            .when(!chat.messages.is_empty(), |d| d.child(ui::ghost_button(SharedString::from(format!("chat-new-{side}")), Some("plus"), Some("新对话".into())).on_click(self.on(Cmd::NewChat(about_paper), cx))))
-                    }),
+                    .child(ui::ghost_button(SharedString::from(format!("chat-history-{side}")), Some(if listing { "arrow-left" } else { "history" }), Some(if listing { "返回".into() } else { "历史".into() })).on_click(self.on(Cmd::ToggleHistory(about_paper), cx)))
+                    .when(!chat.messages.is_empty() && !listing, |d| d.child(ui::ghost_button(SharedString::from(format!("chat-new-{side}")), Some("plus"), Some("新对话".into())).on_click(self.on(Cmd::NewChat(about_paper), cx)))),
             )
             .child(body)
             .when(configured, |d| d.child(self.render_composer(about_paper, chat, &model, window, cx)))
+            // An old conversation on show without a model: it can be read, and says what asking on needs.
+            .when(!configured && !listing && !chat.messages.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(16.))
+                        .py(px(10.))
+                        .border_t_1()
+                        .border_color(Theme::line())
+                        .text_size(px(12.))
+                        .text_color(Theme::text_tertiary())
+                        .child(div().flex_1().min_w_0().child("接着问需要一个模型服务。"))
+                        .child(ui::secondary_button(SharedString::from(format!("chat-settings-{side}")), "打开设置").h(px(28.)).on_click(self.on(Cmd::OpenSettings(SettingsPage::Ai), cx))),
+                )
+            })
             .into_any_element()
     }
 
@@ -215,7 +241,11 @@ impl Workspace {
             let last = i + 1 == chat.messages.len();
             let whole = ((last && !chat.busy) || matches!(chat.messages.get(i + 1), Some(ChatItem::User { .. }))).then(|| {
                 let from = chat.messages[..i].iter().rposition(|item| matches!(item, ChatItem::User { .. })).map_or(0, |at| at + 1);
-                chat.messages[from..=i].iter().filter_map(|item| if let ChatItem::Answer(text) = item { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\n\n")
+                let question = match from.checked_sub(1).and_then(|at| chat.messages.get(at)) {
+                    Some(ChatItem::User { text, .. }) => text.clone(),
+                    _ => String::new(),
+                };
+                (question, chat.messages[from..=i].iter().filter_map(|item| if let ChatItem::Answer(text) = item { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\n\n"))
             });
             items.push(
                 div()
@@ -224,7 +254,17 @@ impl Workspace {
                     .gap(px(8.))
                     .child(crate::markdown::render(&format!("answer-{side}-{i}"), content))
                     .when(!chips.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(6.)).children(chips)))
-                    .when_some(whole, |d, whole| d.child(div().flex().child(ui::ghost_button(SharedString::from(format!("copy-{side}-{i}")), Some("copy"), None).h(px(24.)).min_w(px(24.)).opacity(0.7).on_click(self.on(Cmd::CopyText(whole), cx)))))
+                    .when_some(whole, |d, (question, whole)| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .child(ui::ghost_button(SharedString::from(format!("copy-{side}-{i}")), Some("copy"), None).h(px(24.)).min_w(px(24.)).opacity(0.7).on_click(self.on(Cmd::CopyText(whole.clone()), cx)))
+                                // An answer about one paper can join that paper's notes; one about the library names many.
+                                .when(about_paper, |d| d.child(ui::ghost_button(SharedString::from(format!("note-{side}-{i}")), Some("pen-line"), Some("存为笔记".into())).h(px(24.)).text_size(px(12.)).opacity(0.7).on_click(self.on(Cmd::AnswerToNote(question, whole), cx)))),
+                        )
+                    })
                     .into_any_element(),
             );
             i += 1;

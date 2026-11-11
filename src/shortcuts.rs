@@ -5,7 +5,7 @@
 use gpui::*;
 use std::collections::BTreeMap;
 
-actions!(workspace, [Dismiss, FocusSearch, AddPaper, ImportPdf, AskLibrary, ToggleDetail, ShowSettings, ShowHome, NewLibrary]);
+actions!(workspace, [Dismiss, FocusSearch, AddPaper, ImportPdf, AskLibrary, ToggleDetail, ShowSettings, ShowHome, NewLibrary, ZoomIn, ZoomOut, ZoomFit]);
 
 pub struct Shortcut {
     pub id: &'static str,
@@ -19,7 +19,7 @@ pub struct Shortcut {
 pub const GROUPS: [&str; 2] = ["应用", "文献库"];
 
 /// What each one does is in `Workspace::shortcut` (app.rs).
-pub const SHORTCUTS: [Shortcut; 8] = [
+pub const SHORTCUTS: [Shortcut; 11] = [
     Shortcut { id: "settings", label: "打开设置", group: 0, default: "secondary-," },
     Shortcut { id: "home", label: "回到所有文献库", group: 0, default: "secondary-shift-h" },
     Shortcut { id: "new-library", label: "新建文献库", group: 0, default: "secondary-shift-n" },
@@ -28,6 +28,9 @@ pub const SHORTCUTS: [Shortcut; 8] = [
     Shortcut { id: "import-pdf", label: "导入 PDF 文件", group: 1, default: "secondary-o" },
     Shortcut { id: "ask", label: "向文献库提问", group: 1, default: "secondary-l" },
     Shortcut { id: "detail", label: "展开 / 收起文献详情", group: 1, default: "secondary-e" },
+    Shortcut { id: "zoom-in", label: "放大 PDF", group: 1, default: "secondary-=" },
+    Shortcut { id: "zoom-out", label: "缩小 PDF", group: 1, default: "secondary--" },
+    Shortcut { id: "zoom-fit", label: "PDF 适应宽度", group: 1, default: "secondary-0" },
 ];
 
 /// The text field's own keys (input.rs): a shortcut on one of them would
@@ -84,6 +87,9 @@ pub fn rebuild(custom: &BTreeMap<String, String>, cx: &mut App) {
             "add" => KeyBinding::new(&key, AddPaper, context),
             "import-pdf" => KeyBinding::new(&key, ImportPdf, context),
             "ask" => KeyBinding::new(&key, AskLibrary, context),
+            "zoom-in" => KeyBinding::new(&key, ZoomIn, context),
+            "zoom-out" => KeyBinding::new(&key, ZoomOut, context),
+            "zoom-fit" => KeyBinding::new(&key, ZoomFit, context),
             _ => KeyBinding::new(&key, ToggleDetail, context),
         });
     }

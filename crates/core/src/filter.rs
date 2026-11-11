@@ -59,7 +59,7 @@ pub fn in_view(p: &Paper, view: View, now_ms: i64) -> bool {
         View::Unread => p.reading == "unread",
         View::Starred => p.starred,
         View::Pending => p.screening == "pending" || p.screening == "uncertain",
-        View::NoPdf => p.fulltext != "stored",
+        View::NoPdf => !matches!(p.fulltext.as_str(), "stored" | "textless"),
     }
 }
 

@@ -310,6 +310,7 @@ pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields:
 - 依据的是全文某一页里的一句话时，把这句原文放进标签：[P3 p.5 \"原文中的一句\"]。原文必须逐字出自那一页，一句即可，不翻译、不改写、不拼接；界面会打开 PDF 并高亮它。拿不准原文时只写页码。\n\
 - 「我的笔记」是用户自己写的，可以引用，但要与论文本身的结论区分开。\n\
 - 只列出题目的文献没有摘要，对它们的内容不要下结论。\n\
+- 有的文献存了 PDF 却没读出文字，工具会给出读取时得到的原因。照原因转述即可，不要自己推测它是扫描件、加了密或者损坏了；全文检索看不到这些文献的正文，没有命中不等于文中没有。\n\
 - 上面的材料不够时使用工具：search_fulltext 在已保存的全文里找短语或关键词，read_fulltext 按页读原文核对上下文，list_papers 和 get_paper 查文献记录。工具查的是整个文献库，不限于上面列出的文献。\n\
 - search_online 可以在 PubMed、Europe PMC、Crossref、arXiv 里试检索，不写入文献库。保存或删除检索式、运行导入、撤销导入会改动文献库：只在用户明确要求时使用，并说明做了什么。收录判断由用户本人做出：你可以用 suggest_screening 提出建议，它会出现在筛选页等用户确认。
 \n- 工具结果里每篇文献带有 label，就是引用它时用的标签；工具的 paperId 和 id 参数可以直接填标签（如 P3）。没有保存全文的文献只有记录和摘要，回答依据的只是摘要时要说明。\n\
@@ -390,6 +391,63 @@ pub fn citations(answer: &str) -> Vec<Citation> {
         rest = &rest[close + 1..];
     }
     found
+}
+
+/// An answer about a paper as a passage for that paper's notes. A label
+/// means something only in its conversation, so the paper's own goes
+/// (`[P1 p.5 "…"]` becomes `[p.5 "…"]`) and another paper's gives way to
+/// its title; pages and quotations stay. The last line says what this is:
+/// a model's reading, which nobody has checked against the paper.
+pub fn note_from_answer(question: &str, answer: &str, sources: &[Source], paper_id: &str, date: &str) -> String {
+    let mut body = String::with_capacity(answer.len());
+    let mut rest = answer.trim();
+    while let Some(open) = rest.find('[') {
+        body.push_str(&rest[..open]);
+        rest = &rest[open + 1..];
+        // What stands before a quotation, or the whole of the brackets: the labels are here.
+        let end = rest.find([']', '"', '“', '「']).unwrap_or(rest.len());
+        let separates = |c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '、');
+        let (mut head, mut word, mut dropped) = (String::new(), String::new(), false);
+        for c in rest[..end].chars().chain([' ']) {
+            if !separates(c) {
+                word.push(c);
+                continue;
+            }
+            if !word.is_empty() {
+                match sources.iter().find(|source| source.label == word) {
+                    Some(source) if source.paper_id == paper_id => dropped = true,
+                    Some(source) => {
+                        head.push_str(&format!("《{}》", source.title));
+                        dropped = false;
+                    }
+                    None => {
+                        head.push_str(&word);
+                        dropped = false;
+                    }
+                }
+                word.clear();
+            }
+            // What separated a label that went from the next word goes with it.
+            if !dropped { head.push(c) }
+        }
+        head.pop();
+        rest = &rest[end..];
+        let closes = rest.starts_with(']');
+        let head = if closes { head.trim_matches(separates) } else { head.trim_start_matches(separates) };
+        if head.is_empty() && closes {
+            // `[P1]` alone: nothing is left to say, and the space before it goes too.
+            rest = &rest[1..];
+            let kept = body.trim_end_matches(' ').len();
+            body.truncate(kept);
+        } else {
+            body.push('[');
+            body.push_str(head);
+        }
+    }
+    body.push_str(rest);
+    let question = question.split_whitespace().collect::<Vec<_>>().join(" ");
+    let asked = if question.is_empty() { String::new() } else { format!("问：{question}\n") };
+    format!("{asked}{}\n（{date} 提问所得 · 模型的回答，未核对原文）", body.trim())
 }
 
 // ---- requests
@@ -1235,6 +1293,16 @@ pub fn error_message(status: u16, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_becomes_a_note() {
+        let sources = [Source { label: "P1".into(), paper_id: "a".into(), title: "Root atlas".into() }, Source { label: "P2".into(), paper_id: "b".into(), title: "Leaf atlas".into() }];
+        let note = note_from_answer(" 方法 是什么？\n", "用了 10x 平台 [P1 p.2 \"Libraries were prepared [12] with Chromium.\"]，结论见 [P1]。\n\n与 [P2, P1 p.3] 一致，另见 [P1、P2] 和文献 [12]。", &sources, "a", "2026-11-11");
+        assert_eq!(note, "问：方法 是什么？\n用了 10x 平台 [p.2 \"Libraries were prepared [12] with Chromium.\"]，结论见。\n\n与 [《Leaf atlas》, p.3] 一致，另见 [《Leaf atlas》] 和文献 [12]。\n（2026-11-11 提问所得 · 模型的回答，未核对原文）");
+        // Without a question, and with nothing to rewrite.
+        assert_eq!(note_from_answer("", "没有标签。", &sources, "a", "2026-11-11"), "没有标签。\n（2026-11-11 提问所得 · 模型的回答，未核对原文）");
+    }
+
 
     fn paper(id: &str, title: &str, abstract_text: &str) -> Paper {
         let mut p = Paper { id: id.into(), title: title.into(), abstract_text: abstract_text.into(), ..Default::default() };
