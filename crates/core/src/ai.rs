@@ -120,6 +120,18 @@ pub struct Context {
     pub pages: usize,
     /// Full-text pages of the paper in scope that did not fit.
     pub pages_omitted: usize,
+    /// What each paper in scope was given as, in the library's order.
+    pub given: Vec<Given>,
+}
+
+/// How much of a paper in scope the model was handed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Given {
+    pub paper_id: String,
+    /// `full` (its record, with abstract and notes), `title` (for lack of room), or `omitted`.
+    pub record: &'static str,
+    /// Pages of its full text handed over with the question.
+    pub pages: usize,
 }
 
 impl Context {
@@ -242,6 +254,7 @@ pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields:
                     ctx.omitted += 1;
                 }
             }
+            ctx.given = papers.iter().enumerate().map(|(i, p)| Given { paper_id: p.id.clone(), record: if full.contains(&i) { "full" } else if titles.contains(&i) { "title" } else { "omitted" }, pages: 0 }).collect();
             ctx.full = full.len();
             ctx.titles_only = titles.len();
             // Listed in the library's own order, so labels read in sequence.
@@ -287,6 +300,9 @@ pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields:
                 }
             }
             ctx.pages = chosen.len();
+            for (id, ..) in &chosen {
+                if let Some(given) = ctx.given.iter_mut().find(|given| given.paper_id == *id) { given.pages += 1 }
+            }
         }
     }
 
@@ -337,8 +353,22 @@ pub struct Citation {
 /// What an answer cites, in order of first appearance.
 pub fn citations(answer: &str) -> Vec<Citation> {
     let mut found: Vec<Citation> = vec![];
+    for (_, cited) in citation_spans(answer) {
+        // The same thing cited again is listed once.
+        for citation in cited {
+            if !found.contains(&citation) { found.push(citation) }
+        }
+    }
+    found
+}
+
+/// Where an answer cites: each pair of brackets that names a paper, as
+/// the bytes it takes (brackets included) and what it cites.
+pub fn citation_spans(answer: &str) -> Vec<(std::ops::Range<usize>, Vec<Citation>)> {
+    let mut spans = vec![];
     let mut rest = answer;
     while let Some(open) = rest.find('[') {
+        let start = answer.len() - rest.len() + open;
         rest = &rest[open + 1..];
         // `[P3 p.5 "a sentence"]`: the quotation may hold brackets of its own, so the
         // label ends at the `]` right after the closing quotation mark.
@@ -363,8 +393,7 @@ pub fn citations(answer: &str) -> Vec<Citation> {
             }
         };
         // "[P3]", "[P3 p.5]", "[P3, p.5]", "[P1, P2]"
-        let before = found.len();
-        let mut last_in_bracket: Option<usize> = None;
+        let mut found: Vec<Citation> = vec![];
         for part in head.split([',', '，', ';', '、']) {
             let part = part.trim();
             let mut words = part.split_whitespace();
@@ -372,25 +401,75 @@ pub fn citations(answer: &str) -> Vec<Citation> {
             let page = |word: &str| word.trim_start_matches("p.").trim_start_matches('p').parse::<usize>().ok();
             if first.starts_with('P') && first.len() > 1 && first[1..].bytes().all(|b| b.is_ascii_digit()) {
                 found.push(Citation { label: first.to_string(), page: words.next().and_then(page), quote: String::new() });
-                last_in_bracket = Some(found.len() - 1);
-            } else if first.starts_with("p.") && words.next().is_none() && let (Some(page), Some(at)) = (page(first), last_in_bracket) {
+            } else if first.starts_with("p.") && words.next().is_none() && let (Some(page), Some(last)) = (page(first), found.last_mut()) {
                 // "[P3, p.5]": the page belongs to the label before the comma.
-                if found[at].page.is_none() { found[at].page = Some(page) }
+                if last.page.is_none() { last.page = Some(page) }
             }
         }
         // The quotation belongs to the last paper named in its brackets.
-        if let Some(at) = last_in_bracket { found[at].quote = quote.to_string() }
-        // The same thing cited again is listed once.
-        let mut kept = before;
-        for index in before..found.len() {
-            if found[..kept].contains(&found[index]) { continue }
-            found.swap(kept, index);
-            kept += 1;
-        }
-        found.truncate(kept);
+        if let Some(last) = found.last_mut() { last.quote = quote.to_string() }
         rest = &rest[close + 1..];
+        if !found.is_empty() { spans.push((start..answer.len() - rest.len(), found)) }
     }
-    found
+    spans
+}
+
+/// A passage of a paper as a question hands it to the model: written the
+/// way answers cite, so that an answer can point back at it. The marks a
+/// quotation is closed by are taken out of the passage.
+pub fn quoted_passage(label: &str, page: usize, text: &str) -> String {
+    let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().map(|c| if matches!(c, '"' | '“' | '”') { '\'' } else { c }).collect();
+    format!("[{label} p.{page} \"{text}\"]")
+}
+
+/// How a quotation in an answer stands against the text of the paper it names.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Quoted {
+    /// Word for word where the answer says: on the page named, or in the abstract.
+    Found,
+    /// Word for word, but on this page (1-based) and not the one named.
+    Elsewhere(usize),
+    /// Only its beginning is in the text: on this page, and this share of it (0 to 1).
+    Begins(usize, f32),
+    /// Nowhere in the text.
+    Missing,
+    /// The paper has no text to look in, and the quotation is not in its abstract.
+    NoText,
+}
+
+/// The least of a quotation that counts as its beginning, in compared characters.
+const BEGINNING: usize = 20;
+
+/// Look a quotation up in the paper it is said to be from. Letters and
+/// digits are compared and nothing else (`bare`), so line breaks and
+/// hyphenation do not matter and a changed word or number does. This says
+/// whether the words are there: whether they bear out the claim made with
+/// them is for the reader.
+pub fn check_quote(quote: &str, page: Option<usize>, paper: &Paper, pages: Option<&[String]>) -> Quoted {
+    let wanted = bare(quote);
+    if wanted.is_empty() { return Quoted::Missing }
+    let in_record = bare(&paper.abstract_text).contains(&wanted) || bare(&paper.title).contains(&wanted);
+    let Some(pages) = pages else { return if in_record { Quoted::Found } else { Quoted::NoText } };
+    let pages: Vec<String> = pages.iter().map(|page| bare(page)).collect();
+    let named = page.and_then(|page| page.checked_sub(1)).filter(|at| *at < pages.len());
+    if named.is_some_and(|at| pages[at].contains(&wanted)) || (page.is_none() && in_record) { return Quoted::Found }
+    if let Some(at) = pages.iter().position(|page| page.contains(&wanted)) { return if page.is_some() { Quoted::Elsewhere(at + 1) } else { Quoted::Found } }
+    if in_record { return Quoted::Found }
+    // How far each page goes along with the quotation from its first character on; the page named wins a tie.
+    let letters: Vec<char> = wanted.chars().collect();
+    let reach = |page: &String| {
+        let (mut low, mut high) = (0, letters.len());
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            if page.contains(&letters[..middle].iter().collect::<String>()) { low = middle } else { high = middle - 1 }
+        }
+        low
+    };
+    let best = pages.iter().enumerate().map(|(at, page)| (reach(page), named == Some(at), at)).max_by_key(|(reach, named, at)| (*reach, *named, std::cmp::Reverse(*at)));
+    match best {
+        Some((reach, _, at)) if reach >= BEGINNING.min(letters.len()) && reach < letters.len() => Quoted::Begins(at + 1, reach as f32 / letters.len() as f32),
+        _ => Quoted::Missing,
+    }
 }
 
 /// An answer about a paper as a passage for that paper's notes. A label
@@ -925,40 +1004,54 @@ pub struct Slash {
     /// The request it stands for (`{}` is what follows the name); empty for
     /// a command the window carries out itself.
     pub template: &'static str,
+    /// What the command works on when nothing follows its name; empty when something must.
+    pub alone: &'static str,
 }
 
-pub const SLASH: [Slash; 6] = [
+pub const SLASH: [Slash; 7] = [
     Slash {
         name: "search",
         about: "在全文和记录里检索",
         hint: "关键词或短语",
         template: "在文献库里检索：{}\n\n先用 search_fulltext 查已保存的全文，再用 list_papers 查题目、摘要、标签和笔记。列出命中的文献；全文命中的给出页码和原句。有文献因为没有保存全文而只查了记录时，说明这一点。",
+        alone: "",
     },
     Slash {
         name: "cite",
         about: "为一段文字逐句配引用",
         hint: "要配引用的文字",
         template: "为下面这段文字逐句找出文献库中可以引用的文献：\n\n{}\n\n先调用 find_citations 取得每句的候选，再用 read_fulltext 或文献记录核对候选是否真的支持这句话。逐句给出结果：可以引用的文献（标签和页码）和它依据的原句；没有合适文献的句子直接说明没有，不要勉强配引用。",
+        alone: "",
     },
     Slash {
         name: "review",
         about: "围绕一个主题写带引用的小综述",
         hint: "主题",
         template: "依据文献库里的文献，围绕下面的主题写一段综述：{}\n\n先用 list_papers 和 search_fulltext 找出相关的文献，拿不准的地方用 read_fulltext 核对原文。按观点组织，不要逐篇罗列；每个论断后面给出引用标签，依据全文的写上页码；文献之间一致和分歧的地方要指出来；文献库里证据不足的部分直接说明，不要用常识补齐。",
+        alone: "",
     },
     Slash {
         name: "compare",
         about: "比较几篇文献的方法和结论",
         hint: "文献标签或题目，如 P1 P3",
         template: "比较下面这几篇文献：{}\n\n先用 get_paper 和 read_fulltext 把它们读一遍。用一张表列出各自的研究问题、材料与方法、主要结论和局限，表后用几句话说明它们一致、互补和矛盾的地方。依据全文的内容给出页码；只有摘要可依据的文献要说明。",
+        alone: "",
     },
     Slash {
         name: "write",
         about: "参照文献库里同一部分的写法起草一段",
         hint: "哪一部分和要写的内容，如：导言 根系如何感知土壤紧实",
         template: "参照文献库里的文献，帮我起草论文的一段：{}\n\n先判断这段属于论文的哪个部分（摘要、导言、方法、结果、讨论），用 find_sentences 取这一部分的候选句：先不带 query 看各篇文献怎么开头，再用英文关键词查与要写的内容相近的句子。然后用英文写出这一段：借鉴候选句的结构和措辞，但句子要自己写，不要照抄；引述他人结论的地方给出引用标签和页码。写完后列出你参考的 3 到 5 个候选句（原句、标签、页码），说明各借鉴了什么。文献库里没有这一部分的句子可参考时直接说明。",
+        alone: "",
     },
-    Slash { name: "new", about: "开始一次新对话", hint: "", template: "" },
+    Slash {
+        name: "verify",
+        about: "逐条核对上一个回答的依据",
+        hint: "要核对的论断；不写就核对上一个回答",
+        template: "逐条核对下面这段内容的依据：{}\n\n写的是「上一个回答」时，核对的是你在这次对话里给出的上一个回答。做法：\n1. 把其中的论断一条条列出来，不合并、不遗漏。\n2. 对每一条，用 search_fulltext 找到出处，再用 read_fulltext 读那一页的上下文；只凭关键词命中不算核对。\n3. 每一条按这个顺序写：论断 → 原文摘录（写成 [P3 p.5 \"逐字的一句原文\"]）→ 这句原文支持到什么程度、有什么局限。\n\n要求：摘录必须逐字出自那一页，不翻译、不改写、不把几处拼成一句；界面会拿它和原文逐字比对，并标出比对的结果。只有摘要可依据的，说明依据是摘要，不写页码。没有读到全文、或者原文里找不到依据的，直接写「无法核对」并说明原因，不要用印象补上。原文和论断不一致的，照实指出。最后用一两句话说明哪几条有原文依据、哪几条没有。",
+        alone: "上一个回答",
+    },
+    Slash { name: "new", about: "开始一次新对话", hint: "", template: "", alone: "" },
 ];
 
 /// What a typed message asks for.
@@ -980,8 +1073,9 @@ pub fn read_input(input: &str) -> Result<Input, String> {
         return Err(format!("没有 /{name} 这个命令。可用：{}", SLASH.iter().map(|command| format!("/{}（{}）", command.name, command.about)).collect::<Vec<_>>().join("、")));
     };
     if command.template.is_empty() { return Ok(Input::NewChat) }
-    if argument.trim().is_empty() { return Err(format!("/{name} 后面写上内容：{}。", command.about)) }
-    Ok(Input::Ask(command.template.replace("{}", argument.trim())))
+    let argument = if argument.trim().is_empty() { command.alone } else { argument.trim() };
+    if argument.is_empty() { return Err(format!("/{name} 后面写上内容：{}。", command.about)) }
+    Ok(Input::Ask(command.template.replace("{}", argument)))
 }
 
 /// The request behind a message that was already accepted once: what goes
@@ -1295,6 +1389,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quotations_checked_against_the_text() {
+        let paper = Paper { title: "Root atlas".into(), abstract_text: "WOX5 maintains the quiescent centre of the root.".into(), ..Default::default() };
+        let pages = vec!["Introduction. The root tip of Arabidopsis.".to_string(), "Libraries were prepared with\n10x Genomics Chromium v3 and sequenced to 50,000 reads per cell.".to_string()];
+        let check = |quote: &str, page: Option<usize>| check_quote(quote, page, &paper, Some(&pages));
+        // Where it is said to be, whatever the line breaks and the case.
+        assert_eq!(check("Libraries were prepared with 10X genomics chromium v3", Some(2)), Quoted::Found);
+        // On another page than the one named; without a page, anywhere will do.
+        assert_eq!((check("The root tip of Arabidopsis", Some(2)), check("The root tip of Arabidopsis", None)), (Quoted::Elsewhere(1), Quoted::Found));
+        // The abstract counts, with or without a text.
+        assert_eq!((check("WOX5 maintains the quiescent centre", Some(1)), check_quote("WOX5 maintains the quiescent centre", None, &paper, None)), (Quoted::Found, Quoted::Found));
+        // A number changed in its second half: only the beginning is there, and it is said how much.
+        let Quoted::Begins(page, share) = check("Libraries were prepared with 10x Genomics Chromium v3 and sequenced to 80,000 reads per cell.", Some(2)) else { panic!("not a beginning") };
+        assert!(page == 2 && share > 0.6 && share < 0.9, "{share}");
+        // Made up, and nothing to look in.
+        assert_eq!((check("Protoplasts were sorted by flow cytometry before loading", Some(2)), check_quote("anything at all", Some(1), &paper, None)), (Quoted::Missing, Quoted::NoText));
+        // A few shared first letters are no beginning.
+        assert_eq!(check("Libraries of congress hold many books about roots", Some(2)), Quoted::Missing);
+    }
+
+    #[test]
+    fn where_an_answer_cites() {
+        let answer = "根尖 [P3] 用了 [P1 p.2 \"Libraries [12] were prepared.\"]，见 [1] 和 [P2, p.7]。";
+        let spans = citation_spans(answer);
+        assert_eq!(spans.iter().map(|(range, _)| &answer[range.clone()]).collect::<Vec<_>>(), ["[P3]", "[P1 p.2 \"Libraries [12] were prepared.\"]", "[P2, p.7]"]);
+        assert_eq!(spans[1].1, [Citation { label: "P1".into(), page: Some(2), quote: "Libraries [12] were prepared.".into() }]);
+    }
+
+
+    #[test]
     fn an_answer_becomes_a_note() {
         let sources = [Source { label: "P1".into(), paper_id: "a".into(), title: "Root atlas".into() }, Source { label: "P2".into(), paper_id: "b".into(), title: "Leaf atlas".into() }];
         let note = note_from_answer(" 方法 是什么？\n", "用了 10x 平台 [P1 p.2 \"Libraries were prepared [12] with Chromium.\"]，结论见 [P1]。\n\n与 [P2, P1 p.3] 一致，另见 [P1、P2] 和文献 [12]。", &sources, "a", "2026-11-11");
@@ -1330,6 +1453,8 @@ mod tests {
         assert!(ctx.documents.contains("[P1 p.2]\nWOX5 expression"));
         assert!(!ctx.documents.contains("Introduction about leaves"));
         assert_eq!(ctx.sources[1], Source { label: "P2".into(), paper_id: "b".into(), title: "Leaf development".into() });
+        // What each paper was handed over as, for the list on the question page.
+        assert_eq!(ctx.given, [Given { paper_id: "a".into(), record: "full", pages: 1 }, Given { paper_id: "b".into(), record: "full", pages: 0 }]);
     }
 
     #[test]
@@ -1725,7 +1850,10 @@ mod tests {
     #[test]
     fn slash_popup() {
         let names = |input: &str| slash_matches(input).iter().map(|command| command.name).collect::<Vec<_>>();
-        assert_eq!(names("/"), ["search", "cite", "review", "compare", "write", "new"]);
+        assert_eq!(names("/"), ["search", "cite", "review", "compare", "write", "verify", "new"]);
+        // A command that can stand alone works on what it says it does.
+        assert!(matches!(read_input("/verify"), Ok(Input::Ask(prompt)) if prompt.contains("逐条核对下面这段内容的依据：上一个回答")));
+        assert!(read_input("/cite").is_err());
         assert_eq!(names("/c"), ["cite", "compare"]);
         assert_eq!(names("/RE"), ["review"]);
         // Found by what it does, after those found by name.

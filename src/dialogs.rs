@@ -98,6 +98,47 @@ impl Workspace {
                     )
             }
 
+            Modal::FetchReport => {
+                let run = self.lib.as_ref()?.fetching.as_ref()?;
+                // What was not had comes first: that is where something is left to do.
+                let mut rows: Vec<(usize, &crate::app::FetchRow)> = run.rows.iter().enumerate().collect();
+                rows.sort_by_key(|(_, row)| match row.outcome.as_str() {
+                    "failed" => 0,
+                    "not_found" => 1,
+                    _ => 2,
+                });
+                let listed: Vec<AnyElement> = rows
+                    .into_iter()
+                    .map(|(i, row)| {
+                        let (state, color) = match row.outcome.as_str() {
+                            "saved" if row.textless => ("已保存 PDF，但没读出文字", Theme::warning()),
+                            "saved" => ("已保存 PDF", Theme::success()),
+                            "not_found" => ("没有找到开放获取的全文", Theme::text_tertiary()),
+                            _ => ("找到了地址，没有取到文件", Theme::warning()),
+                        };
+                        div()
+                            .id(("fetched", i))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .px(px(8.))
+                            .py(px(6.))
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(Theme::hover()))
+                            .on_click(self.on(Cmd::OpenImported(row.paper_id.clone()), cx))
+                            .child(div().truncate().child(row.title.clone()))
+                            .child(div().text_size(px(12.)).line_height(px(17.)).text_color(color).child(state))
+                            .when(!row.detail.is_empty(), |d| d.child(div().text_size(px(12.)).line_height(px(17.)).text_color(Theme::text_tertiary()).child(row.detail.clone())))
+                            .into_any_element()
+                    })
+                    .collect();
+                ui::dialog(620.)
+                    .child(ui::dialog_title(format!("查找开放全文 · {} 篇", run.rows.len())))
+                    .child(body().gap(px(2.)).child(div().pb(px(6.)).text_color(Theme::text_secondary()).child(format!("{}。没有取到的，可以打开文献的链接自己下载，再把 PDF 拖进窗口：它会附到原来的条目上。点一行打开那篇文献。", run.summary()))).children(listed))
+                    .child(div().flex().flex_none().justify_end().gap(px(8.)).px(px(20.)).py(px(14.)).child(ui::secondary_button("modal-cancel", "稍后再看").on_click(self.on(Cmd::CloseModal, cx))).child(ui::primary_button("modal-ok", "知道了").on_click(self.on(Cmd::SubmitModal, cx))))
+            }
+
             Modal::Note { paper_id, text } => {
                 let title = self.lib.as_ref().and_then(|lib| lib.paper(paper_id)).map(|paper| paper.title.clone()).unwrap_or_default();
                 ui::dialog(620.)

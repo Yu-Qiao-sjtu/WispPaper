@@ -9,6 +9,7 @@
 
 use hayro_interpret::font::{Glyph, GlyphRun};
 use hayro_interpret::hayro_cmap::BfString;
+use hayro_interpret::hayro_syntax::page::Page;
 use hayro_interpret::hayro_syntax::{DecryptionError, LoadPdfError, Pdf};
 use hayro_interpret::kurbo::{BezPath, Point, Rect};
 use hayro_interpret::{BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps, InterpreterCache, InterpreterSettings, SoftMask, TransformExt, interpret_page};
@@ -94,20 +95,90 @@ pub fn pages(data: Vec<u8>) -> Result<Vec<String>, String> {
     let mut out = vec![];
     let (mut read, mut unreadable) = (0, 0);
     for page in pdf.pages().iter() {
-        let (width, height) = page.render_dimensions();
-        let marks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut marks = Marks::default();
-            let mut context = Context::new(page.initial_transform(true).to_kurbo(), Rect::new(0., 0., width as f64, height as f64), &cache, page.xref(), InterpreterSettings::default());
-            interpret_page(page, &mut context, &mut marks);
-            marks
-        }))
-        .unwrap_or_default();
+        let marks = read_marks(page, &cache);
         read += marks.marks.len();
         unreadable += marks.unreadable;
         out.push(page_text(&marks.marks));
     }
     if unreadable > read { return Err(crate::fulltext::NO_ENCODING.into()) }
     Ok(out)
+}
+
+/// The glyphs of a page as it is interpreted; none when the interpreter gives up on it.
+fn read_marks<'a>(page: &Page<'a>, cache: &InterpreterCache<'a>) -> Marks {
+    let (width, height) = page.render_dimensions();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut marks = Marks::default();
+        let mut context = Context::new(page.initial_transform(true).to_kurbo(), Rect::new(0., 0., width as f64, height as f64), cache, page.xref(), InterpreterSettings::default());
+        interpret_page(page, &mut context, &mut marks);
+        marks
+    }))
+    .unwrap_or_default()
+}
+
+/// The glyphs of one page in the order they are drawn, for the preview:
+/// what a pointer dragged over the page selects.
+pub fn page_marks<'a>(page: &Page<'a>, cache: &InterpreterCache<'a>) -> Vec<Mark> {
+    read_marks(page, cache).marks
+}
+
+/// Whether a mark starts another line than the one before it stands on.
+fn starts_line(last: &Mark, next: &Mark) -> bool {
+    let size = last.size.max(next.size);
+    // Another baseline, or back to the left: a new line.
+    (next.y - last.y).abs() > size * 0.55 || next.x0 < last.x1 - size * 2.
+}
+
+/// The box a mark takes on the page: from above its capitals to below its descenders.
+fn mark_box(mark: &Mark) -> [f32; 4] {
+    [mark.x0, mark.y - mark.size * 0.8, mark.x1, mark.y + mark.size * 0.25]
+}
+
+/// The mark a point of the page is on, or the nearest to it: the line
+/// counts for more than the place along it, so a pointer in the margin
+/// takes the end of the line beside it.
+pub fn mark_at(marks: &[Mark], x: f32, y: f32) -> Option<usize> {
+    let away = |low: f32, high: f32, at: f32| if at < low { low - at } else if at > high { at - high } else { 0. };
+    let distance = |mark: &Mark| {
+        let [x0, y0, x1, y1] = mark_box(mark);
+        away(y0, y1, y) * 4. + away(x0, x1, x)
+    };
+    (0..marks.len()).min_by(|a, b| distance(&marks[*a]).total_cmp(&distance(&marks[*b])))
+}
+
+/// One box per line for a stretch of marks: what a selection covers.
+pub fn mark_boxes(marks: &[Mark]) -> Vec<[f32; 4]> {
+    let mut boxes: Vec<[f32; 4]> = vec![];
+    for (at, mark) in marks.iter().enumerate() {
+        let own = mark_box(mark);
+        match boxes.last_mut() {
+            Some(line) if at > 0 && !starts_line(&marks[at - 1], mark) => *line = [line[0].min(own[0]), line[1].min(own[1]), line[2].max(own[2]), line[3].max(own[3])],
+            _ => boxes.push(own),
+        }
+    }
+    boxes
+}
+
+/// A stretch of marks as it reads: words apart where the page sets them
+/// apart, a space where a line ends, and a word broken at a line's end
+/// put together again.
+pub fn marks_text(marks: &[Mark]) -> String {
+    let mut text = String::new();
+    for (at, mark) in marks.iter().enumerate() {
+        if at > 0 {
+            let last = &marks[at - 1];
+            if starts_line(last, mark) {
+                // `devel-` / `opment`: one word. `single-` / `Cell`, or a dash after a space, stays as set.
+                let broken = text.ends_with('-') && text.chars().rev().nth(1).is_some_and(char::is_alphabetic) && mark.text.chars().next().is_some_and(char::is_lowercase);
+                if broken { text.pop(); } else if !text.ends_with(' ') { text.push(' ') }
+            } else {
+                let gap = mark.x0 - last.x1;
+                if (gap > last.size.max(mark.size) * 0.11 || gap < -last.size) && !text.ends_with(' ') && !mark.text.starts_with(' ') { text.push(' ') }
+            }
+        }
+        text.push_str(&mark.text);
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A line of a page: its text, where it stands and how it is set.
@@ -185,12 +256,7 @@ fn lines(marks: &[Mark]) -> Vec<Line> {
     let mut out = vec![];
     let mut start = 0;
     for at in 1..=marks.len() {
-        let ends = at == marks.len() || {
-            let (last, next) = (&marks[at - 1], &marks[at]);
-            let size = last.size.max(next.size);
-            // Another baseline, or back to the left: a new line.
-            (next.y - last.y).abs() > size * 0.55 || next.x0 < last.x1 - size * 2.
-        };
+        let ends = at == marks.len() || starts_line(&marks[at - 1], &marks[at]);
         if ends {
             out.extend(line_of(&marks[start..at]));
             start = at;
@@ -240,6 +306,26 @@ mod tests {
     /// A line of text set glyph by glyph from `x`, each half its size wide.
     fn set(text: &str, x: f32, y: f32, size: f32, bold: bool) -> Vec<Mark> {
         text.chars().enumerate().map(|(i, c)| Mark { text: c.to_string(), x0: x + i as f32 * size * 0.5, x1: x + (i + 1) as f32 * size * 0.5, y, size, bold }).collect()
+    }
+
+    #[test]
+    fn a_stretch_of_a_page() {
+        let mut marks = set("Roots adapt to devel-", 50., 100., 10., false);
+        marks.extend(set("opment in soil", 50., 114., 10., false));
+        // A word set apart by a gap and not by a space glyph.
+        marks.extend(set("deeply", 150., 114., 10., false));
+        assert_eq!(marks_text(&marks), "Roots adapt to development in soil deeply");
+        assert_eq!(marks_text(&marks[6..11]), "adapt");
+        // The pointer on a letter, between the lines, and out in the right margin of the first.
+        assert_eq!(mark_at(&marks, 51., 97.), Some(0));
+        assert_eq!(marks[mark_at(&marks, 76., 113.).unwrap()].text, "t");
+        assert_eq!(mark_at(&marks, 400., 99.), Some(20));
+        assert_eq!(mark_at(&[], 1., 1.), None);
+        // One box a line, each as wide as what is taken of that line.
+        let boxes = mark_boxes(&marks[15..25]);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!((boxes[0][0], boxes[0][2], boxes[1][0], boxes[1][2]), (125., 155., 50., 70.));
+        assert!(boxes[0][1] < 100. && boxes[0][3] > 100.);
     }
 
     #[test]

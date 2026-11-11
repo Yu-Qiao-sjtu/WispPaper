@@ -2,7 +2,7 @@
 //! JSON-RPC message. The transport (lines on stdin and stdout) is the `wisp`
 //! binary's; nothing here reads or writes a stream.
 
-use crate::sources::Fetch;
+use crate::sources::{Download, Fetch};
 use crate::tools;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -18,6 +18,7 @@ const INSTRUCTIONS: &str = "Wisp Paper 的本地文献库。先用 list_librarie
 /// tools that change a library are offered at all.
 pub struct Server<'a> {
     pub fetch: Fetch<'a>,
+    pub download: Download<'a>,
     pub read_only: bool,
 }
 
@@ -46,7 +47,7 @@ pub fn handle(root: &Path, message: &Value, server: &Server) -> Option<Value> {
                 let args = if params["arguments"].is_null() { &empty } else { &params["arguments"] };
                 // A failed tool is a result the model reads and recovers from, not a protocol error.
                 let refused = server.read_only && tools::catalog().iter().any(|t| t.name == name && t.writes);
-                let outcome = if refused { Err(format!("这个 MCP 服务以只读方式启动，不能使用 {name}。")) } else { tools::call(root, name, args, server.fetch) };
+                let outcome = if refused { Err(format!("这个 MCP 服务以只读方式启动，不能使用 {name}。")) } else { tools::call(root, name, args, server.fetch, server.download) };
                 Ok(match outcome {
                     Ok(value) => json!({"content": [{"type": "text", "text": value.to_string()}], "structuredContent": value, "isError": false}),
                     Err(error) => json!({"content": [{"type": "text", "text": error}], "isError": true}),
@@ -73,7 +74,7 @@ mod tests {
     #[test]
     fn a_session() {
         let (root, id) = tools::tests::sample();
-        let server = Server { fetch: &tools::tests::offline, read_only: false };
+        let server = Server { fetch: &tools::tests::offline, download: &tools::tests::no_download, read_only: false };
         let ask = |message: Value| handle(&root, &message, &server);
         let hello = ask(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})).unwrap();
         assert_eq!((hello["id"].as_i64(), hello["result"]["protocolVersion"].as_str()), (Some(1), Some("2025-03-26")));
@@ -104,7 +105,7 @@ mod tests {
         // Read-only: the tools that change a library are neither listed nor callable.
         let annotated = listed["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "run_search").unwrap();
         assert_eq!(annotated["annotations"]["readOnlyHint"], false);
-        let reader = Server { fetch: &tools::tests::offline, read_only: true };
+        let reader = Server { fetch: &tools::tests::offline, download: &tools::tests::no_download, read_only: true };
         let listed = handle(&root, &json!({"id": 9, "method": "tools/list"}), &reader).unwrap();
         let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"search_online") && !names.contains(&"run_search") && !names.contains(&"save_search"));

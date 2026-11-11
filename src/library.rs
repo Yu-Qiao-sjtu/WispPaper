@@ -128,6 +128,46 @@ impl Workspace {
         )
     }
 
+    /// The round of looking for open full texts, beside the import's: how far it is, then what came of it.
+    fn render_fetching(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let run = self.lib.as_ref()?.fetching.as_ref()?;
+        let card = div().flex().flex_col().gap(px(5.)).p(px(10.)).rounded(px(8.)).border_1().border_color(Theme::line()).bg(Theme::bg_body()).text_size(px(12.)).line_height(px(17.));
+        let lib = self.lib.as_ref()?;
+        if run.running() {
+            let done = run.rows.len();
+            let current = run.working.first().and_then(|id| lib.paper(id)).map(|paper| paper.title.clone()).unwrap_or_default();
+            return Some(
+                card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(ui::spinner("fetch-working", 13., Theme::accent()))
+                        .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child(format!("正在查找全文 · {done} / {}", run.total)))
+                        .child(ui::ghost_button("fetch-stop", None, Some("停止".into())).h(px(20.)).px(px(6.)).text_size(px(12.)).on_click(self.on(Cmd::StopFetch, cx))),
+                )
+                .child(div().truncate().text_color(Theme::text_tertiary()).child(current))
+                .child(div().w_full().h(px(4.)).rounded_full().bg(Theme::groove()).overflow_hidden().child(div().h_full().rounded_full().bg(Theme::accent()).w(relative(done as f32 / run.total.max(1) as f32))))
+                .when(done > 0, |d| d.child(div().text_color(Theme::text_secondary()).child(run.summary())))
+                .into_any_element(),
+            );
+        }
+        Some(
+            card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(ui::icon("check", 13., Theme::success()))
+                    .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child(format!("全文查找完成 · {} 篇", run.rows.len())))
+                    .child(ui::ghost_button("fetch-close", Some("x"), None).h(px(20.)).min_w(px(20.)).on_click(self.on(Cmd::CloseFetch, cx))),
+            )
+            .child(div().text_color(Theme::text_secondary()).child(run.summary()))
+            .child(div().flex().child(ui::ghost_button("fetch-report", None, Some("查看明细".into())).h(px(22.)).px(px(6.)).text_size(px(12.)).text_color(Theme::accent()).on_click(self.on(Cmd::ShowFetch, cx))))
+            .into_any_element(),
+        )
+    }
+
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let lib = self.lib.as_ref().unwrap();
         let now = time::now_millis();
@@ -226,6 +266,7 @@ impl Workspace {
                     .child(div().id("tags").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(1.)).children(tag_rows).when(tags.is_empty(), |d| d.child(div().px(px(8.)).text_size(px(12.)).text_color(Theme::text_placeholder()).child("编辑文献时添加标签"))))
             )
             .children(self.render_import(cx))
+            .children(self.render_fetching(cx))
             .child(
                 div()
                     .flex()
@@ -344,6 +385,8 @@ impl Workspace {
 
         let total = filter::view_count(&lib.papers, View::All, 0);
         let shown = lib.shown.len();
+        // Of the papers on show, those without a PDF that have a number to be looked up by.
+        let lookable = if lib.filters.view == View::NoPdf { lib.shown.iter().filter(|&&i| wisp_core::openaccess::lookable(&lib.papers[i])).count() } else { 0 };
         let body = if shown == 0 {
             if lib.papers.is_empty() {
                 ui::empty_state("library", "这个文献库还是空的", "点击左侧「添加文献」：粘贴 DOI 或 PMID、导入 BibTeX / RIS，或者直接把 PDF 拖进窗口。").into_any_element()
@@ -391,6 +434,23 @@ impl Workspace {
             )
             .child(div().id("filters").flex().flex_wrap().items_center().gap(px(6.)).px(px(16.)).py(px(10.)).children(chips))
             .child(div().flex().flex_none().h(px(32.)).px(px(8.)).border_t_1().border_b_1().border_color(Theme::line()).bg(Theme::bg_sunken()).text_size(px(12.)).text_color(Theme::text_tertiary()).children(header))
+            // The papers without a PDF: the open ones among them can be fetched in one go.
+            .when(lib.filters.view == View::NoPdf && lookable > 0 && lib.fetching.as_ref().is_none_or(|run| !run.running()), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(16.))
+                        .py(px(8.))
+                        .border_b_1()
+                        .border_color(Theme::line())
+                        .bg(Theme::accent_soft())
+                        .child(div().flex_1().min_w_0().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_secondary()).child(format!("这些文献还没有 PDF。可以替你找开放获取的全文（arXiv、开放获取期刊、作者存档的版本），下载后附到各自的条目上；要付费或登录的不会去取。查找时会把 DOI 或 PMID 发给 OpenAlex、Europe PMC 和出版商。{}", if lookable < shown { format!("另有 {} 篇没有 DOI、PMID 或 arXiv 编号，查不了。", shown - lookable) } else { String::new() })))
+                        .child(ui::primary_button("find-pdfs", format!("为 {lookable} 篇查找开放全文")).h(px(30.)).flex_none().on_click(self.on(Cmd::FindPdfs(None), cx))),
+                )
+            })
             .child(body)
             .child(
                 div()
@@ -404,8 +464,9 @@ impl Workspace {
                     .border_color(Theme::line())
                     .text_size(px(12.))
                     .text_color(Theme::text_tertiary())
-                    .child(if filtered || shown != total { format!("显示 {shown} / {total} 篇") } else { format!("共 {total} 篇") })
-                    .child(status),
+                    .gap(px(12.))
+                    .child(div().flex_none().child(if filtered || shown != total { format!("显示 {shown} / {total} 篇") } else { format!("共 {total} 篇") }))
+                    .child(div().min_w_0().truncate().child(status)),
             )
             .into_any_element()
     }

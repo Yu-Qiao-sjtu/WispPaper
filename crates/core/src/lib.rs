@@ -14,6 +14,7 @@
 //! - `markdown` the Markdown of an answer → blocks to draw
 //! - `ai`       context building, request bodies and stream parsing for 文献库提问
 //! - `sources`  literature database searches: URLs to ask, records read from the replies
+//! - `openaccess` where a paper's full text can be had for free: addresses to ask, candidates read from the replies
 //! - `settings` settings.json, and where it and the libraries live
 //! - `tools`    what an agent can do with a library: the one table behind the command line, MCP and the assistant
 //! - `mcp`      the Model Context Protocol replies for those tools
@@ -29,6 +30,7 @@ pub mod lookup;
 pub mod markdown;
 pub mod mcp;
 pub mod model;
+pub mod openaccess;
 pub mod pdftext;
 pub mod settings;
 pub mod sources;
