@@ -1,0 +1,51 @@
+name: Pages
+
+# The project page, https://xuzhougeng.github.io/WispPaper/. It is site/ plus
+# the screenshots under docs/images (site/build.sh), and release.json: the
+# latest release's files, which the download buttons read. So it is deployed
+# again after every release, not only when the page changes.
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", "docs/images/**", "assets/branding/**", ".github/workflows/pages.yml"]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and deploy
+    # After a Release run: only one that published (a pull request's is a rehearsal).
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'pull_request')
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Put the page together
+        run: sh site/build.sh _site
+      - name: The latest release, for the download buttons
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq '{tag: .tag_name, published: .published_at, url: .html_url, assets: [.assets[] | {name, size, url: .browser_download_url}]}' \
+            > _site/release.json || echo '{}' > _site/release.json
+          cat _site/release.json
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

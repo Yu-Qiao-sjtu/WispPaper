@@ -75,6 +75,10 @@ A thin shell over `tools` and `mcp`: argument words in, JSON out; `wisp mcp` is 
 - `input.rs` is the app's own text input (single / multi-line, IME via `EntityInputHandler`); `pdf.rs` renders pages with `hayro` on a worker thread into a virtualised list, keeping a bounded number of pages.
 - `build.rs` embeds every file under `assets/` (of `branding/`, only `app-icon.png`) into the binary; icons are loaded by name through `ui::icon`. On Windows it also compiles the icon resource.
 
+### `site/`: the project page
+
+https://xuzhougeng.github.io/WispPaper/ is three hand-written files (`index.html`, `style.css`, `site.js`), no generator and nothing loaded from another host (no web fonts: the stacks are system ones). `site/build.sh [folder]` adds the screenshots from `docs/images` and the icon; `python3 -m http.server --directory dist/site` shows the result. `.github/workflows/pages.yml` deploys it on a push to main that touches it and after every published release, writing `release.json` (the latest release's files) next to the page: the download buttons read it, and lead to the release page without it. The page is laid out as a paper (numbered figures, citations that can be clicked); its numbers are those of `docs/TUTORIAL.md`, and its colours are `theme.rs`'s. Keep it out of `scripts/`, whose changes rehearse the packaging.
+
 ### `vendor/`
 
 `gpui` 0.2.2, `taffy` 0.9.0 and `xattr` 0.2.3 are vendored with local patches and wired in through `[patch.crates-io]`. Patched spots carry a `quiet.md:` comment and are listed in `vendor/PATCHES.md`. When changing vendored code, add a row there and keep the comment; do not bump these versions without re-applying the patches. GPUI APIs here are 0.2.2 plus those patches (for example `grid_col_widths`, `ListState::estimated_scroll_metrics`), so check `vendor/gpui/src` rather than upstream docs.
