@@ -1,7 +1,7 @@
 //! The detail panel of the selected paper: 信息 (record, statuses, custom
 //! fields, notes, files), PDF (preview) and 提问 (questions about this paper).
 
-use crate::app::{Cmd, MenuKind, Tab, Translated, Workspace};
+use crate::app::{Cmd, Edge, MenuKind, Tab, Translated, Workspace};
 use crate::pdf::{Zoom, ZoomTo};
 use crate::theme::{self, Theme};
 use crate::ui;
@@ -78,7 +78,7 @@ impl Workspace {
             Tab::Ask => self.render_chat(true, window, cx),
         };
         // The panel's left edge: drag it to give the list or the paper more room, click it twice for the width it came with.
-        let resizing = self.resizing;
+        let resizing = self.resizing == Some(Edge::Detail);
         let edge = div()
             .id("detail-edge")
             .group("detail-edge")
@@ -93,12 +93,12 @@ impl Workspace {
             .occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
                 if event.click_count >= 2 {
-                    this.resizing = false;
+                    this.resizing = None;
                     this.settings.detail_width = 0.;
                     if let Some(lib) = this.lib.as_mut() { lib.wide = false }
                     this.save_settings(cx);
                 } else {
-                    this.resizing = true;
+                    this.resizing = Some(Edge::Detail);
                 }
                 cx.notify();
             }))
