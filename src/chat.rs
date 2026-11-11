@@ -3,6 +3,7 @@
 //! it open the paper, or its PDF at that page.
 
 use crate::app::{Cmd, Workspace};
+use crate::settings::SettingsPage;
 use crate::theme::Theme;
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
@@ -12,9 +13,9 @@ impl Workspace {
     pub fn render_chat(&mut self, about_paper: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let lib = self.lib.as_ref().unwrap();
         let chat = if about_paper { &lib.paper_chat } else { &lib.library_chat };
-        let profile = self.settings.profile();
-        let configured = profile.is_some_and(|p| !p.key().is_empty());
-        let model = profile.map(|p| p.model.clone()).unwrap_or_default();
+        let profile = self.settings.profile_or_default();
+        let configured = !profile.key().is_empty();
+        let model = profile.model.clone();
 
         // What the model has been given, or will be given with the first question.
         let scope = match &chat.ctx {
@@ -100,7 +101,7 @@ impl Workspace {
 
         let empty = chat.messages.is_empty() && chat.error.is_empty();
         let body = if !configured {
-            ui::empty_state("sparkle", "还没有配置模型", "提问需要一个模型服务：Claude API，或任何 OpenAI 兼容的服务。API Key 只保存在本机。").child(ui::primary_button(if about_paper { "chat-settings-paper" } else { "chat-settings" }, "打开设置").on_click(self.on(Cmd::OpenSettings, cx))).into_any_element()
+            ui::empty_state("sparkle", "还没有配置模型", "提问需要一个模型服务：Claude API，或任何 OpenAI 兼容的服务。API Key 只保存在本机。").child(ui::primary_button(if about_paper { "chat-settings-paper" } else { "chat-settings" }, "打开设置").on_click(self.on(Cmd::OpenSettings(SettingsPage::Ai), cx))).into_any_element()
         } else if empty {
             let suggestions: &[&str] = if about_paper { &["这篇文献的研究问题、方法和主要结论是什么？", "作者的结论有哪些证据支持？有什么局限？", "用三句话向同行介绍这篇文章。"] } else { &["这些文献主要在研究哪些问题？按主题归类。", "哪些文献的结论相互支持或矛盾？", "我还没读的文献里，哪几篇最值得先读？为什么？"] };
             ui::empty_state("sparkle", if about_paper { "就这篇文献提问" } else { "向文献库提问" }, "回答依据文献库里的记录、笔记和已存 PDF 的全文，并标出出处。")
@@ -152,7 +153,7 @@ impl Workspace {
                                 .items_end()
                                 .gap(px(8.))
                                 .child(ui::field(&chat.input, window, cx).flex_1().max_h(px(160.)).overflow_hidden())
-                                .child(ui::primary_button(if about_paper { "chat-send-paper" } else { "chat-send" }, "").w(px(34.)).px(px(0.)).when(chat.busy, |d| d.opacity(0.5)).child(ui::icon("send", 16., gpui::white())).on_click(self.on(Cmd::Ask(about_paper), cx))),
+                                .child(ui::primary_button(if about_paper { "chat-send-paper" } else { "chat-send" }, "").w(px(34.)).px(px(0.)).when(chat.busy, |d| d.opacity(0.5)).child(ui::icon("send", 16., Theme::on_accent())).on_click(self.on(Cmd::Ask(about_paper), cx))),
                         )
                         .child(div().text_size(px(11.)).text_color(Theme::text_placeholder()).child(format!("{model} · Enter 发送，Shift+Enter 换行 · 回答可能有误，请对照原文"))),
                 )

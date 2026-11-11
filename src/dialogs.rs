@@ -1,12 +1,11 @@
-//! The dialogs: library, add by identifier, paper form, custom fields,
-//! settings and confirmations. Their state and what happens on submit are
+//! The dialogs: library, add by identifier, paper form, custom fields
+//! and confirmations. Their state and what happens on submit are
 //! in app.rs; this file draws them.
 
 use crate::app::{Cmd, Modal, Workspace};
 use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
-use wisp_core::ai::Protocol;
 use wisp_core::model::FieldKind;
 
 /// A choice among a few: the chosen one filled with the accent.
@@ -22,7 +21,7 @@ fn option_chip(id: impl Into<ElementId>, label: impl Into<SharedString>, chosen:
         .border_1()
         .cursor_pointer()
         .text_size(px(12.))
-        .when(chosen, |d| d.bg(Theme::accent()).border_color(Theme::accent()).text_color(gpui::white()))
+        .when(chosen, |d| d.bg(Theme::accent()).border_color(Theme::accent()).text_color(Theme::on_accent()))
         .when(!chosen, |d| d.border_color(Theme::line_strong()).text_color(Theme::text_secondary()).hover(|s| s.bg(Theme::hover())))
         .child(label.into())
 }
@@ -59,9 +58,9 @@ impl Workspace {
                         .rounded_full()
                         .cursor_pointer()
                         .border_2()
-                        .border_color(if chosen { theme::c(accent.strong) } else { gpui::transparent_black() })
+                        .border_color(if chosen { accent.strong() } else { gpui::transparent_black() })
                         .on_click(self.on(Cmd::PickColor(accent.key.to_string()), cx))
-                        .child(div().size(px(18.)).rounded_full().bg(theme::c(accent.strong)))
+                        .child(div().size(px(18.)).rounded_full().bg(accent.strong()))
                 }).collect();
                 ui::dialog(480.)
                     .child(ui::dialog_title(if editing.is_some() { "编辑文献库" } else { "新建文献库" }))
@@ -198,26 +197,6 @@ impl Workspace {
                             .child(ui::primary_button("modal-ok", if editing.is_some() { "保存修改" } else { "添加词条" }).on_click(self.on(Cmd::SubmitModal, cx))),
                     )
             }
-
-            Modal::Settings { data_dir, base_url, api_key, model, protocol } => ui::dialog(540.)
-                .child(ui::dialog_title("设置"))
-                .child(
-                    body()
-                        .child(ui::caption("数据"))
-                        .child(ui::form_row("数据目录（所有文献库都在这个文件夹下）", ui::field(data_dir, window, cx)))
-                        .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("改到别的目录后，首页显示那个目录里的文献库；原目录里的文献库不会被移动。"))
-                        .child(div().pt(px(8.)).child(ui::caption("提问使用的模型")))
-                        .child(div().flex().gap(px(6.)).child(option_chip("protocol-anthropic", "Claude API", *protocol == Protocol::Anthropic).on_click(self.on(Cmd::PickProtocol(Protocol::Anthropic), cx))).child(option_chip("protocol-openai", "OpenAI 兼容", *protocol == Protocol::OpenAI).on_click(self.on(Cmd::PickProtocol(Protocol::OpenAI), cx))))
-                        .child(ui::form_row("服务地址", ui::field(base_url, window, cx)))
-                        .child(ui::form_row("模型", ui::field(model, window, cx)))
-                        .child(ui::form_row("API Key", ui::field(api_key, window, cx)))
-                        .child(div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_tertiary()).child(match protocol {
-                            Protocol::Anthropic => "API Key 以明文保存在本机的 settings.json 里；留空则读取环境变量 ANTHROPIC_API_KEY。提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。",
-                            Protocol::OpenAI => "适用于任何兼容 chat/completions 的服务，地址写到 /v1。API Key 以明文保存在本机的 settings.json 里；留空则读取环境变量 OPENAI_API_KEY。提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。",
-                        }))
-                        .child(error),
-                )
-                .child(footer("保存", false, self, cx)),
         };
         // The top strip still drags the window while a dialog is open.
         Some(div().absolute().top_0().left_0().size_full().occlude().flex().items_center().justify_center().bg(Theme::scrim()).child(ui::title_strip().absolute().top_0().left_0()).child(card).into_any_element())

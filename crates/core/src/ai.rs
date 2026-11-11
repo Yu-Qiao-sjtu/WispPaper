@@ -312,8 +312,8 @@ const FALLBACK_MODELS: [&str; 5] = ["claude-fable-5-2", "claude-fable-5-1", "cla
 /// The streaming request for one turn of the conversation.
 pub fn chat_request(profile: &Profile, ctx: &Context, messages: &[ChatMessage]) -> Result<HttpRequest, String> {
     let key = profile.key();
-    if key.is_empty() { return Err("还没有配置 API Key。请在「设置 › 模型」里填写，或设置对应的环境变量。".into()) }
-    if profile.model.trim().is_empty() { return Err("请在「设置 › 模型」里填写模型名称。".into()) }
+    if key.is_empty() { return Err("还没有配置 API Key。请在「设置 › AI」里填写，或设置对应的环境变量。".into()) }
+    if profile.model.trim().is_empty() { return Err("请在「设置 › AI」里填写模型名称。".into()) }
     let base = profile.base_url.trim().trim_end_matches('/');
     if !base.starts_with("https://") && !base.starts_with("http://") { return Err("模型服务地址应以 https:// 或 http:// 开头。".into()) }
     let turns: Vec<Value> = messages.iter().map(|m| json!({"role": if m.from_user { "user" } else { "assistant" }, "content": m.content})).collect();

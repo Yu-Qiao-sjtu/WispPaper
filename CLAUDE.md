@@ -1,0 +1,63 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Wisp Paper is a local-first literature library desktop app (collect papers, organise, preview PDFs, ask an LLM about the library), written in Rust with GPUI. Targets Windows and macOS; Linux compiles but is untested. The UI is Chinese-only: user-facing strings and error messages are written in Chinese, code comments in English.
+
+## Commands
+
+```sh
+cargo run --release                     # run the app
+cargo test                              # both crates (workspace default-members)
+cargo test -p wisp_core                 # engine only; no GPUI build, much faster
+cargo test -p wisp_core store::         # one module's tests
+cargo test -p wisp_core <test_name>     # one test
+cargo test -- --ignored lookup          # live Crossref / Europe PMC lookups (network)
+cargo clippy --all-targets              # expected to be warning-free
+```
+
+- The toolchain is pinned in `rust-toolchain.toml` (clippy only). There is no rustfmt component and no `rustfmt.toml`: the code is hand-formatted with long lines and one-line `if x { return }` bodies. Do not run `cargo fmt`; match the surrounding style.
+- Windows needs the MSVC build tools.
+- Demo data: `cargo run -p wisp_core --example seed -- /tmp/wisp-demo some.pdf`, then `WISP_PAPER_HOME=/tmp/wisp-demo cargo run`.
+- `WISP_PAPER_HOME` moves both the data folder and `settings.json` to one directory; use it for any manual run so the real library in `Documents/WispPaper` is not touched.
+- Debug builds only: `WISP_PAPER_DEV=open:0,select:0,tab:pdf` scripts the window into a state at start (steps: `open`, `select`, `tab`, `page`, `wide`, `menu`, `search`, `modal`, `settings:<page>`, `theme:dark`, `record:<shortcut id>`, `update`; see `dev_start` at the end of `src/app.rs`). The window does not take focus when it is set. `theme:` is saved to `settings.json`, so combine it with `WISP_PAPER_HOME`.
+- `WISP_PAPER_UPDATE_URL` points the release check at another address (it must answer with a redirect to this project's release page).
+- In a `#[cfg(test)]` module of a file that has `use gpui::*`, do not write `use super::*`: it brings in gpui's `test` attribute, and `#[test]` then fails with "recursion limit reached". Import the names you need.
+
+## Architecture
+
+A Cargo workspace of two crates. Dependencies point one way only: the app depends on core.
+
+### `crates/core` (`wisp_core`): the engine, no GPUI
+
+Everything that can be decided without a window or a socket lives here, and it is where nearly all tests are. That includes the pure halves of networked features: `lookup` builds Crossref / Europe PMC URLs and turns their JSON into a `Paper`; `ai` builds the context, the request body for both protocols (Anthropic and OpenAI-compatible) and parses stream lines into `StreamEvent`s. The actual HTTP (blocking `ureq`) is in the app's `src/net.rs`, whose tests serve canned responses from a local port.
+
+On-disk layout: the data root holds one folder per library, each with `library.json` (`libraries`), `wisp-paper.sqlite` and `papers/` (`store`). Attachment paths in the database are relative to the library folder so a folder can be copied elsewhere. Removing a library or attachment moves it to `removed/`; nothing is deleted.
+
+`store.rs` notes:
+- The schema is one `CREATE TABLE IF NOT EXISTS` batch guarded by `SCHEMA_VERSION` / `PRAGMA user_version`; a newer database is refused. Bump the version when an older build would misread the data.
+- Deduplication is by DOI, PMID (`paper_identifiers`), then `title_key`. Trashed papers stay in `papers` (marked by a `trashed_papers` row) so they keep blocking re-import.
+- `Store::in_memory` is what tests use.
+- Status values are stored as English keys and shown through the label tables in `model.rs` (`SCREENINGS`, `READINGS`, …). The labels are not translations: the stored key `excluded` is displayed as 「相关」.
+
+### Root crate (`wisp_paper`): the GPUI app
+
+- `src/app.rs` holds all state in one root view, `Workspace` (`lib: Option<Library>` is the open library, `None` is the home page). Every click is a `Cmd` enum value, wired with `self.on(Cmd::…, cx)` and handled in `Workspace::run`. Popup menus are built from a `MenuKind` in `open_menu`; dialogs are `Modal` variants, built and submitted in `app.rs`.
+- `home.rs`, `library.rs`, `detail.rs`, `chat.rs`, `dialogs.rs` are `impl Workspace` blocks that only render. A new feature usually means: a `Cmd` variant, its arm in `run`, and the element that emits it.
+- Store writes go through `Workspace::change`, which runs the closure, calls `Library::reload` (re-reads papers, fields, files, trash and refilters) and shows a toast on failure. `Library::shown` is indices into `papers`, recomputed by `refilter`.
+- Background work (PDF text extraction, lookups, chat streaming) runs on `cx.background_executor()` and comes back through `this.update`. Each task captures the library id (chats also a `generation` counter) and stops when the user has since closed the library or started a new conversation; keep that check in new async code.
+- A library question's scope is the currently shown list (`lib.shown`), so view, search and filters change what the model reads. The context is built once with the first question of a conversation. Conversations are not persisted.
+- `settings.rs` is the settings view (通用, 外观, 快捷键, AI, 关于). It replaces the page while `Workspace::settings_view` is `Some`; the open library stays underneath. There is no save button: each change writes `settings.json` at once.
+- `shortcuts.rs` owns every key binding. `shortcuts::rebuild` clears and re-binds all of them (the text field's too) from the defaults plus `Settings::shortcuts`; call it after any change. While 设置 › 快捷键 waits for a key, all bindings are cleared and `Workspace::record_key` receives the key. A new shortcut needs an entry in `SHORTCUTS`, an action, its binding in `rebuild`, an `.on_action` in `home.rs` and an arm in `Workspace::shortcut`.
+- Colours come only from `theme.rs`, which has a light and a dark set (`theme::dark()`); `Workspace::apply_appearance` picks one from the setting or the system. Do not hard-code colours elsewhere; text on an accent fill is `Theme::on_accent()`, a library colour is `Accent::strong()` / `soft()`.
+- The release check (`check_update`) reads the redirect of GitHub's `releases/latest` (the JSON API is rate-limited per address). It only notifies and opens the release page; there is no release packaging or signing in this repository, so nothing is downloaded or installed.
+- `input.rs` is the app's own text input (single / multi-line, IME via `EntityInputHandler`); `pdf.rs` renders pages with `hayro` on a worker thread into a virtualised list, keeping a bounded number of pages.
+- `build.rs` embeds every file under `assets/` (of `branding/`, only `app-icon.png`) into the binary; icons are loaded by name through `ui::icon`. On Windows it also compiles the icon resource.
+
+### `vendor/`
+
+`gpui` 0.2.2, `taffy` 0.9.0 and `xattr` 0.2.3 are vendored with local patches and wired in through `[patch.crates-io]`. Patched spots carry a `quiet.md:` comment and are listed in `vendor/PATCHES.md`. When changing vendored code, add a row there and keep the comment; do not bump these versions without re-applying the patches. GPUI APIs here are 0.2.2 plus those patches (for example `grid_col_widths`, `ListState::estimated_scroll_metrics`), so check `vendor/gpui/src` rather than upstream docs.
+
+## Scope
+
+Ported from BiblioCell, deliberately without its datasets, scheduled source tracking, MCP server, CLI and web version. API keys are stored in plain text in `settings.json`; when empty, `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are read from the environment.

@@ -4,6 +4,8 @@
 
 use crate::input::{InputEvent, TextInput};
 use crate::pdf::PdfView;
+use crate::settings::{SettingsPage, SettingsView, UpdateState};
+use crate::shortcuts::{self, Dismiss};
 use crate::theme;
 use gpui::*;
 use std::collections::{BTreeMap, HashSet};
@@ -17,12 +19,6 @@ use wisp_core::model::*;
 use wisp_core::settings::Settings;
 use wisp_core::store::{Store, TrashEntry};
 use wisp_core::{export, fulltext, import, time};
-
-actions!(workspace, [Dismiss, FocusSearch]);
-
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("escape", Dismiss, Some("Workspace")), KeyBinding::new("secondary-f", FocusSearch, Some("Workspace"))]);
-}
 
 /// What the middle of an open library shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,8 +74,23 @@ pub enum Cmd {
     AskRemoveLibrary(String),
     RemoveLibrary(String),
     GoHome,
-    OpenSettings,
     RevealFolder,
+    OpenUrl(String),
+    // Settings
+    OpenSettings(SettingsPage),
+    CloseSettings,
+    PickDataDir,
+    ResetDataDir,
+    RevealDataDir,
+    ToggleAutoUpdate,
+    CheckUpdate,
+    SetAppearance(String),
+    SetDensity(String),
+    RecordShortcut(String),
+    ClearShortcut(String),
+    ResetShortcut(String),
+    ResetShortcuts,
+    PickProtocol(Protocol),
     // Collect
     AddById,
     AddManual,
@@ -127,7 +138,6 @@ pub enum Cmd {
     SubmitModal,
     PickColor(String),
     PickKind(FieldKind),
-    PickProtocol(Protocol),
     PickOption(String, String),
     ToggleInTable,
 }
@@ -188,7 +198,6 @@ pub enum Modal {
     AddById { input: Entity<TextInput>, busy: bool },
     Paper(Box<PaperForm>),
     Fields { editing: Option<String>, name: Entity<TextInput>, options: Entity<TextInput>, kind: FieldKind, in_table: bool },
-    Settings { data_dir: Entity<TextInput>, base_url: Entity<TextInput>, api_key: Entity<TextInput>, model: Entity<TextInput>, protocol: Protocol },
     Confirm { title: String, message: String, action: String, cmd: Cmd },
 }
 
@@ -228,16 +237,21 @@ pub struct Workspace {
     pub root: PathBuf,
     pub libraries: Vec<LibraryInfo>,
     pub lib: Option<Library>,
+    /// 设置, shown instead of the home page or the library while it is open.
+    pub settings_view: Option<SettingsView>,
+    pub update: UpdateState,
+    /// The version the automatic check last announced, so it says it once.
+    pub update_told: Option<String>,
     pub modal: Option<Modal>,
     pub modal_error: String,
-    modal_subscriptions: Vec<Subscription>,
+    pub modal_subscriptions: Vec<Subscription>,
     pub menu: Option<Menu>,
     pub toast: Option<Toast>,
     pub home_scroll: ScrollHandle,
 }
 
 /// Where the libraries live unless the settings say otherwise.
-fn default_root() -> PathBuf {
+pub(crate) fn default_root() -> PathBuf {
     if let Ok(home) = std::env::var("WISP_PAPER_HOME") && !home.trim().is_empty() { return PathBuf::from(home) }
     dirs::document_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("WispPaper")
 }
@@ -323,8 +337,13 @@ impl Workspace {
         let focus = cx.focus_handle();
         window.focus(&focus);
         theme::set_accent("blue");
+        shortcuts::rebuild(&settings.shortcuts, cx);
         let libraries = libraries::list(&root);
-        Workspace { focus, settings, settings_path, root, libraries, lib: None, modal: None, modal_error: String::new(), modal_subscriptions: vec![], menu: None, toast, home_scroll: ScrollHandle::new() }
+        let mut this = Workspace { focus, settings, settings_path, root, libraries, lib: None, settings_view: None, update: UpdateState::Idle, update_told: None, modal: None, modal_error: String::new(), modal_subscriptions: vec![], menu: None, toast, home_scroll: ScrollHandle::new() };
+        this.apply_appearance(window);
+        cx.observe_window_appearance(window, |this, window, _| this.apply_appearance(window)).detach();
+        this.watch_updates(cx);
+        this
     }
 
     pub fn on(&self, cmd: Cmd, cx: &mut Context<Self>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
@@ -376,7 +395,7 @@ impl Workspace {
         }
     }
 
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
+    pub fn save_settings(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = self.settings.save(&self.settings_path) {
             self.fail(format!("{err:#}"), cx);
         }
@@ -453,11 +472,14 @@ impl Workspace {
 
     pub fn run(&mut self, cmd: Cmd, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
+        // Anything else than a key ends the wait for a shortcut's new key.
+        if !matches!(cmd, Cmd::RecordShortcut(_)) { self.stop_recording(cx) }
         cx.notify();
         match cmd {
             Cmd::OpenLibrary(id) => self.open_library(&id, window, cx),
             Cmd::GoHome => {
                 self.lib = None;
+                self.settings_view = None;
                 self.modal = None;
                 theme::set_accent("blue");
                 self.libraries = libraries::list(&self.root);
@@ -487,11 +509,37 @@ impl Workspace {
                 }
                 self.libraries = libraries::list(&self.root);
             }
-            Cmd::OpenSettings => self.settings_dialog(window, cx),
             Cmd::RevealFolder => {
                 let path = self.lib.as_ref().map_or(self.root.clone(), |l| l.info.dir.clone());
                 cx.open_with_system(&path);
             }
+            Cmd::OpenUrl(url) => cx.open_url(&url),
+
+            Cmd::OpenSettings(page) => self.open_settings(page, window, cx),
+            Cmd::CloseSettings => self.close_settings(window, cx),
+            Cmd::PickDataDir => self.pick_data_dir(cx),
+            Cmd::ResetDataDir => self.set_data_dir(None, cx),
+            Cmd::RevealDataDir => cx.open_with_system(&self.root),
+            Cmd::ToggleAutoUpdate => {
+                self.settings.auto_update = !self.settings.auto_update;
+                self.save_settings(cx);
+                if self.settings.auto_update { self.check_update(false, cx) }
+            }
+            Cmd::CheckUpdate => self.check_update(true, cx),
+            Cmd::SetAppearance(value) => {
+                self.settings.appearance = value;
+                self.save_settings(cx);
+                self.apply_appearance(window);
+            }
+            Cmd::SetDensity(value) => {
+                self.settings.density = value;
+                self.save_settings(cx);
+            }
+            Cmd::RecordShortcut(id) => self.start_recording(id, window, cx),
+            Cmd::ClearShortcut(id) => self.set_shortcut(&id, Some(String::new()), cx),
+            Cmd::ResetShortcut(id) => self.set_shortcut(&id, None, cx),
+            Cmd::ResetShortcuts => self.reset_shortcuts(cx),
+            Cmd::PickProtocol(value) => self.pick_protocol(value, cx),
 
             Cmd::AddById => {
                 let input = self.modal_input("10.1038/s41586-020-2649-2、PMID 或它们的链接", "", false, window, cx);
@@ -673,18 +721,6 @@ impl Workspace {
             Cmd::ToggleInTable => {
                 if let Some(Modal::Fields { in_table, .. }) = self.modal.as_mut() { *in_table = !*in_table }
             }
-            Cmd::PickProtocol(value) => {
-                if let Some(Modal::Settings { protocol, base_url, model, .. }) = self.modal.as_mut() && *protocol != value {
-                    *protocol = value;
-                    // The other protocol's address and model would only fail: offer this one's defaults.
-                    let (url, name) = match value {
-                        Protocol::Anthropic => (ai::ANTHROPIC_BASE, ai::DEFAULT_MODEL),
-                        Protocol::OpenAI => ("https://api.openai.com/v1", ""),
-                    };
-                    base_url.update(cx, |input, cx| input.set_text(url, cx));
-                    model.update(cx, |input, cx| input.set_text(name, cx));
-                }
-            }
             Cmd::PickOption(field, option) => {
                 if let Some(Modal::Paper(form)) = self.modal.as_mut() {
                     if form.selects.get(&field) == Some(&option) { form.selects.remove(&field); } else { form.selects.insert(field, option); }
@@ -697,18 +733,40 @@ impl Workspace {
         if self.menu.take().is_some() {
         } else if self.modal.is_some() {
             self.run(Cmd::CloseModal, window, cx);
+        } else if self.settings_view.is_some() {
+            self.close_settings(window, cx);
         } else if self.lib.as_ref().is_some_and(|l| l.selected.is_some()) {
             self.select(None, window, cx);
         }
         cx.notify();
     }
 
-    pub fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal.is_none() && let Some(lib) = self.lib.as_mut() {
-            lib.page = Page::Papers;
-            lib.search.read(cx).focus(window);
-            cx.notify();
-        }
+    /// A keyboard shortcut (shortcuts.rs) was pressed.
+    pub fn shortcut(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A dialog keeps the keyboard to itself.
+        if self.modal.is_some() { return }
+        let in_settings = self.settings_view.is_some();
+        let cmd = match id {
+            "settings" if !in_settings => Cmd::OpenSettings(SettingsPage::General),
+            "home" => Cmd::GoHome,
+            "new-library" if !in_settings && self.lib.is_none() => Cmd::NewLibrary,
+            // The rest act on the open library, when it is the one in view.
+            _ if in_settings || self.lib.is_none() => return,
+            "search" => {
+                if let Some(lib) = self.lib.as_mut() {
+                    lib.page = Page::Papers;
+                    lib.search.read(cx).focus(window);
+                    cx.notify();
+                }
+                return;
+            }
+            "add" => Cmd::AddById,
+            "import-pdf" => Cmd::ImportPdfs,
+            "ask" => Cmd::SetPage(Page::Ask),
+            "detail" if self.lib.as_ref().is_some_and(|l| l.selected.is_some()) => Cmd::ToggleWide,
+            _ => return,
+        };
+        self.run(cmd, window, cx);
     }
 
     // ---- libraries
@@ -1028,9 +1086,7 @@ impl Workspace {
     // ---- questions
 
     fn ask(&mut self, about_paper: bool, cx: &mut Context<Self>) {
-        let Some(profile) = self.settings.profile().cloned() else {
-            return self.fail("还没有配置模型。请先在「设置」里填写模型服务和 API Key。", cx);
-        };
+        let profile = self.settings.profile_or_default();
         let Some(lib) = self.lib.as_mut() else { return };
         let paper_id = lib.selected.clone();
         let chat = if about_paper { &mut lib.paper_chat } else { &mut lib.library_chat };
@@ -1198,19 +1254,6 @@ impl Workspace {
         self.modal = Some(Modal::Fields { editing, name, options, kind: field.kind, in_table: field.in_table });
     }
 
-    fn settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.modal_subscriptions.clear();
-        self.modal_error.clear();
-        let profile = self.settings.profile().cloned().unwrap_or_default();
-        let root = self.root.to_string_lossy().to_string();
-        let data_dir = self.modal_input("", &root, false, window, cx);
-        let base_url = self.modal_input("https://…", &profile.base_url, false, window, cx);
-        let api_key = self.modal_input("留空则读取环境变量", &profile.api_key, false, window, cx);
-        api_key.update(cx, |input, _| input.masked = true);
-        let model = self.modal_input("模型名称", &profile.model, false, window, cx);
-        self.modal = Some(Modal::Settings { data_dir, base_url, api_key, model, protocol: profile.protocol });
-    }
-
     fn submit_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = |input: &Entity<TextInput>, cx: &App| input.read(cx).text().trim().to_string();
         self.modal_error.clear();
@@ -1329,27 +1372,6 @@ impl Workspace {
                     Err(err) => self.modal_error = format!("{err:#}"),
                 }
             }
-            Modal::Settings { data_dir, base_url, api_key, model, protocol } => {
-                let dir = text(data_dir, cx);
-                if dir.is_empty() {
-                    self.modal_error = "请填写数据目录。".into();
-                    return;
-                }
-                if let Err(err) = std::fs::create_dir_all(&dir) {
-                    self.modal_error = format!("无法使用这个目录：{err}");
-                    return;
-                }
-                let profile = ai::Profile { name: self.settings.profile().map_or("默认".into(), |p| p.name.clone()), protocol: *protocol, base_url: text(base_url, cx), api_key: text(api_key, cx), model: text(model, cx) };
-                // The default folder is stored as "unset", so it follows the user's Documents folder.
-                self.settings.data_dir = if std::path::Path::new(&dir) == default_root() { String::new() } else { dir };
-                self.settings.profiles = vec![profile];
-                self.settings.active_profile = 0;
-                self.root = self.settings.data_root(&default_root());
-                self.libraries = libraries::list(&self.root);
-                self.save_settings(cx);
-                self.run(Cmd::CloseModal, window, cx);
-                self.say("设置已保存。", cx);
-            }
         }
         cx.notify();
     }
@@ -1382,9 +1404,19 @@ impl Workspace {
                     }
                     None
                 }
+                "settings" => Some(Cmd::OpenSettings(match arg {
+                    "appearance" => SettingsPage::Appearance,
+                    "shortcuts" => SettingsPage::Shortcuts,
+                    "ai" => SettingsPage::Ai,
+                    "about" => SettingsPage::About,
+                    _ => SettingsPage::General,
+                })),
+                // Saved like the choice in 设置 › 外观: "light", "dark", or empty for the system's.
+                "theme" => Some(Cmd::SetAppearance(arg.to_string())),
+                "record" => Some(Cmd::RecordShortcut(arg.to_string())),
+                "update" => Some(Cmd::CheckUpdate),
                 "modal" => match arg {
                     "fields" => Some(Cmd::ManageFields),
-                    "settings" => Some(Cmd::OpenSettings),
                     "library" => Some(Cmd::NewLibrary),
                     "add" => Some(Cmd::AddById),
                     "paper" => self.lib.as_ref().and_then(|l| l.selected.clone()).map(Cmd::EditPaper),
