@@ -92,6 +92,8 @@ impl Theme {
     pub fn danger() -> Hsla { pick(0xD4483B, 0xEB7468) }
     pub fn danger_soft() -> Hsla { pick(0xFDECEA, 0x3B2523) }
     pub fn success() -> Hsla { pick(0x2E8B57, 0x57BA85) }
+    /// Something that still wants the reader's attention, short of an error.
+    pub fn warning() -> Hsla { pick(0x9A6410, 0xE0B25A) }
     pub fn star() -> Hsla { pick(0xE0A100, 0xE8B92E) }
     pub fn accent() -> Hsla { ACCENTS[ACCENT.load(Ordering::Relaxed)].strong() }
     pub fn accent_soft() -> Hsla { ACCENTS[ACCENT.load(Ordering::Relaxed)].soft() }
@@ -110,7 +112,7 @@ pub fn status_colors(value: &str) -> (Hsla, Hsla) {
     let (light, fill, bright) = match value {
         "included" | "read" | "stored" | "published" => (0x23764A, 0xE4F4EA, 0x63C48F),
         "excluded" | "skimmed" | "linked" => (0x2A5FC4, 0xE8F0FE, 0x7CA8F5),
-        "uncertain" | "preprint" => (0x9A6410, 0xFBF1DC, 0xE0B25A),
+        "uncertain" | "preprint" | "textless" => (0x9A6410, 0xFBF1DC, 0xE0B25A),
         "irrelevant" => (0xB23B30, 0xFDECEA, 0xEE877C),
         _ => (0x5C636E, 0xEFEFEC, 0xABAFB7),
     };

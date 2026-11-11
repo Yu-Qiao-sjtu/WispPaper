@@ -3,7 +3,7 @@
 
 use crate::app::{Cmd, MenuKind, Workspace};
 use crate::settings::{SettingsPage, UpdateState};
-use crate::shortcuts::{AddPaper, AskLibrary, FocusSearch, ImportPdf, NewLibrary, ShowHome, ShowSettings, ToggleDetail};
+use crate::shortcuts::{AddPaper, AskLibrary, FocusSearch, ImportPdf, NewLibrary, ShowHome, ShowSettings, ToggleDetail, ZoomFit, ZoomIn, ZoomOut};
 use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
@@ -40,11 +40,29 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ImportPdf, window, cx| this.shortcut("import-pdf", window, cx)))
             .on_action(cx.listener(|this, _: &AskLibrary, window, cx| this.shortcut("ask", window, cx)))
             .on_action(cx.listener(|this, _: &ToggleDetail, window, cx| this.shortcut("detail", window, cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| this.shortcut("zoom-in", window, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| this.shortcut("zoom-out", window, cx)))
+            .on_action(cx.listener(|this, _: &ZoomFit, window, cx| this.shortcut("zoom-fit", window, cx)))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.import_paths(paths.paths().to_vec(), cx)))
+
             .child(page)
             .children(self.render_modal(window, cx))
             .children(self.render_menu(cx))
             .children(self.render_toast())
+            // While the detail panel's edge is held, a layer over everything hears the pointer wherever it goes:
+            // an element only hears the moves made over it.
+            .children(self.resizing.then(|| {
+                div()
+                    .id("resize-layer")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .occlude()
+                    .cursor_col_resize()
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| this.drag_detail(event, window, cx)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_drag_detail(cx)))
+            }))
             .children(ui::window_controls(window))
     }
 }

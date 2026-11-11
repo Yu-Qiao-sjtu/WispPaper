@@ -2,7 +2,7 @@
 //! and confirmations. Their state and what happens on submit are
 //! in app.rs; this file draws them.
 
-use crate::app::{Cmd, Modal, Workspace};
+use crate::app::{Cmd, ImportRow, Imported, Modal, Workspace};
 use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
@@ -46,6 +46,70 @@ impl Workspace {
 
         let card = match modal {
             Modal::Confirm { title, message, action, .. } => ui::dialog(440.).child(ui::dialog_title(title.clone())).child(body().child(div().text_color(Theme::text_secondary()).line_height(px(21.)).child(message.clone())).child(error)).child(footer(action, true, self, cx)),
+
+            Modal::ImportReport => {
+                let lib = self.lib.as_ref()?;
+                let run = lib.import.as_ref()?;
+                // What still wants doing comes first; the rest in the order the files were read.
+                let mut rows: Vec<(usize, &ImportRow)> = run.rows.iter().enumerate().collect();
+                rows.sort_by_key(|(_, row)| !row.open());
+                let textless = run.count(|row| !row.textless.is_empty());
+                let listed: Vec<AnyElement> = rows
+                    .into_iter()
+                    .map(|(i, row)| {
+                        let (state, color) = match &row.outcome {
+                            Imported::Failed(err) => (format!("没有导入：{err}"), Theme::danger()),
+                            Imported::InTrash => ("它的文献在回收站里，没有导入".to_string(), Theme::warning()),
+                            Imported::Attached => ("文献库里已有这篇，PDF 附到了原条目".to_string(), Theme::text_tertiary()),
+                            Imported::Added if row.unrecognised => ("已添加 · 没认出 DOI，待补全题目和作者".to_string(), Theme::warning()),
+                            Imported::Added => ("已添加".to_string(), Theme::text_tertiary()),
+                        };
+                        let title = row.paper_id.as_deref().and_then(|id| lib.paper(id)).map(|paper| paper.title.clone()).filter(|title| !row.unrecognised && !title.is_empty());
+                        div()
+                            .id(("imported", i))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .px(px(8.))
+                            .py(px(6.))
+                            .rounded(px(8.))
+                            .when_some(row.paper_id.clone(), |d, id| d.cursor_pointer().hover(|s| s.bg(Theme::hover())).on_click(self.on(Cmd::OpenImported(id), cx)))
+                            .child(div().truncate().child(title.unwrap_or_else(|| row.name.clone())))
+                            .child(div().text_size(px(12.)).line_height(px(17.)).text_color(color).child(state))
+                            .when(!row.textless.is_empty(), |d| d.child(div().text_size(px(12.)).line_height(px(17.)).text_color(Theme::warning()).child(format!("没读出文字，全文暂时不能用于提问：{}", row.textless))))
+                            .into_any_element()
+                    })
+                    .collect();
+                ui::dialog(600.)
+                    .child(ui::dialog_title(format!("导入结果 · {} 个 PDF", run.total)))
+                    .child(body().gap(px(2.)).child(div().pb(px(6.)).text_color(Theme::text_secondary()).child(format!("{}。点一行打开那篇文献。", run.summary()))).children(listed))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(20.))
+                            .py(px(14.))
+                            .when(textless > 0, |d| d.child(ui::secondary_button("import-textless", format!("在列表里看没读出文字的 {textless} 篇")).on_click(self.on(Cmd::ShowTextless, cx))))
+                            .child(div().flex_1())
+                            .child(ui::secondary_button("modal-cancel", "稍后再看").on_click(self.on(Cmd::CloseModal, cx)))
+                            .child(ui::primary_button("modal-ok", "知道了").on_click(self.on(Cmd::SubmitModal, cx))),
+                    )
+            }
+
+            Modal::Note { paper_id, text } => {
+                let title = self.lib.as_ref().and_then(|lib| lib.paper(paper_id)).map(|paper| paper.title.clone()).unwrap_or_default();
+                ui::dialog(620.)
+                    .child(ui::dialog_title("存为笔记"))
+                    .child(
+                        body()
+                            .child(div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_tertiary()).child(format!("会加到「{title}」的「我的笔记」末尾，已有的笔记不动。笔记会随文献记录一起提供给以后的提问，所以先看一遍，把不对的地方改掉。")))
+                            .child(ui::field(text, window, cx))
+                            .child(error),
+                    )
+                    .child(footer("存入笔记", false, self, cx))
+            }
 
             Modal::Library { editing, name, topic, color } => {
                 let swatches: Vec<Stateful<Div>> = theme::ACCENTS.iter().map(|accent| {

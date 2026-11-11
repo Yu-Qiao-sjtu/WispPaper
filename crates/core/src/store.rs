@@ -462,8 +462,17 @@ impl Store {
                 papers[i].fulltext = "stored".into();
             }
         }
+        // Stored, read, and no text came of any of its full-text files.
+        let mut stmt = self.db.prepare("SELECT r.paper_id FROM resources r JOIN fulltext_text t ON t.resource_id = r.id WHERE r.resource_type = 'fulltext' GROUP BY r.paper_id HAVING SUM(t.error = '') = 0")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            if let Some(&i) = index.get(&id) {
+                papers[i].fulltext = "textless".into();
+            }
+        }
         for paper in papers.iter_mut() {
-            if paper.fulltext != "stored" {
+            if !matches!(paper.fulltext.as_str(), "stored" | "textless") {
                 paper.fulltext = if paper.link().is_empty() { "missing" } else { "linked" }.into();
             }
         }
@@ -1046,6 +1055,19 @@ impl Store {
     }
 
     /// Every extracted full text, by paper id: (file, pages).
+    /// The full-text files that gave no text, with why: (file, paper, reason).
+    /// A paper that has another file with text is not among them.
+    pub fn fulltext_failures(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT r.id, r.paper_id, t.error FROM resources r JOIN fulltext_text t ON t.resource_id = r.id \
+             WHERE r.resource_type = 'fulltext' AND t.error != '' AND r.paper_id NOT IN (SELECT paper_id FROM trashed_papers) \
+               AND r.paper_id NOT IN (SELECT r2.paper_id FROM resources r2 JOIN fulltext_text t2 ON t2.resource_id = r2.id WHERE r2.resource_type = 'fulltext' AND t2.error = '') \
+             ORDER BY r.paper_id, r.id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn all_fulltext(&self) -> Result<BTreeMap<String, (PaperFile, Vec<String>)>> {
         let mut out = BTreeMap::new();
         for file in self.read_files("WHERE resource_type = 'fulltext' AND paper_id NOT IN (SELECT paper_id FROM trashed_papers)", [])? {

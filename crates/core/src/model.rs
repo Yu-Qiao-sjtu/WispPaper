@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 /// One paper. `fields` holds the values of the library's custom fields
 /// (自定义词条) by field id; an absent or empty list means "not filled in".
-/// `fulltext` is computed from the attachments: missing, linked or stored.
+/// `fulltext` is computed from the attachments: missing, linked, stored or textless.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Paper {
@@ -42,7 +42,8 @@ pub struct Paper {
 
 pub const SCREENINGS: [(&str, &str); 5] = [("pending", "待判断"), ("included", "已纳入"), ("excluded", "相关"), ("uncertain", "证据不足"), ("irrelevant", "不相关")];
 pub const READINGS: [(&str, &str); 3] = [("unread", "未读"), ("skimmed", "已浏览"), ("read", "已精读")];
-pub const FULLTEXTS: [(&str, &str); 3] = [("missing", "无全文"), ("linked", "有链接"), ("stored", "已存 PDF")];
+/// `textless`: a full text is stored, and no text could be had from it.
+pub const FULLTEXTS: [(&str, &str); 4] = [("missing", "无全文"), ("linked", "有链接"), ("stored", "已存 PDF"), ("textless", "PDF 无文字")];
 pub const PUBLICATION_STATUSES: [(&str, &str); 4] = [("unknown", "尚未确认"), ("preprint", "预印本"), ("published", "正式发表"), ("unpublished", "未发表")];
 
 /// The display label of a stored value; the value itself when unknown.

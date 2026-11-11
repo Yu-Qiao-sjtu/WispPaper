@@ -12,11 +12,67 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 
-/// Pixels per PDF point: 2× keeps text sharp on a high-density display at reading width.
-const RENDER_SCALE: f32 = 2.0;
-/// Rendered pages kept in memory (about 8 MB each for A4).
+/// Rendered pages kept in memory at most, and the bytes they may take together:
+/// a page at reading width is about 18 MB, one enlarged four times close to 100.
 const KEEP_PAGES: usize = 10;
+const KEEP_BYTES: usize = 240 << 20;
+/// The pixels of one rendered page at most. Past this an enlarged page is
+/// drawn softer rather than larger.
+const MAX_PAGE_PIXELS: f32 = 24_000_000.;
 const PAGE_GAP: f32 = 12.;
+/// The room left at either side of a page.
+const MARGIN: f32 = 16.;
+/// Logical pixels a PDF point takes at 100 %: a point is 1/72 inch, a pixel 1/96.
+const POINT_PX: f32 = 96. / 72.;
+const ZOOM_MIN: f32 = 25.;
+const ZOOM_MAX: f32 = 500.;
+/// The sizes the zoom buttons and keys step through, in percent.
+const ZOOM_STEPS: [f32; 16] = [25., 33., 50., 67., 75., 90., 100., 110., 125., 150., 175., 200., 250., 300., 400., 500.];
+
+/// How large the pages are drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Zoom {
+    /// Each page as wide as the viewer.
+    FitWidth,
+    /// Each page whole in the viewer.
+    FitPage,
+    /// A fixed size, in percent of the page's own.
+    Percent(f32),
+}
+
+/// A change of zoom asked for from the toolbar, the menu or the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ZoomTo {
+    In,
+    Out,
+    Set(Zoom),
+}
+
+/// Logical pixels per point for a page of this size (in points) in a viewer of this size.
+fn page_scale(zoom: Zoom, page: (f32, f32), view: (f32, f32)) -> f32 {
+    let fit_width = (view.0 - 2. * MARGIN).max(120.) / page.0.max(1.);
+    match zoom {
+        Zoom::FitWidth => fit_width,
+        // Until the viewer has been laid out its height is not known: the width decides.
+        Zoom::FitPage if view.1 > 0. => fit_width.min((view.1 - 2. * PAGE_GAP).max(120.) / page.1.max(1.)),
+        Zoom::FitPage => fit_width,
+        Zoom::Percent(percent) => percent.clamp(ZOOM_MIN, ZOOM_MAX) / 100. * POINT_PX,
+    }
+}
+
+/// Device pixels per point a page is rendered at to be shown at `wanted`:
+/// the next of a few steps, so that a small change of zoom keeps the
+/// picture, within what one picture may take.
+fn render_scale(page: (f32, f32), wanted: f32) -> f32 {
+    let step = [2., 3., 4., 6., 8., 12., 16.].into_iter().find(|step| *step >= wanted - 0.01).unwrap_or(16.);
+    // Pixmaps are at most 65535 px a side; huge posters render smaller.
+    step.min((MAX_PAGE_PIXELS / (page.0 * page.1).max(1.)).sqrt()).min(8000. / page.0.max(page.1).max(1.))
+}
+
+/// The next size up or down from this one, in percent.
+fn zoom_step(percent: f32, up: bool) -> f32 {
+    if up { ZOOM_STEPS.into_iter().find(|step| *step > percent + 0.5).unwrap_or(ZOOM_MAX) } else { ZOOM_STEPS.into_iter().rev().find(|step| *step < percent - 0.5).unwrap_or(ZOOM_MIN) }
+}
 
 /// The pages a quotation is looked for on before giving up.
 const FIND_PAGES: usize = 300;
@@ -24,7 +80,8 @@ const FIND_PAGES: usize = 300;
 const KEEP_REQUESTS: usize = 3;
 
 enum Request {
-    Page(usize),
+    /// Render a page at so many device pixels per point.
+    Page(usize, f32),
     /// Look for a quoted sentence, starting at this 0-based page.
     Find(Option<usize>, String),
 }
@@ -33,7 +90,8 @@ enum Reply {
     /// Page sizes in points, once, after the file parsed.
     Opened(Vec<(f32, f32)>),
     Failed(String),
-    Page(usize, u32, u32, Vec<u8>),
+    /// A rendered page: its index, the scale it was rendered at, its size in pixels and the pixels.
+    Page(usize, f32, u32, u32, Vec<u8>),
     /// A page whose render was dropped for newer ones: ask again when it is in view.
     Skipped(usize),
     /// Where the quotation is: the page, and one box per line in page points.
@@ -139,15 +197,15 @@ fn worker(path: PathBuf, requests: mpsc::Receiver<Request>, replies: async_chann
         // Of several quotations asked for in a row, only the last still matters.
         let find = waiting.iter().rev().find_map(|request| match request {
             Request::Find(page, quote) => Some((*page, quote.clone())),
-            Request::Page(_) => None,
+            Request::Page(..) => None,
         });
         // Scrolling queues pages faster than they render: the latest few are drawn,
         // newest first, and the view is told about the rest so it can ask again.
-        let mut wanted: Vec<usize> = vec![];
+        let mut wanted: Vec<(usize, f32)> = vec![];
         for request in waiting.iter().rev() {
-            if let Request::Page(index) = request && !wanted.contains(index) { wanted.push(*index) }
+            if let Request::Page(index, scale) = request && !wanted.iter().any(|(known, _)| known == index) { wanted.push((*index, *scale)) }
         }
-        for skipped in wanted.split_off(wanted.len().min(KEEP_REQUESTS)) {
+        for (skipped, _) in wanted.split_off(wanted.len().min(KEEP_REQUESTS)) {
             if replies.send_blocking(Reply::Skipped(skipped)).is_err() { return }
         }
 
@@ -175,11 +233,8 @@ fn worker(path: PathBuf, requests: mpsc::Receiver<Request>, replies: async_chann
             if replies.send_blocking(reply).is_err() { return }
         }
 
-        for index in wanted {
+        for (index, scale) in wanted {
             let Some(page) = pages.get(index) else { continue };
-            let (w, h) = page.render_dimensions();
-            // Pixmaps are at most 65535 px a side; huge posters render smaller.
-            let scale = RENDER_SCALE.min(8000. / w.max(h).max(1.));
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render(page, &cache, &interpreter, &settings, &PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE })));
             let reply = match rendered {
                 Ok(pixmap) => {
@@ -189,9 +244,9 @@ fn worker(path: PathBuf, requests: mpsc::Receiver<Request>, replies: async_chann
                     for pixel in bytes.as_chunks_mut::<4>().0 {
                         pixel.swap(0, 2);
                     }
-                    Reply::Page(index, width, height, bytes)
+                    Reply::Page(index, scale, width, height, bytes)
                 }
-                Err(_) => Reply::Page(index, 0, 0, vec![]),
+                Err(_) => Reply::Page(index, scale, 0, 0, vec![]),
             };
             if replies.send_blocking(reply).is_err() { return }
         }
@@ -200,7 +255,8 @@ fn worker(path: PathBuf, requests: mpsc::Receiver<Request>, replies: async_chann
 
 pub struct PdfView {
     sizes: Vec<(f32, f32)>,
-    images: HashMap<usize, Arc<RenderImage>>,
+    /// The rendered pages: the picture, the scale it was rendered at, the bytes it takes.
+    images: HashMap<usize, (Arc<RenderImage>, f32, usize)>,
     /// Pages that failed to render.
     broken: HashSet<usize>,
     /// Most recently shown last.
@@ -213,13 +269,22 @@ pub struct PdfView {
     /// A quotation was looked for and is not in this PDF.
     missing: bool,
     error: Option<String>,
+    /// The viewer's size in logical pixels; the height is known once it has been laid out.
     width: f32,
+    height: f32,
+    zoom: Zoom,
+    /// How far the pages are moved to the left, when they are wider than the viewer.
+    scroll_x: f32,
+    /// How far they can be.
+    max_x: f32,
+    /// Device pixels per logical pixel of the window the viewer is in.
+    device_scale: f32,
     /// A page to jump to once the file has opened.
     goto: Option<usize>,
 }
 
 impl PdfView {
-    pub fn new(path: &Path, cx: &mut Context<Self>) -> Self {
+    pub fn new(path: &Path, zoom: Zoom, cx: &mut Context<Self>) -> Self {
         let (requests, request_rx) = mpsc::channel();
         let (reply_tx, replies) = async_channel::unbounded();
         let file = path.to_path_buf();
@@ -240,6 +305,11 @@ impl PdfView {
             requests,
             error: None,
             width: 0.,
+            height: 0.,
+            zoom,
+            scroll_x: 0.,
+            max_x: 0.,
+            device_scale: 2.,
             goto: None,
             highlight: None,
             missing: false,
@@ -255,6 +325,15 @@ impl PdfView {
         self.list.logical_scroll_top().item_ix + 1
     }
 
+    pub fn zoom(&self) -> Zoom {
+        self.zoom
+    }
+
+    /// How large the page in view is drawn, in percent of its own size.
+    pub fn percent(&self) -> f32 {
+        self.scale_of(self.list.logical_scroll_top().item_ix) / POINT_PX * 100.
+    }
+
     /// Go to a 1-based page and look for a sentence quoted from it; when it
     /// is found, there or on another page, it is highlighted and scrolled
     /// into view.
@@ -265,9 +344,80 @@ impl PdfView {
         let _ = self.requests.send(Request::Find(page.checked_sub(1), quote.to_string()));
     }
 
-    /// How wide a page is drawn, and so how many pixels a page point takes.
-    fn sheet_width(&self) -> f32 {
-        (self.width - 32.).max(120.)
+    /// How many logical pixels a point of this page takes.
+    fn scale_of(&self, index: usize) -> f32 {
+        page_scale(self.zoom, self.sizes.get(index).copied().unwrap_or((595., 842.)), (self.width, self.height))
+    }
+
+    /// Where a page's left edge stands in the viewer: in the middle while
+    /// the page fits, else moved by the sideways scroll.
+    fn sheet_left(&self, sheet_width: f32) -> f32 {
+        if sheet_width + 2. * MARGIN <= self.width { (self.width - sheet_width) / 2. } else { MARGIN - self.scroll_x }
+    }
+
+    /// Change what decides the size of the pages (the zoom, the viewer's
+    /// size), and keep in view what was: the point `anchor` pixels from the
+    /// viewer's top left corner stays under it.
+    fn resize(&mut self, anchor: (f32, f32), change: impl FnOnce(&mut Self)) {
+        let top = self.list.logical_scroll_top();
+        let before = self.scale_of(top.item_ix);
+        let (page_width, page_height) = self.sizes.get(top.item_ix).copied().unwrap_or((595., 842.));
+        let left = self.sheet_left(page_width * before);
+        change(self);
+        let after = self.scale_of(top.item_ix);
+        let widest = self.sizes.iter().enumerate().map(|(index, (width, _))| width * self.scale_of(index)).fold(0., f32::max);
+        self.max_x = (widest + 2. * MARGIN - self.width).max(0.);
+        let ratio = after / before.max(0.001);
+        // Sideways: the point of the page under the anchor comes back under it.
+        self.scroll_x = (MARGIN - (anchor.0 - (anchor.0 - left) * ratio)).clamp(0., self.max_x);
+        if (ratio - 1.).abs() < 0.0005 { return }
+        // Page heights follow the scale: measure the list again.
+        let offset = ((f32::from(top.offset_in_item) + anchor.1) * ratio - anchor.1).clamp(0., (page_height * after - 1.).max(0.));
+        self.list.reset(self.sizes.len());
+        self.list.scroll_to(ListOffset { item_ix: top.item_ix, offset_in_item: px(offset) });
+    }
+
+    /// Draw the pages at another size. `anchor` is the point of the viewer
+    /// that stays where it is (the pointer's place); without one, the top.
+    pub fn set_zoom(&mut self, zoom: Zoom, anchor: Option<(f32, f32)>, cx: &mut Context<Self>) {
+        let zoom = match zoom {
+            Zoom::Percent(percent) => Zoom::Percent(percent.clamp(ZOOM_MIN, ZOOM_MAX)),
+            fit => fit,
+        };
+        if zoom == self.zoom { return }
+        self.resize(anchor.unwrap_or((self.width / 2., 0.)), |this| this.zoom = zoom);
+        cx.notify();
+    }
+
+    pub fn zoom_to(&mut self, to: ZoomTo, cx: &mut Context<Self>) {
+        let zoom = match to {
+            ZoomTo::In => Zoom::Percent(zoom_step(self.percent(), true)),
+            ZoomTo::Out => Zoom::Percent(zoom_step(self.percent(), false)),
+            ZoomTo::Set(zoom) => zoom,
+        };
+        self.set_zoom(zoom, None, cx);
+    }
+
+    /// The wheel turned over the viewer, before the list of pages hears of
+    /// it. With ⌘ or Ctrl it changes the zoom about the pointer; sideways
+    /// (or with Shift) it moves pages wider than the viewer. Anything else
+    /// is left to the list, which scrolls down the pages.
+    fn wheel(&mut self, event: &ScrollWheelEvent, bounds: Bounds<Pixels>, cx: &mut Context<Self>) -> bool {
+        let delta = event.delta.pixel_delta(px(20.));
+        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+        if event.modifiers.secondary() || event.modifiers.control {
+            if dy != 0. {
+                let anchor = (f32::from(event.position.x - bounds.origin.x), f32::from(event.position.y - bounds.origin.y));
+                self.set_zoom(Zoom::Percent(self.percent() * (dy / 240.).exp()), Some(anchor), cx);
+            }
+            return true;
+        }
+        // A wheel that only turns one way moves sideways with Shift held.
+        let sideways = if event.modifiers.shift && dx == 0. { dy } else { dx };
+        if self.max_x <= 0. || sideways == 0. || (sideways.abs() <= dy.abs() && !event.modifiers.shift) { return false }
+        self.scroll_x = (self.scroll_x - sideways).clamp(0., self.max_x);
+        cx.notify();
+        true
     }
 
     /// Scroll to a 1-based page.
@@ -285,6 +435,7 @@ impl PdfView {
             Reply::Opened(sizes) => {
                 self.sizes = sizes;
                 self.list.reset(self.sizes.len());
+                self.resize((0., 0.), |_| {});
                 if let Some(page) = self.goto.take() { self.go_to(page, cx) }
             }
             Reply::Failed(error) => self.error = Some(error),
@@ -292,22 +443,25 @@ impl PdfView {
                 self.pending.remove(&index);
             }
             Reply::Found(index, boxes) => {
-                // Bring the first line of the quotation a little below the top of the view.
-                if let (Some(first), Some((w, _))) = (boxes.first(), self.sizes.get(index)) {
-                    let top = first[1] * self.sheet_width() / w.max(1.) - 80.;
-                    self.list.scroll_to(ListOffset { item_ix: index, offset_in_item: px(top.max(0.)) });
+                // Bring the first line of the quotation a little below the top of the view, and into it sideways.
+                if let Some(first) = boxes.first() {
+                    let scale = self.scale_of(index);
+                    self.list.scroll_to(ListOffset { item_ix: index, offset_in_item: px((first[1] * scale - 80.).max(0.)) });
+                    if self.max_x > 0. { self.scroll_x = (first[0] * scale - 40.).clamp(0., self.max_x) }
                 }
                 self.highlight = Some((index, boxes));
             }
             Reply::NotFound => self.missing = true,
-            Reply::Page(index, width, height, bytes) => {
+            Reply::Page(index, scale, width, height, bytes) => {
                 self.pending.remove(&index);
                 match image::RgbaImage::from_raw(width, height, bytes).filter(|_| width > 0) {
                     Some(buffer) => {
-                        self.images.insert(index, Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])));
+                        let size = width as usize * height as usize * 4;
+                        // A page rendered again at another size takes the place of the one it had.
+                        if let Some((old, ..)) = self.images.insert(index, (Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])), scale, size)) { cx.drop_image(old, None) }
                         self.touch(index);
-                        while self.recent.len() > KEEP_PAGES {
-                            if let Some(old) = self.recent.pop_front() && let Some(image) = self.images.remove(&old) {
+                        while self.recent.len() > KEEP_PAGES || (self.recent.len() > 2 && self.images.values().map(|(.., size)| size).sum::<usize>() > KEEP_BYTES) {
+                            if let Some(old) = self.recent.pop_front() && let Some((image, ..)) = self.images.remove(&old) {
                                 cx.drop_image(image, None);
                             }
                         }
@@ -328,16 +482,17 @@ impl PdfView {
 
     fn page(&mut self, index: usize) -> AnyElement {
         let (w, h) = self.sizes.get(index).copied().unwrap_or((595., 842.));
-        let width = self.sheet_width();
-        let height = width * h / w.max(1.);
-        let image = self.images.get(&index).cloned();
-        if image.is_some() {
-            self.touch(index);
-        } else if !self.broken.contains(&index) && self.pending.insert(index) {
-            let _ = self.requests.send(Request::Page(index));
+        let scale = self.scale_of(index);
+        let (width, height) = (w * scale, h * scale);
+        // The picture this size wants. One made for another size is shown, stretched, until its own arrives.
+        let wanted = render_scale((w, h), scale * self.device_scale);
+        let image = self.images.get(&index).map(|(image, at, _)| (image.clone(), *at));
+        let stale = image.as_ref().is_none_or(|(_, at)| (at - wanted).abs() > 0.01);
+        if image.is_some() { self.touch(index) }
+        if stale && !self.broken.contains(&index) && self.pending.insert(index) {
+            let _ = self.requests.send(Request::Page(index, wanted));
         }
         // The quotation on this page: a translucent marker over each of its lines.
-        let scale = width / w.max(1.);
         let marks: Vec<Div> = self
             .highlight
             .iter()
@@ -345,23 +500,24 @@ impl PdfView {
             .flat_map(|(_, boxes)| boxes.iter())
             .map(|line| div().absolute().left(px(line[0] * scale - 1.)).top(px(line[1] * scale)).w(px((line[2] - line[0]) * scale + 2.)).h(px((line[3] - line[1]) * scale)).rounded(px(2.)).bg(hsla(50. / 360., 1., 0.5, 0.35)))
             .collect();
-        let sheet = div().relative().w(px(width)).h(px(height)).bg(gpui::white()).border_1().border_color(Theme::line()).overflow_hidden();
+        let sheet = div().relative().flex_none().ml(px(self.sheet_left(width))).w(px(width)).h(px(height)).bg(gpui::white()).border_1().border_color(Theme::line()).overflow_hidden();
         let sheet = match image {
-            Some(image) => sheet.child(img(image).w(px(width)).h(px(height))).children(marks),
+            Some((image, _)) => sheet.child(img(image).w(px(width)).h(px(height))).children(marks),
             None => sheet.flex().items_center().justify_center().text_size(px(12.)).text_color(Theme::text_placeholder()).child(if self.broken.contains(&index) { format!("第 {} 页无法渲染", index + 1) } else { format!("第 {} 页", index + 1) }),
         };
-        div().w_full().flex().justify_center().pb(px(PAGE_GAP)).child(sheet).into_any_element()
+        div().w_full().flex().pb(px(PAGE_GAP)).child(sheet).into_any_element()
     }
 
     /// The viewer, `width` logical pixels wide.
     pub fn set_width(&mut self, width: f32) {
-        if (self.width - width).abs() > 0.5 {
-            self.width = width;
-            // Page heights follow the width: measure the list again, keeping the page in view.
-            let top = self.list.logical_scroll_top();
-            self.list.reset(self.sizes.len());
-            self.list.scroll_to(ListOffset { item_ix: top.item_ix, offset_in_item: px(0.) });
-        }
+        if (self.width - width).abs() > 0.5 { self.resize((0., 0.), |this| this.width = width) }
+    }
+
+    /// The viewer's height, as it was laid out.
+    fn set_height(&mut self, height: f32, cx: &mut Context<Self>) {
+        if (self.height - height).abs() <= 0.5 { return }
+        self.resize((0., 0.), |this| this.height = height);
+        cx.notify();
     }
 }
 
@@ -373,21 +529,69 @@ impl Drop for PdfView {
 }
 
 impl Render for PdfView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(error) = &self.error {
             return ui::empty_state("image-broken", "无法预览", error).size_full().into_any_element();
         }
         if self.sizes.is_empty() {
             return ui::empty_state("file-text", "正在打开 PDF…", "").size_full().into_any_element();
         }
+        self.device_scale = window.scale_factor();
         let entity = cx.entity();
+        let (measured, wheel) = (cx.entity(), cx.entity());
         div()
             .size_full()
             .bg(Theme::bg_sunken())
             .relative()
+            // Under the pages: it learns the viewer's height, and hears the wheel before the list does.
+            .child(
+                canvas(
+                    |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    move |bounds, hitbox, window, cx| {
+                        let height = f32::from(bounds.size.height);
+                        window.defer(cx, move |_, cx| measured.update(cx, |this, cx| this.set_height(height, cx)));
+                        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Capture && hitbox.is_hovered(window) && wheel.update(cx, |this, cx| this.wheel(event, bounds, cx)) { cx.stop_propagation() }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(list(self.list.clone(), move |index, _, cx| entity.update(cx, |this, _| this.page(index))).size_full().pt(px(PAGE_GAP)))
             // Said plainly: the page is the cited one, the sentence was not found on it or anywhere else.
             .children(self.missing.then(|| div().absolute().top(px(8.)).left_0().w_full().flex().justify_center().child(div().px(px(10.)).py(px(5.)).rounded(px(6.)).bg(Theme::bg_body()).border_1().border_color(Theme::line()).text_size(px(12.)).text_color(Theme::text_secondary()).child("已跳到引用的页，但没有在 PDF 里找到这句原文。"))))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: that would bring in gpui's own `test` attribute.
+    use super::{MARGIN, POINT_PX, Zoom, page_scale, render_scale, zoom_step};
+
+    #[test]
+    fn sizes_of_a_page() {
+        let (a4, view) = ((595., 842.), (800., 600.));
+        // As wide as the viewer less its margins; whole in it; its own size.
+        assert_eq!(page_scale(Zoom::FitWidth, a4, view), (800. - 2. * MARGIN) / 595.);
+        assert!((page_scale(Zoom::FitPage, a4, view) * 842. - (600. - 24.)).abs() < 0.01);
+        assert_eq!(page_scale(Zoom::FitPage, a4, (800., 0.)), page_scale(Zoom::FitWidth, a4, view));
+        assert_eq!((page_scale(Zoom::Percent(100.), a4, view), page_scale(Zoom::Percent(9000.), a4, view)), (POINT_PX, 5. * POINT_PX));
+        // The buttons step through round sizes, from wherever the wheel left the zoom.
+        assert_eq!((zoom_step(100., true), zoom_step(100., false), zoom_step(137.2, true), zoom_step(137.2, false)), (110., 90., 150., 125.));
+        assert_eq!((zoom_step(500., true), zoom_step(25., false)), (500., 25.));
+    }
+
+    #[test]
+    fn pictures_within_bounds() {
+        let a4 = (595., 842.);
+        // Reading width on a dense display, and a little more of the same: one picture serves both.
+        assert_eq!((render_scale(a4, 2.6), render_scale(a4, 2.9), render_scale(a4, 1.3)), (3., 3., 2.));
+        // Enlarged five times on a dense display a page would be 400 MB: it is held to what a picture may take.
+        let capped = render_scale(a4, 13.3);
+        assert!(capped < 7. && capped * capped * 595. * 842. <= 24_000_001.);
+        // A poster stays under the longest side a pixmap can have.
+        assert!(render_scale((10_000., 4_000.), 2.) * 10_000. <= 8000.5);
     }
 }

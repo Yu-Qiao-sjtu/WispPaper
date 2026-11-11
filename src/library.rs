@@ -13,6 +13,9 @@ use wisp_core::time;
 
 const SIDEBAR_W: f32 = 224.;
 pub const DETAIL_W: f32 = 448.;
+/// The narrowest the detail panel is dragged to, and what the list beside it keeps.
+const DETAIL_MIN: f32 = 320.;
+const MAIN_MIN: f32 = 260.;
 
 /// A column of the paper table: fixed width, or the flexible title column.
 struct Column {
@@ -36,12 +39,36 @@ enum ColumnKind {
 }
 
 impl Workspace {
-    /// The detail panel's width for this window.
+    /// The detail panel's width for this window: the width the reader
+    /// dragged it to, or the one it comes with; most of the window while it
+    /// is expanded. The list beside it keeps `MAIN_MIN` where the window allows.
     pub fn detail_width(&self, window: &Window) -> f32 {
         let Some(lib) = &self.lib else { return 0. };
         if lib.selected.is_none() || matches!(lib.page, Page::Trash | Page::Sources | Page::Guide) { return 0. }
         let viewport = f32::from(window.viewport_size().width);
-        if lib.wide { (viewport * 0.62).max(DETAIL_W).min(viewport - SIDEBAR_W - 80.) } else { DETAIL_W.min(viewport - SIDEBAR_W - 80.).max(280.) }
+        let own = if self.settings.detail_width > 0. { self.settings.detail_width } else { DETAIL_W };
+        if lib.wide { (viewport * 0.62).max(DETAIL_W).min(viewport - SIDEBAR_W - 80.) } else { own.min(viewport - SIDEBAR_W - MAIN_MIN).max(DETAIL_MIN) }
+    }
+
+    /// The edge between the list and the detail panel is being dragged:
+    /// the panel reaches from the pointer to the window's right edge.
+    pub fn drag_detail(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.resizing { return }
+        // Let go outside the window: the button is up by the time the pointer is back.
+        if event.pressed_button != Some(MouseButton::Left) { return self.end_drag_detail(cx) }
+        let viewport = f32::from(window.viewport_size().width);
+        let width = (viewport - f32::from(event.position.x)).min(viewport - SIDEBAR_W - MAIN_MIN).max(DETAIL_MIN);
+        if (width - self.settings.detail_width).abs() < 0.5 { return }
+        self.settings.detail_width = width;
+        if let Some(lib) = self.lib.as_mut() { lib.wide = false }
+        cx.notify();
+    }
+
+    /// The edge was let go: the width is kept for the next time.
+    pub fn end_drag_detail(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.resizing) { return }
+        self.save_settings(cx);
+        cx.notify();
     }
 
     pub fn render_library(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -64,6 +91,41 @@ impl Workspace {
             .child(div().flex().flex_col().flex_1().min_w_0().h_full().bg(Theme::bg_body()).border_l_1().border_color(Theme::line()).child(ui::title_strip()).child(div().flex().flex_col().flex_1().min_h_0().child(main)))
             .when(detail_width > 0., |d| d.child(self.render_detail(detail_width, window, cx)))
             .into_any_element()
+    }
+
+    /// The PDFs being read in, on every page of the library: how far the
+    /// reading is, then what came of them, until the report is put away.
+    fn render_import(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let run = self.lib.as_ref()?.import.as_ref()?;
+        let card = div().flex().flex_col().gap(px(5.)).p(px(10.)).rounded(px(8.)).border_1().border_color(Theme::line()).bg(Theme::bg_body()).text_size(px(12.)).line_height(px(17.));
+        if run.running() {
+            let done = run.rows.len();
+            return Some(
+                card.child(div().flex().items_center().gap(px(6.)).child(ui::spinner("import-working", 13., Theme::accent())).child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child(format!("正在导入 PDF · {done} / {}", run.total))))
+                    .child(div().truncate().text_color(Theme::text_tertiary()).child(if run.current.is_empty() { "正在读取…".to_string() } else { run.current.clone() }))
+                    .child(div().w_full().h(px(4.)).rounded_full().bg(Theme::groove()).overflow_hidden().child(div().h_full().rounded_full().bg(Theme::accent()).w(relative(done as f32 / run.total.max(1) as f32))))
+                    .into_any_element(),
+            );
+        }
+        let (unrecognised, textless) = (run.count(|row| row.unrecognised), run.count(|row| !row.textless.is_empty()));
+        let mut open = vec![];
+        if unrecognised > 0 { open.push(format!("{unrecognised} 篇待补全题目和作者")) }
+        if textless > 0 { open.push(format!("{textless} 篇没读出文字")) }
+        Some(
+            card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(ui::icon("check", 13., Theme::success()))
+                    .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child(format!("导入完成 · {} 个 PDF", run.total)))
+                    .child(ui::ghost_button("import-close", Some("x"), None).h(px(20.)).min_w(px(20.)).on_click(self.on(Cmd::CloseImport, cx))),
+            )
+            .child(div().text_color(Theme::text_secondary()).child(run.summary()))
+            .when(!open.is_empty(), |d| d.child(div().text_color(Theme::warning()).child(open.join(" · "))))
+            .child(div().flex().child(ui::ghost_button("import-report", None, Some("查看明细".into())).h(px(22.)).px(px(6.)).text_size(px(12.)).text_color(Theme::accent()).on_click(self.on(Cmd::ShowImport, cx))))
+            .into_any_element(),
+        )
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -163,6 +225,7 @@ impl Workspace {
                     .child(ui::caption("标签").px(px(8.)).py(px(4.)))
                     .child(div().id("tags").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(1.)).children(tag_rows).when(tags.is_empty(), |d| d.child(div().px(px(8.)).text_size(px(12.)).text_color(Theme::text_placeholder()).child("编辑文献时添加标签"))))
             )
+            .children(self.render_import(cx))
             .child(
                 div()
                     .flex()
@@ -290,8 +353,8 @@ impl Workspace {
         } else {
             uniform_list("papers", shown, cx.processor(move |this, range: Range<usize>, window, cx| this.render_rows(range, width, window, cx))).track_scroll(lib.table_scroll.clone()).flex_1().into_any_element()
         };
-        let status = if lib.importing > 0 {
-            format!("正在读取 {} 个 PDF…", lib.importing)
+        let status = if let Some(run) = lib.import.as_ref().filter(|run| run.running()) {
+            format!("正在导入 PDF，已完成 {} / {}", run.rows.len(), run.total)
         } else if !lib.extracting.is_empty() {
             format!("正在提取 {} 篇全文的文字，用于提问…", lib.extracting.len())
         } else {

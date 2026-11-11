@@ -2,6 +2,7 @@
 //! fields, notes, files), PDF (preview) and 提问 (questions about this paper).
 
 use crate::app::{Cmd, MenuKind, Tab, Translated, Workspace};
+use crate::pdf::{Zoom, ZoomTo};
 use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
@@ -63,7 +64,33 @@ impl Workspace {
             Tab::Pdf => self.render_pdf_tab(width, cx),
             Tab::Ask => self.render_chat(true, window, cx),
         };
-        div().flex().flex_col().flex_none().w(px(width)).h_full().bg(Theme::bg_body()).border_l_1().border_color(Theme::line()).child(ui::title_strip()).child(header).child(div().flex().flex_col().flex_1().min_h_0().child(body)).into_any_element()
+        // The panel's left edge: drag it to give the list or the paper more room, click it twice for the width it came with.
+        let resizing = self.resizing;
+        let edge = div()
+            .id("detail-edge")
+            .group("detail-edge")
+            .absolute()
+            .top_0()
+            .left(px(-4.))
+            .w(px(9.))
+            .h_full()
+            .flex()
+            .justify_center()
+            .cursor_col_resize()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                if event.click_count >= 2 {
+                    this.resizing = false;
+                    this.settings.detail_width = 0.;
+                    if let Some(lib) = this.lib.as_mut() { lib.wide = false }
+                    this.save_settings(cx);
+                } else {
+                    this.resizing = true;
+                }
+                cx.notify();
+            }))
+            .child(div().w(px(2.)).h_full().when(resizing, |d| d.bg(Theme::accent())).when(!resizing, |d| d.group_hover("detail-edge", |s| s.bg(Theme::accent().opacity(0.5)))));
+        div().relative().flex().flex_col().flex_none().w(px(width)).h_full().bg(Theme::bg_body()).border_l_1().border_color(Theme::line()).child(ui::title_strip()).child(header).child(div().flex().flex_col().flex_1().min_h_0().child(body)).child(edge).into_any_element()
     }
 
     /// The paper's title and abstract translated, while translation is on:
@@ -157,32 +184,64 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(i, file)| {
-                let note = match lib.store.fulltext_pages(&file.id) {
-                    _ if lib.extracting.contains(&file.id) => "正在提取文字…".to_string(),
-                    Ok(Some(Ok(pages))) => format!("{} 页文字可用于提问", pages.len()),
-                    Ok(Some(Err(error))) => error,
-                    _ => String::new(),
+                let reading = lib.extracting.contains(&file.id);
+                // By a model's eyes, when the file gave no text of its own.
+                let by_eye = lib.writing.sorting.reading && lib.writing.sorting.working.contains(&file.id);
+                let text = lib.store.fulltext_pages(&file.id).ok().flatten();
+                let failure = match &text {
+                    Some(Err(error)) if !reading && !by_eye => Some(error.clone()),
+                    _ => None,
                 };
+                let note = match &text {
+                    _ if reading => "正在提取文字…".to_string(),
+                    _ if by_eye => "模型正在读页面…".to_string(),
+                    Some(Ok(pages)) => match lib.writing.structures.get(&file.id).map(|info| info.text_by.as_str()).filter(|by| !by.is_empty()) {
+                        Some(by) => format!("{} 页文字可用于提问（由 {by} 读出）", pages.len()),
+                        None => format!("{} 页文字可用于提问", pages.len()),
+                    },
+                    Some(Err(error)) => format!("没读出文字：{}", wisp_core::fulltext::failure_brief(error)),
+                    None => String::new(),
+                };
+                let small = |id: (&'static str, usize), text: &'static str| ui::secondary_button(id, text).h(px(24.)).px(px(8.)).text_size(px(12.));
                 div()
                     .flex()
-                    .items_center()
-                    .gap(px(8.))
+                    .flex_col()
+                    .gap(px(6.))
                     .p(px(8.))
                     .rounded(px(8.))
                     .border_1()
                     .border_color(Theme::line())
-                    .child(ui::icon("file-text", 18., Theme::accent()))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().truncate().child(file.title.clone()))
-                            .child(div().truncate().text_size(px(12.)).text_color(Theme::text_tertiary()).child(format!("{} · {}{}", if file.kind == "fulltext" { "全文" } else { "附件" }, file_size(file.size_bytes), if note.is_empty() { String::new() } else { format!(" · {note}") }))),
+                            .items_center()
+                            .gap(px(8.))
+                            .child(if reading || by_eye { ui::spinner(("file-busy", i), 16., Theme::accent()).into_any_element() } else { ui::icon("file-text", 18., Theme::accent()).into_any_element() })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().truncate().child(file.title.clone()))
+                                    .child(div().truncate().text_size(px(12.)).text_color(if failure.is_some() { Theme::warning() } else { Theme::text_tertiary() }).child(format!("{} · {}{}", if file.kind == "fulltext" { "全文" } else { "附件" }, file_size(file.size_bytes), if note.is_empty() { String::new() } else { format!(" · {note}") }))),
+                            )
+                            .child(ui::ghost_button(("file-open", i), Some("link"), None).on_click(self.on(Cmd::OpenFile(file.id.clone()), cx)))
+                            .child(ui::ghost_button(("file-remove", i), Some("x"), None).on_click(self.on(Cmd::RemoveFile(file.id.clone()), cx))),
                     )
-                    .child(ui::ghost_button(("file-open", i), Some("link"), None).on_click(self.on(Cmd::OpenFile(file.id.clone()), cx)))
-                    .child(ui::ghost_button(("file-remove", i), Some("x"), None).on_click(self.on(Cmd::RemoveFile(file.id.clone()), cx)))
+                    // A file without text: why, what it means for questions, and the two things to try.
+                    .when_some(failure, |d, error| {
+                        d.child(div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_secondary()).child(format!("{error}在读出文字之前，提问只能用到这篇文献的记录和摘要。")))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(6.))
+                                    .child(small(("file-reread", i), "重新读取").on_click(self.on(Cmd::RereadFile(file.id.clone()), cx)))
+                                    .when(file.format == "pdf" && wisp_core::fulltext::readable_by_eye(&error), |d| d.child(small(("file-by-eye", i), "让模型读页面").on_click(self.on(Cmd::ReadPages(file.id.clone()), cx)))),
+                            )
+                            .when(lib.writing.sorting.reading && !lib.writing.sorting.error.is_empty(), |d| d.child(ui::error_line(&lib.writing.sorting.error)))
+                    })
                     .into_any_element()
             })
             .collect();
@@ -257,11 +316,20 @@ impl Workspace {
             return ui::empty_state("file-text", "这篇文献还没有 PDF", "添加后可以在这里预览，全文也会用于提问。").child(ui::primary_button("pdf-attach", "添加 PDF").on_click(self.on(Cmd::AttachPdf(p.id.clone()), cx))).size_full().into_any_element();
         };
         let Some(pdf) = lib.pdf.clone() else { return div().into_any_element() };
+        let (file_id, file_title) = (file.id.clone(), file.title.clone());
         pdf.update(cx, |pdf, _| pdf.set_width(width));
-        let (page, count) = {
+        let (page, count, percent, zoom) = {
             let view = pdf.read(cx);
-            (view.current_page(), view.page_count())
+            (view.current_page(), view.page_count(), view.percent(), view.zoom())
         };
+        // The size chosen here is the one the next paper opens at.
+        if let Some(lib) = self.lib.as_mut() { lib.zoom = zoom }
+        let fit = match zoom {
+            Zoom::FitWidth => "适应宽度",
+            Zoom::FitPage => "适应整页",
+            Zoom::Percent(_) => "",
+        };
+        let tool = |id: &'static str, icon: &'static str| ui::ghost_button(id, Some(icon), None).h(px(24.)).min_w(px(24.));
         div()
             .flex()
             .flex_col()
@@ -278,9 +346,21 @@ impl Workspace {
                     .border_color(Theme::line())
                     .text_size(px(12.))
                     .text_color(Theme::text_tertiary())
-                    .child(div().flex_1().min_w_0().truncate().child(file.title.clone()))
+                    .child(div().flex_1().min_w_0().truncate().child(file_title))
                     .when(count > 0, |d| d.child(div().flex_none().child(format!("{page} / {count} 页"))))
-                    .child(ui::ghost_button("pdf-open", Some("link"), Some("用系统应用打开".into())).on_click(self.on(Cmd::OpenFile(file.id.clone()), cx))),
+                    // Smaller, the size in force (a menu of sizes), larger.
+                    .when(count > 0, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .child(tool("pdf-zoom-out", "minus").on_click(self.on(Cmd::PdfZoom(ZoomTo::Out), cx)))
+                                .child(ui::ghost_button("pdf-zoom", None, Some(if fit.is_empty() { format!("{}%", percent.round()).into() } else { format!("{fit} · {}%", percent.round()).into() })).h(px(24.)).px(px(6.)).text_size(px(12.)).on_click(self.on_menu(MenuKind::PdfZoom, cx)))
+                                .child(tool("pdf-zoom-in", "plus").on_click(self.on(Cmd::PdfZoom(ZoomTo::In), cx))),
+                        )
+                    })
+                    .child(ui::ghost_button("pdf-open", Some("link"), (width >= 620.).then(|| "用系统应用打开".into())).h(px(24.)).on_click(self.on(Cmd::OpenFile(file_id), cx))),
             )
             .child(div().flex_1().min_h_0().child(pdf))
             .into_any_element()
