@@ -48,6 +48,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 | `lookup` | Crossref / Europe PMC 返回值 → 文献 |
 | `sources` | 文献数据库检索：要请求的地址，以及从返回内容读出的记录 |
 | `fulltext` | PDF 逐页文字提取；引文与页面字形的比对 |
+| `markdown` | 回答里的 Markdown → 要画的块（标题、列表、表格、代码块和行内标记） |
 | `ai` | 提问的上下文组装、三种协议的请求体（含工具定义）、流式返回和工具调用的解析、斜杠命令 |
 | `settings` | settings.json，以及它和数据目录的位置 |
 | `tools` | agent 能对文献库做的事：命令行、MCP 和应用内助手共用的一张工具表 |
@@ -70,6 +71,7 @@ GPUI 应用。
 |---|---|
 | `app` | `Workspace`：全部状态；每次点击是一个 `Cmd`，由 `run` 处理 |
 | `home` / `library` / `detail` / `chat` / `dialogs` | 各部分界面的绘制 |
+| `markdown` | 把 `wisp_core::markdown` 读出的块画出来：助手的回答 |
 | `settings` | 设置页：通用、外观、快捷键、AI、网络、关于；检查更新 |
 | `shortcuts` | 快捷键的默认值、改键规则和显示 |
 | `input` | 文本输入框（单行 / 多行，支持输入法） |
@@ -82,3 +84,28 @@ GPUI 应用。
 ### `vendor/`
 
 `gpui`、`taffy` 和 `xattr` 带着本地补丁放在仓库里，通过 `[patch.crates-io]` 接入。改过的地方有 `quiet.md:` 注释，并列在 `vendor/PATCHES.md`。
+
+## 打包与发布
+
+```sh
+scripts/package-macos.sh                    # dist/Wisp Paper.app 和 DMG，本机架构，ad hoc 签名
+scripts/package-macos.sh --arch universal   # Apple 芯片 + Intel（需要两个 rustup target）
+pwsh -File scripts/package-windows.ps1      # dist/WispPaper-v<版本>-windows-x64.zip，不签名
+```
+
+没有签名身份时，macOS 的包只能在本机运行，不适合分发。本机 `cargo` 用不了固定的工具链时，用 `CARGO="cargo +stable"` 指定；Xcode 没装 Metal Toolchain 时脚本会自己改用 `gpui/runtime_shaders`。
+
+发布一个版本：
+
+1. 把四个 `Cargo.toml` 的 `version` 改成新版本，写 `.github/release-notes/v<版本>.md`，合并到 `main`。
+2. 在 `main` 上打标签 `v<版本>` 并推送。`.github/workflows/release.yml` 会核对标签和版本一致，然后在三个系统上编译、打包、签名，全部成功才创建 Release。
+
+签名沿用 BiblioCell 的方案，需要在仓库的 Actions secrets 里放十个值（名字和 BiblioCell 相同，可以用同一套证书）：
+
+| 用途 | Secrets |
+|---|---|
+| macOS：Developer ID 证书（.p12 的 base64）和它的密码 | `MAC_CERT_P12_BASE64`、`MAC_CERT_PASSWORD` |
+| macOS：Apple 公证 | `APPLE_ID`、`APPLE_TEAM_ID`、`APPLE_APP_PASSWORD` |
+| Windows：SSL.com eSigner | `ESIGNER_CREDENTIAL_ID`、`ESIGNER_USERNAME`、`ESIGNER_PASSWORD`、`ESIGNER_TOTP_SECRET`、`ESIGNER_PIN` |
+
+缺任何一个，工作流在开头就失败，不会发布没有签名的包。改动打包脚本或工作流的 pull request 只做一次不签名的预演，包留在这次运行的 artifacts 里。想先看签名对不对再发布，在 Actions 页手动运行 Release，填已有的标签，不勾选 publish。
