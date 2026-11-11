@@ -40,14 +40,36 @@ fn get_json(url: &str) -> Result<Option<Value>, String> {
 /// GET a document as text: what `wisp_core::sources` asks the literature
 /// databases for (JSON from most, XML from PubMed and arXiv).
 pub fn get_text(url: &str) -> Result<String, String> {
-    let mut response = agent(Some(Duration::from_secs(60))).get(url).call().map_err(network_error)?;
-    let status = response.status().as_u16();
     let host = url.split('/').nth(2).unwrap_or(url);
-    match status {
-        200..300 => response.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| format!("无法读取 {host} 的返回内容：{e}")),
-        429 => Err(format!("{host} 限制了请求频率，请稍后再试。")),
-        _ => Err(format!("{host} 返回 HTTP {status}。")),
+    // A service that says "too fast" is asked again, a little later each time.
+    for wait in [Some(1500), Some(4000), None] {
+        take_turn(host);
+        let mut response = agent(Some(Duration::from_secs(60))).get(url).call().map_err(network_error)?;
+        let status = response.status().as_u16();
+        match (status, wait) {
+            (200..300, _) => return response.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| format!("无法读取 {host} 的返回内容：{e}")),
+            (429, Some(millis)) => std::thread::sleep(Duration::from_millis(millis)),
+            (429, None) => break,
+            _ => return Err(format!("{host} 返回 HTTP {status}。")),
+        }
     }
+    Err(format!("{host} 限制了请求频率，请稍后再试。"))
+}
+
+/// NCBI allows three requests a second without a key, counted across
+/// everything this process sends: searches running side by side take turns,
+/// one every 400 ms. Other hosts are not held back.
+fn take_turn(host: &str) {
+    static NEXT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if !host.ends_with("ncbi.nlm.nih.gov") { return }
+    let now = std::time::Instant::now();
+    let at = {
+        let mut next = NEXT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let at = next.filter(|at| *at > now).unwrap_or(now);
+        *next = Some(at + Duration::from_millis(400));
+        at
+    };
+    std::thread::sleep(at.saturating_duration_since(now));
 }
 
 /// The paper behind a DOI or PMID: Crossref first for a DOI, completed by
@@ -135,6 +157,26 @@ pub fn stream_chat(request: HttpRequest, protocol: Protocol, events: async_chann
         }
     }
     send(ChatEvent::Done(reader.finish()));
+}
+
+/// Send a request and wait for the whole answer as text: for a one-off
+/// question whose reply is read by code, not shown as it arrives.
+pub fn complete(request: HttpRequest, protocol: Protocol) -> Result<String, String> {
+    let (sender, events) = async_channel::unbounded();
+    stream_chat(request, protocol, sender);
+    let mut text = String::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            ChatEvent::Text(more) => text.push_str(&more),
+            ChatEvent::Error(error) => return Err(error),
+            // A reply that was cut off or declined is not one to parse.
+            ChatEvent::Done(turn) => {
+                if let Some(note) = ai::stop_note(&turn.stop) { return Err(note.to_string()) }
+            }
+        }
+    }
+    if text.trim().is_empty() { return Err("模型没有返回内容。".into()) }
+    Ok(text)
 }
 
 #[cfg(test)]

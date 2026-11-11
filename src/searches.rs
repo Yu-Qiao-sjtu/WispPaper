@@ -109,6 +109,7 @@ impl Workspace {
                             .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("为文献数据库保存检索式：先试检索，满意了再运行导入。导入的文献都是「待判断」，已有的会跳过，每次导入可以整批撤销。")),
                     )
                     .when(!empty, |d| d.child(ui::secondary_button("run-all-searches", "全部运行").on_click(self.on(Cmd::RunAllSearches, cx))))
+                    .child(ui::secondary_button("open-guide", "让助手拟检索式").on_click(self.on(Cmd::OpenGuide(false), cx)))
                     .child(ui::primary_button("new-search", "新建检索式").on_click(self.on(Cmd::NewSearch, cx))),
             )
             .child(if empty {

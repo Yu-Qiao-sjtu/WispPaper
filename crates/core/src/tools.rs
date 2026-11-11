@@ -243,7 +243,8 @@ fn dispatch(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fet
     match name {
         "find_citations" => find_citations(store, args),
         "search_online" => search_online(store, args, fetch),
-        "list_searches" => Ok(json!({"searches": store.list_searches()?})),
+        // With how each database wants its queries written, for whoever composes the next one.
+        "list_searches" => Ok(json!({"searches": store.list_searches()?, "syntax": sources::KINDS.iter().map(|(key, _)| (key.to_string(), json!(sources::syntax(key)))).collect::<Map<String, Value>>()})),
         "save_search" => save_search(store, args),
         "remove_search" => store.remove_search(text(args, "id")?).map(|()| json!({"removed": true})),
         "run_search" => run_search(store, text(args, "id")?, fetch),

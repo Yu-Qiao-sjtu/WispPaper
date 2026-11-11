@@ -634,6 +634,75 @@ pub fn expand_slash(input: &str) -> Result<String, String> {
     Ok(template.replace("{}", argument.trim()))
 }
 
+// ---- one-off requests
+
+/// A single question with its own instructions and no library in front of
+/// the model: what the guide's query suggestions are asked with.
+pub fn plain_request(profile: &Profile, system: &str, prompt: &str) -> Result<HttpRequest, String> {
+    let mut request = chat_request(profile, &Context { instructions: system.into(), ..Default::default() }, &[user_message(prompt)], &[])?;
+    match profile.protocol {
+        // No documents to cache, and an empty text block would be refused.
+        Protocol::Anthropic => {
+            request.body["system"] = json!(system);
+            if let Some(body) = request.body.as_object_mut() { body.remove("cache_control"); }
+        }
+        Protocol::OpenAI => request.body["messages"][0]["content"] = json!(system),
+    }
+    Ok(request)
+}
+
+/// A search the model proposes for one literature database.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryIdea {
+    /// A key of `sources::KINDS`.
+    pub source: String,
+    pub query: String,
+    /// What this query aims at, in a sentence.
+    pub why: String,
+}
+
+/// The instructions and the question that ask for search queries on a
+/// topic, for the databases in `kinds`.
+pub fn query_prompt(library_name: &str, topic: &str, keywords: &str, kinds: &[String]) -> (String, String) {
+    let system = "你是文献检索专家，熟悉各文献数据库的检索语法。你的任务是把一个研究主题写成可以直接运行的检索式。".to_string();
+    let mut prompt = format!("文献库：{library_name}\n");
+    if !topic.trim().is_empty() { prompt.push_str(&format!("主题：{}\n", topic.trim())) }
+    if !keywords.trim().is_empty() { prompt.push_str(&format!("用户给出的关键词或说明：{}\n", keywords.trim())) }
+    prompt.push_str("\n要检索的数据库和它们的语法：\n");
+    for kind in kinds {
+        prompt.push_str(&format!("- {kind}：{}\n", crate::sources::syntax(kind)));
+    }
+    prompt.push_str(
+        "\n为每个数据库写 2 到 3 条检索式，总数不超过 8 条。同一个数据库的几条要有明显不同的取向，让用户能比较哪条靠谱：\
+例如一条宽（核心概念加同义词，宁多勿漏），一条聚焦（加上限定，命中少而准），一条换一个角度或术语体系。\n\
+关键词是中文时，换成英文的专业术语，并补上常用的同义词、缩写和拼写变体。检索式必须符合该数据库的语法，可以直接粘贴运行。\n\n\
+只输出一个 JSON 数组，不要任何其他文字：\n\
+[{\"source\": \"数据库的键，如 pubmed\", \"query\": \"检索式\", \"why\": \"一句中文，说明这条检索式的取向和它可能漏掉或多带进来的东西\"}]",
+    );
+    (system, prompt)
+}
+
+/// The queries in a reply to `query_prompt`. The array may sit inside other
+/// text or a code fence; entries for an unknown database or without a query
+/// are dropped.
+pub fn parse_queries(reply: &str) -> Result<Vec<QueryIdea>, String> {
+    let ideas: Vec<QueryIdea> = reply
+        .find('[')
+        .zip(reply.rfind(']'))
+        .filter(|(start, end)| start < end)
+        .and_then(|(start, end)| serde_json::from_str::<Vec<Value>>(&reply[start..=end]).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            let field = |key: &str| item[key].as_str().unwrap_or("").trim().to_string();
+            let idea = QueryIdea { source: field("source").to_lowercase(), query: field("query"), why: field("why") };
+            (crate::sources::KINDS.iter().any(|(key, _)| *key == idea.source) && !idea.query.is_empty()).then_some(idea)
+        })
+        .collect();
+    if ideas.is_empty() { return Err("模型没有给出可用的检索式。可以换个说法再试一次，或者自己新建检索式。".into()) }
+    Ok(ideas)
+}
+
 /// What to tell the reader when a turn did not end normally.
 pub fn stop_note(reason: &str) -> Option<&'static str> {
     match reason {
@@ -902,6 +971,32 @@ mod tests {
         add_labels(&mut result, &ctx.sources);
         assert_eq!(result, json!({"total": 1, "hits": [{"paperId": "c", "page": 1, "label": "P3"}], "papers": [{"id": "a", "label": "P1"}, {"id": "zzz"}]}));
         assert!(ctx.instructions.contains("search_fulltext") && ctx.instructions.contains("label"));
+    }
+
+    #[test]
+    fn query_ideas() {
+        let (system, prompt) = query_prompt("根", "根尖发育", "单细胞 干细胞微环境", &["pubmed".into(), "arxiv".into()]);
+        assert!(system.contains("检索"));
+        assert!(prompt.contains("主题：根尖发育") && prompt.contains("单细胞 干细胞微环境") && prompt.contains("- pubmed：PubMed 检索式") && prompt.contains("- arxiv：") && !prompt.contains("- crossref"));
+        // No topic, no line for it.
+        assert!(!query_prompt("根", " ", "x", &[]).1.contains("主题："));
+
+        let reply = "好的：\n```json\n[{\"source\": \"PubMed\", \"query\": \" root[Title] AND \\\"single cell\\\" \", \"why\": \"聚焦\"},\n {\"source\": \"scholar\", \"query\": \"x\"}, {\"source\": \"arxiv\", \"query\": \"\"}, {\"source\": \"arxiv\", \"query\": \"abs:[root]\"}]\n```";
+        assert_eq!(
+            parse_queries(reply).unwrap(),
+            [QueryIdea { source: "pubmed".into(), query: "root[Title] AND \"single cell\"".into(), why: "聚焦".into() }, QueryIdea { source: "arxiv".into(), query: "abs:[root]".into(), why: String::new() }]
+        );
+        for bad in ["我不知道", "[]", "] [", "[{\"source\": \"pubmed\"}]"] {
+            assert!(parse_queries(bad).is_err(), "{bad}");
+        }
+
+        let claude = Profile { api_key: "k".into(), ..Default::default() };
+        let r = plain_request(&claude, "S", "Q").unwrap();
+        assert_eq!((r.body["system"].clone(), r.body["messages"].clone()), (json!("S"), json!([{"role": "user", "content": "Q"}])));
+        assert!(r.body.get("cache_control").is_none() && r.body.get("tools").is_none() && r.body["fallbacks"] == "default");
+        let other = plain_request(&Profile { protocol: Protocol::OpenAI, base_url: "http://x/v1".into(), api_key: "k".into(), model: "m".into(), ..Default::default() }, "S", "Q").unwrap();
+        assert_eq!(other.body["messages"], json!([{"role": "system", "content": "S"}, {"role": "user", "content": "Q"}]));
+        assert!(plain_request(&Profile::default(), "S", "Q").is_err() || !Profile::default().key().is_empty());
     }
 
     #[test]
