@@ -12,16 +12,38 @@ use wisp_core::update::{self, Release};
 
 const USER_AGENT: &str = concat!("WispPaper/", env!("CARGO_PKG_VERSION"));
 
-fn agent(overall: Option<Duration>) -> ureq::Agent {
-    ureq::Agent::config_builder()
+/// The proxy every request of this process goes through, from the settings.
+static PROXY: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Set the global proxy (`http://…`, `socks5://…`); empty leaves the choice
+/// to the environment (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`).
+pub fn set_proxy(address: &str) {
+    *PROXY.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = address.trim().to_string();
+}
+
+/// Which proxy a request takes. `own` is the setting of whoever asks (a
+/// model profile): an address of its own, `direct` for none at all, or empty
+/// for the global one, which when empty too is the environment's.
+fn proxy_for(own: &str) -> Result<Option<ureq::Proxy>, String> {
+    let own = own.trim();
+    if own.eq_ignore_ascii_case("direct") { return Ok(None) }
+    let global = PROXY.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let address = if own.is_empty() { global.as_str() } else { own };
+    if address.is_empty() { return Ok(ureq::Proxy::try_from_env()) }
+    ureq::Proxy::new(address).map(Some).map_err(|err| format!("代理地址 {address} 无法使用：{err}"))
+}
+
+fn agent(overall: Option<Duration>, proxy: &str) -> Result<ureq::Agent, String> {
+    Ok(ureq::Agent::config_builder()
         // Error responses carry the reason in their body; read it rather than a bare status.
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(20)))
         .timeout_recv_response(Some(Duration::from_secs(120)))
         .timeout_global(overall)
         .user_agent(USER_AGENT)
+        .proxy(proxy_for(proxy)?)
         .build()
-        .into()
+        .into())
 }
 
 fn network_error(err: ureq::Error) -> String {
@@ -30,7 +52,7 @@ fn network_error(err: ureq::Error) -> String {
 
 /// GET a JSON document; `None` for a 404.
 fn get_json(url: &str) -> Result<Option<Value>, String> {
-    let mut response = agent(Some(Duration::from_secs(40))).get(url).call().map_err(network_error)?;
+    let mut response = agent(Some(Duration::from_secs(40)), "")?.get(url).call().map_err(network_error)?;
     let status = response.status().as_u16();
     if status == 404 { return Ok(None) }
     if !(200..300).contains(&status) { return Err(format!("服务返回 HTTP {status}：{url}")) }
@@ -44,7 +66,7 @@ pub fn get_text(url: &str) -> Result<String, String> {
     // A service that says "too fast" is asked again, a little later each time.
     for wait in [Some(1500), Some(4000), None] {
         take_turn(host);
-        let mut response = agent(Some(Duration::from_secs(60))).get(url).call().map_err(network_error)?;
+        let mut response = agent(Some(Duration::from_secs(60)), "")?.get(url).call().map_err(network_error)?;
         let status = response.status().as_u16();
         match (status, wait) {
             (200..300, _) => return response.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| format!("无法读取 {host} 的返回内容：{e}")),
@@ -103,7 +125,7 @@ pub fn lookup_paper(id: &Identifier) -> Result<Paper, String> {
 /// (`update::latest_url()`); `None` when nothing has been published. Only
 /// the redirect is read: no page or package is fetched.
 pub fn latest_release(url: &str) -> Result<Option<Release>, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).timeout_global(Some(Duration::from_secs(20))).user_agent(USER_AGENT).build().into();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).timeout_global(Some(Duration::from_secs(20))).user_agent(USER_AGENT).proxy(proxy_for("")?).build().into();
     let response = agent.get(url).call().map_err(network_error)?;
     let status = response.status().as_u16();
     match status {
@@ -118,7 +140,15 @@ pub fn latest_release(url: &str) -> Result<Option<Release>, String> {
 /// ends or the receiver is gone (the conversation was reset).
 pub fn stream_chat(request: HttpRequest, protocol: Protocol, events: async_channel::Sender<ChatEvent>) {
     let send = |event| events.send_blocking(event).is_ok();
-    let mut call = agent(None).post(&request.url);
+    // The model service may have a proxy of its own, or be told to use none.
+    let agent = match agent(None, &request.proxy) {
+        Ok(agent) => agent,
+        Err(err) => {
+            send(ChatEvent::Error(err));
+            return;
+        }
+    };
+    let mut call = agent.post(&request.url);
     for (name, value) in &request.headers {
         call = call.header(name, value);
     }
@@ -311,6 +341,66 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         assert!(received.starts_with("POST /v1/responses "), "{received}");
         assert!(received.to_lowercase().contains("authorization: bearer test-key"));
         assert_eq!((request.body["store"].as_bool(), request.body["input"][0]["content"].as_str()), (Some(false), Some("你好")));
+    }
+
+    /// A profile's own proxy takes its request; `direct` and a bad address are what they say.
+    #[test]
+    fn profile_proxy() {
+        let reply = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let ask_through = |base: &str, proxy: &str| {
+            let profile = Profile { protocol: Protocol::OpenAI, base_url: base.into(), api_key: "k".into(), model: "m".into(), proxy: proxy.into(), ..Default::default() };
+            let request = chat_request(&profile, &Context { instructions: "I".into(), documents: "D".into(), ..Default::default() }, &[user_message("你好")], &[]).unwrap();
+            let (sender, events) = async_channel::unbounded();
+            stream_chat(request, Protocol::OpenAI, sender);
+            std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>()
+        };
+        // A proxy that grants the tunnel it is asked for and then answers inside it itself. The
+        // service's name resolves nowhere: only the proxy can have answered.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut read_until = |end: &str| {
+                let mut received = vec![];
+                let mut buffer = [0u8; 4096];
+                while !String::from_utf8_lossy(&received).ends_with(end) {
+                    let n = stream.read(&mut buffer).unwrap();
+                    if n == 0 { break }
+                    received.extend_from_slice(&buffer[..n]);
+                }
+                String::from_utf8_lossy(&received).to_string()
+            };
+            let asked = read_until("\r\n\r\n");
+            let mut stream = stream;
+            stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").unwrap();
+            let mut received = vec![];
+            let mut buffer = [0u8; 4096];
+            // The whole request: its body is either counted or chunked, ending with a zero-length chunk.
+            loop {
+                let n = stream.read(&mut buffer).unwrap();
+                received.extend_from_slice(&buffer[..n]);
+                let text = String::from_utf8_lossy(&received).to_lowercase();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length: usize = text.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+                    if (text.contains("transfer-encoding: chunked") && text.ends_with("0\r\n\r\n")) || (!text.contains("transfer-encoding: chunked") && received.len() >= end + 4 + length) { break }
+                }
+                if n == 0 { break }
+            }
+            stream.write_all(reply.as_bytes()).unwrap();
+            (asked, String::from_utf8_lossy(&received).to_string())
+        });
+        let events = ask_through("http://model.invalid/v1", &proxy);
+        assert_eq!(events[0], ChatEvent::Text("Hi".into()), "{events:?}");
+        let (asked, inner) = server.join().unwrap();
+        assert!(asked.starts_with("CONNECT model.invalid:80 "), "{asked}");
+        assert!(inner.starts_with("POST /v1/chat/completions "), "{inner}");
+
+        let (base, server) = serve(reply);
+        assert_eq!(ask_through(&format!("{base}/v1"), "direct")[0], ChatEvent::Text("Hi".into()));
+        assert!(server.join().unwrap().starts_with("POST /v1/chat/completions "));
+
+        let events = ask_through("http://model.invalid/v1", "not a proxy");
+        assert!(matches!(&events[..], [ChatEvent::Error(e)] if e.contains("代理地址")), "{events:?}");
     }
 
     #[test]

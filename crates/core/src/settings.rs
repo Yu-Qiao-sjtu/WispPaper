@@ -21,13 +21,16 @@ pub struct Settings {
     pub appearance: String,
     /// "compact" tightens the paper table; empty is the standard rows.
     pub density: String,
+    /// The proxy every request goes through, as a URL (`http://127.0.0.1:7890`,
+    /// `socks5://…`); empty leaves it to the environment (`HTTPS_PROXY` and the like).
+    pub proxy: String,
     /// Changed shortcuts by id; an empty key means the shortcut is removed.
     pub shortcuts: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { data_dir: String::new(), profiles: vec![], active_profile: 0, auto_update: true, appearance: String::new(), density: String::new(), shortcuts: BTreeMap::new() }
+        Settings { data_dir: String::new(), profiles: vec![], active_profile: 0, auto_update: true, appearance: String::new(), density: String::new(), proxy: String::new(), shortcuts: BTreeMap::new() }
     }
 }
 
@@ -47,6 +50,23 @@ pub fn settings_file() -> PathBuf {
         Some(home) => home.join("settings.json"),
         None => dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("WispPaper").join("settings.json"),
     }
+}
+
+/// The schemes a proxy address may have.
+pub const PROXY_SCHEMES: [&str; 6] = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
+
+/// What is wrong with a proxy address, if anything. Empty is fine: it means
+/// "not set". `direct` (no proxy at all) is only meaningful for one model
+/// service, so it is accepted only where `allow_direct` says so.
+pub fn proxy_problem(value: &str, allow_direct: bool) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || (allow_direct && value.eq_ignore_ascii_case("direct")) { return None }
+    let Some((scheme, rest)) = value.split_once("://") else { return Some("代理地址要写完整，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。".into()) };
+    if !PROXY_SCHEMES.contains(&scheme.to_lowercase().as_str()) { return Some(format!("不支持 {scheme}:// 代理。可用：{}。", PROXY_SCHEMES.join("、"))) }
+    // What stands after any `user:password@`, up to the port or a path.
+    let host = rest.rsplit('@').next().unwrap_or("").split(['/', ':']).next().unwrap_or("");
+    if host.is_empty() || value.contains(char::is_whitespace) { return Some("代理地址里缺少主机名，或者含有空格。".into()) }
+    None
 }
 
 impl Settings {
@@ -106,6 +126,22 @@ mod tests {
         assert!(old.auto_update && old.appearance.is_empty());
         assert_eq!((old.data_dir.as_str(), old.shortcuts.get("search").map(String::as_str)), ("/x", Some("")));
         assert_eq!(s.data_root(Path::new("/d")), PathBuf::from("/d"));
+        assert!(old.proxy.is_empty());
+        // A profile saved before proxies existed has none of its own.
+        std::fs::write(&path, r#"{"proxy":"socks5://127.0.0.1:1080","profiles":[{"name":"x","protocol":"openai","baseUrl":"http://h/v1","apiKey":"","model":"m"}]}"#).unwrap();
+        let with = Settings::load(&path).unwrap();
+        assert_eq!((with.proxy.as_str(), with.profiles[0].proxy.as_str()), ("socks5://127.0.0.1:1080", ""));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn proxy_addresses() {
+        for good in ["", "  ", "http://127.0.0.1:7890", "HTTPS://proxy.example", "socks5://user:pass@10.0.0.1:1080", "socks5h://localhost:1080/"] {
+            assert_eq!(proxy_problem(good, false), None, "{good}");
+        }
+        for bad in ["127.0.0.1:7890", "ftp://x", "http://", "http://:8080", "http://a b:1", "direct"] {
+            assert!(proxy_problem(bad, false).is_some(), "{bad}");
+        }
+        assert_eq!(proxy_problem(" Direct ", true), None);
     }
 }

@@ -38,6 +38,8 @@ pub struct Profile {
     /// Empty means the ANTHROPIC_API_KEY / OPENAI_API_KEY environment variable.
     pub api_key: String,
     pub model: String,
+    /// A proxy for this service alone: empty uses the global one, `direct` none at all.
+    pub proxy: String,
 }
 
 pub const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
@@ -45,7 +47,7 @@ pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 
 impl Default for Profile {
     fn default() -> Self {
-        Profile { name: "Claude".into(), protocol: Protocol::Anthropic, base_url: ANTHROPIC_BASE.into(), api_key: String::new(), model: DEFAULT_MODEL.into() }
+        Profile { name: "Claude".into(), protocol: Protocol::Anthropic, base_url: ANTHROPIC_BASE.into(), api_key: String::new(), model: DEFAULT_MODEL.into(), proxy: String::new() }
     }
 }
 
@@ -360,6 +362,8 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Value,
+    /// The profile's own proxy setting, for whoever sends the request.
+    pub proxy: String,
 }
 
 /// Models whose safety classifiers can decline a request, and for which the
@@ -414,7 +418,7 @@ pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[T
                     body["fallbacks"] = json!("default");
                 }
             }
-            Ok(HttpRequest { url: format!("{base}/v1/messages"), headers, body })
+            Ok(HttpRequest { url: format!("{base}/v1/messages"), headers, body, proxy: profile.proxy.trim().to_string() })
         }
         Protocol::OpenAI => {
             let mut all = vec![json!({"role": "system", "content": format!("{}\n\n{}", ctx.instructions, ctx.documents)})];
@@ -423,7 +427,7 @@ pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[T
             if !tools.is_empty() {
                 body["tools"] = tools.iter().map(|t| json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}})).collect();
             }
-            Ok(HttpRequest { url: format!("{base}/chat/completions"), headers: vec![("authorization".to_string(), format!("Bearer {key}")), ("content-type".to_string(), "application/json".to_string())], body })
+            Ok(HttpRequest { url: format!("{base}/chat/completions"), headers: vec![("authorization".to_string(), format!("Bearer {key}")), ("content-type".to_string(), "application/json".to_string())], body, proxy: profile.proxy.trim().to_string() })
         }
         Protocol::Responses => {
             let mut body = json!({
@@ -439,7 +443,7 @@ pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[T
             if !tools.is_empty() {
                 body["tools"] = tools.iter().map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.input_schema})).collect();
             }
-            Ok(HttpRequest { url: format!("{base}/responses"), headers: vec![("authorization".to_string(), format!("Bearer {key}")), ("content-type".to_string(), "application/json".to_string())], body })
+            Ok(HttpRequest { url: format!("{base}/responses"), headers: vec![("authorization".to_string(), format!("Bearer {key}")), ("content-type".to_string(), "application/json".to_string())], body, proxy: profile.proxy.trim().to_string() })
         }
     }
 }

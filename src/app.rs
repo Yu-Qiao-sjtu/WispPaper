@@ -484,6 +484,7 @@ impl Workspace {
             toast = Some(Toast { message: format!("{err:#}；本次使用默认设置。").into(), error: true, at: Instant::now() });
             Settings::default()
         });
+        wisp_net::set_proxy(&settings.proxy);
         let root = settings.data_root(&default_root());
         let _ = std::fs::create_dir_all(&root);
         let focus = cx.focus_handle();
@@ -2095,6 +2096,7 @@ impl Workspace {
                     "appearance" => SettingsPage::Appearance,
                     "shortcuts" => SettingsPage::Shortcuts,
                     "ai" => SettingsPage::Ai,
+                    "network" => SettingsPage::Network,
                     "about" => SettingsPage::About,
                     _ => SettingsPage::General,
                 })),
