@@ -19,6 +19,7 @@ cargo clippy --all-targets              # expected to be warning-free
 
 - The toolchain is pinned in `rust-toolchain.toml` (clippy only). There is no rustfmt component and no `rustfmt.toml`: the code is hand-formatted with long lines and one-line `if x { return }` bodies. Do not run `cargo fmt`; match the surrounding style.
 - Windows needs the MSVC build tools.
+- CI (`.github/workflows/ci.yml`) runs clippy with `-D warnings` and the tests on Windows and macOS, and the three windowless crates on Linux. A release is a pushed tag `v<version>` that matches the version in `Cargo.toml` (`release.yml`; notes from `.github/release-notes/v<version>.md`; macOS bundle by `scripts/package-macos.sh`). Packages are unsigned.
 - Demo data: `cargo run -p wisp_core --example seed -- /tmp/wisp-demo some.pdf`, then `WISP_PAPER_HOME=/tmp/wisp-demo cargo run`.
 - No API key at hand: `cargo run -p wisp_core --example mock_model -- 8787` is a fake Claude endpoint: in a chat it calls two tools and then answers, asked for search queries by the guide it proposes two for PubMed, and asked to screen a paper it decides by one word. Point a profile in the demo folder's `settings.json` at `http://127.0.0.1:8787` and drive the window with `WISP_PAPER_DEV=open:0,page:ask,ask:<question>`.
 - `WISP_PAPER_HOME` moves both the data folder and `settings.json` to one directory; use it for any manual run so the real library in `Documents/WispPaper` is not touched.

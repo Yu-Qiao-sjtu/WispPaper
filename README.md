@@ -105,6 +105,12 @@ wisp search_fulltext --help             # 一个工具的参数
 }
 ```
 
+## 下载
+
+安装包在 [Releases](https://github.com/xuzhougeng/WispPaper/releases) 页：Windows x64、macOS（Apple 芯片和 Intel）各一个 zip，里面带有命令行工具 `wisp`。
+
+目前的安装包没有代码签名。Windows 提示「已保护你的电脑」时点「更多信息」→「仍要运行」；macOS 提示无法验证开发者或文件已损坏时，执行 `xattr -cr "/Applications/Wisp Paper.app"` 后再打开。
+
 ## 构建
 
 需要 Rust（版本见 `rust-toolchain.toml`，rustup 会自动安装）。Windows 上需要 MSVC 构建工具。
@@ -122,6 +128,11 @@ cargo clippy --all-targets          # 应当没有警告
 cargo run -p wisp_core --example seed -- /tmp/wisp-demo some.pdf
 WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 ```
+
+### 持续集成与发布
+
+- 每次推送到 `main` 和每个 PR 都会在 Windows 和 macOS 上跑 `cargo clippy --all-targets -- -D warnings` 与 `cargo test`，并在 Linux 上检查不带窗口的三个 crate（`.github/workflows/ci.yml`）。
+- 发布：把各 `Cargo.toml` 的版本号改好，写 `.github/release-notes/v<版本>.md`，然后推送标签 `v<版本>`。`.github/workflows/release.yml` 会构建三个安装包并创建 Release；标签和 `Cargo.toml` 的版本不一致时构建会失败。macOS 的 `.app` 由 `scripts/package-macos.sh` 组装。
 
 ## 代码结构
 
