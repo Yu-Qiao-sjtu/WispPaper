@@ -29,11 +29,12 @@ pub enum SettingsPage {
     Appearance,
     Shortcuts,
     Ai,
+    Network,
     About,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 5] = [SettingsPage::General, SettingsPage::Appearance, SettingsPage::Shortcuts, SettingsPage::Ai, SettingsPage::About];
+    const ALL: [SettingsPage; 6] = [SettingsPage::General, SettingsPage::Appearance, SettingsPage::Shortcuts, SettingsPage::Ai, SettingsPage::Network, SettingsPage::About];
 
     fn title(self) -> &'static str {
         match self {
@@ -41,6 +42,7 @@ impl SettingsPage {
             SettingsPage::Appearance => "外观",
             SettingsPage::Shortcuts => "快捷键",
             SettingsPage::Ai => "AI",
+            SettingsPage::Network => "网络",
             SettingsPage::About => "关于",
         }
     }
@@ -51,6 +53,7 @@ impl SettingsPage {
             SettingsPage::Appearance => "palette",
             SettingsPage::Shortcuts => "keyboard",
             SettingsPage::Ai => "sparkle",
+            SettingsPage::Network => "link",
             SettingsPage::About => "info",
         }
     }
@@ -64,6 +67,9 @@ pub struct SettingsView {
     base_url: Entity<TextInput>,
     model: Entity<TextInput>,
     api_key: Entity<TextInput>,
+    /// The model service's own proxy, and the proxy for everything.
+    profile_proxy: Entity<TextInput>,
+    proxy: Entity<TextInput>,
     /// The shortcut waiting for its new key. While it waits, every key
     /// binding is cleared, so the keys pressed reach `record_key`.
     recording: Option<String>,
@@ -207,8 +213,10 @@ impl Workspace {
                 let base_url = input("https://…", &profile.base_url);
                 let model = input("模型名称", &profile.model);
                 let api_key = input("留空则读取环境变量", &profile.api_key);
+                let profile_proxy = input("留空则使用全局代理", &profile.proxy);
+                let proxy = input("http://127.0.0.1:7890", &self.settings.proxy);
                 api_key.update(cx, |input, _| input.masked = true);
-                let subscriptions = [&base_url, &model, &api_key]
+                let mut subscriptions: Vec<Subscription> = [&base_url, &model, &api_key, &profile_proxy]
                     .into_iter()
                     .map(|input| {
                         cx.subscribe(input, |this, _, event: &InputEvent, cx| {
@@ -216,7 +224,10 @@ impl Workspace {
                         })
                     })
                     .collect();
-                self.settings_view = Some(SettingsView { page, scroll: ScrollHandle::new(), protocol: profile.protocol, base_url, model, api_key, recording: None, shortcut_error: None, _subscriptions: subscriptions });
+                subscriptions.push(cx.subscribe(&proxy, |this, _, event: &InputEvent, cx| {
+                    if *event == InputEvent::Changed { this.save_proxy(cx) }
+                }));
+                self.settings_view = Some(SettingsView { page, scroll: ScrollHandle::new(), protocol: profile.protocol, base_url, model, api_key, profile_proxy, proxy, recording: None, shortcut_error: None, _subscriptions: subscriptions });
             }
         }
         window.focus(&self.focus);
@@ -431,10 +442,22 @@ impl Workspace {
     }
 
     /// Keep what the AI page shows as the profile questions go to.
+    /// Keep the global proxy as typed, and put it to use once it is an
+    /// address that can work; until then the last good one stays in force.
+    fn save_proxy(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = &self.settings_view else { return };
+        let address = view.proxy.read(cx).text().trim().to_string();
+        cx.notify();
+        if wisp_core::settings::proxy_problem(&address, false).is_some() || self.settings.proxy == address { return }
+        self.settings.proxy = address;
+        wisp_net::set_proxy(&self.settings.proxy);
+        self.save_settings(cx);
+    }
+
     fn save_profile(&mut self, cx: &mut Context<Self>) {
         let Some(view) = &self.settings_view else { return };
         let text = |input: &Entity<TextInput>| input.read(cx).text().trim().to_string();
-        let profile = Profile { name: self.settings.profile().map_or("默认".into(), |p| p.name.clone()), protocol: view.protocol, base_url: text(&view.base_url), api_key: text(&view.api_key), model: text(&view.model) };
+        let profile = Profile { name: self.settings.profile().map_or("默认".into(), |p| p.name.clone()), protocol: view.protocol, base_url: text(&view.base_url), api_key: text(&view.api_key), model: text(&view.model), proxy: text(&view.profile_proxy) };
         if self.settings.profile() == Some(&profile) { return }
         self.settings.profiles = vec![profile];
         self.settings.active_profile = 0;
@@ -485,6 +508,7 @@ impl Workspace {
             SettingsPage::Appearance => self.appearance_page(cx),
             SettingsPage::Shortcuts => self.shortcuts_page(cx),
             SettingsPage::Ai => self.ai_page(window, cx),
+            SettingsPage::Network => self.network_page(window, cx),
             SettingsPage::About => self.about_page(cx),
         };
         let changed = page == SettingsPage::Shortcuts && !self.settings.shortcuts.is_empty();
@@ -627,7 +651,9 @@ impl Workspace {
             ("可以提问", theme::status_colors("included"))
         };
         let field = |input: &Entity<TextInput>| div().w(px(INPUT_W)).child(ui::field(input, window, cx));
-        let (base_url, model, api_key) = (field(&view.base_url), field(&view.model), field(&view.api_key));
+        let (base_url, model, api_key, profile_proxy) = (field(&view.base_url), field(&view.model), field(&view.api_key), field(&view.profile_proxy));
+        // A bad address is said where it is typed; the request would only fail later.
+        let proxy_detail = wisp_core::settings::proxy_problem(view.profile_proxy.read(cx).text(), true).unwrap_or_else(|| "只用于这个模型服务。留空则使用「网络」页的全局代理；填 direct 表示不走代理。".to_string());
         div()
             .flex()
             .flex_col()
@@ -642,9 +668,36 @@ impl Workspace {
                         row("服务地址", None, base_url).into_any_element(),
                         row("模型", None, model).into_any_element(),
                         row("API Key", Some(format!("留空则读取环境变量 {variable}。").into()), api_key).into_any_element(),
+                        row("代理", Some(proxy_detail.into()), profile_proxy).into_any_element(),
                     ],
                 )
                 .child(note(privacy)),
+            )
+            .into_any_element()
+    }
+
+    fn network_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(view) = &self.settings_view else { return div().into_any_element() };
+        let problem = wisp_core::settings::proxy_problem(view.proxy.read(cx).text(), false);
+        let (state, colors) = match (&problem, self.settings.proxy.trim().is_empty()) {
+            (Some(_), _) => ("地址有误，未启用", theme::status_colors("uncertain")),
+            (None, true) => ("未设置，跟随系统环境变量", theme::status_colors("pending")),
+            (None, false) => ("已启用", theme::status_colors("included")),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(px(24.))
+            .child(
+                group(
+                    Some("代理"),
+                    vec![
+                        row("全局代理", Some("文献检索、元数据查询、检查更新和模型请求都经过它。修改会自动保存，下一次请求起生效。".into()), ui::chip(state, colors.0, colors.1)).into_any_element(),
+                        row("代理地址", Some(problem.unwrap_or_else(|| "支持 http、https、socks4、socks4a、socks5、socks5h，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。".to_string()).into()), div().w(px(INPUT_W)).child(ui::field(&view.proxy, window, cx))).into_any_element(),
+                    ],
+                )
+                .child(note("留空时使用环境变量 ALL_PROXY、HTTPS_PROXY、HTTP_PROXY（NO_PROXY 同样有效）。模型服务可以在「AI」页单独指定代理，或者填 direct 不走代理。命令行 wisp 使用同一个设置。代理地址连同其中的用户名和密码以明文保存在本机的 settings.json 里。")),
             )
             .into_any_element()
     }

@@ -81,6 +81,8 @@ fn serve(root: &Path, server: &mcp::Server, input: impl BufRead, mut output: imp
 
 fn main() {
     let mut words: Vec<String> = std::env::args().skip(1).collect();
+    // The proxy chosen in the app's settings holds here too; a settings file that cannot be read is reported by `data_root`.
+    if let Ok(settings) = Settings::load(&settings_file()) { wisp_net::set_proxy(&settings.proxy) }
     let result = take_data_dir(&mut words).and_then(data_root).and_then(|root| {
         if words.first().map(String::as_str) == Some("mcp") {
             // `wisp mcp --read-only` leaves out the tools that change a library.

@@ -41,7 +41,8 @@
   - 通用：数据目录、自动检查更新。
   - 外观：跟随系统 / 浅色 / 深色，文献列表的行高。
   - 快捷键：搜索、添加文献、导入 PDF、提问等都可以改键、移除或恢复默认。
-  - AI：提问使用的模型服务。三种接口：Claude API、OpenAI 兼容的 chat/completions、OpenAI 的 Responses（/responses）。
+  - AI：提问使用的模型服务。三种接口：Claude API、OpenAI 兼容的 chat/completions、OpenAI 的 Responses（/responses）。模型服务可以单独指定代理，或者填 direct 不走代理。
+  - 网络：全局代理（http、https、socks4、socks5 等），文献检索、元数据查询、检查更新和模型请求都经过它；留空时跟随环境变量 ALL_PROXY / HTTPS_PROXY / HTTP_PROXY。命令行 `wisp` 用同一个设置。
   - 关于：版本、检查更新、项目主页。
 
 ## 数据在哪里
