@@ -135,9 +135,25 @@ pub fn latest_release(url: &str) -> Result<Option<Release>, String> {
     }
 }
 
+/// How long to wait before each further try of a request the service could
+/// not take: two more tries, as the model SDKs make.
+const RETRY_WAITS: [u64; 2] = if cfg!(test) { [10, 10] } else { [1000, 3000] };
+
+/// The longest a service's own `retry-after` is waited for, in milliseconds.
+const RETRY_AFTER_CAP: u64 = 20_000;
+
+/// Statuses that say "not now", not "not this": too many requests, a
+/// service that is overloaded or failing, a request that timed out there.
+fn retryable(status: u16) -> bool {
+    matches!(status, 408 | 409 | 429 | 500..=599)
+}
+
 /// Send a chat request and forward the model's turn: its text as it
-/// arrives, then the whole turn with any tool calls. Returns when the stream
-/// ends or the receiver is gone (the conversation was reset).
+/// arrives, then the whole turn with any tool calls. A request the service
+/// is too busy for, or that never reached it, is sent again a little later,
+/// up to twice; nothing of an answer has arrived by then, so nothing is
+/// repeated. Returns when the stream ends or the receiver is gone (the
+/// conversation was reset or stopped).
 pub fn stream_chat(request: HttpRequest, protocol: Protocol, events: async_channel::Sender<ChatEvent>) {
     let send = |event| events.send_blocking(event).is_ok();
     // The model service may have a proxy of its own, or be told to use none.
@@ -148,17 +164,34 @@ pub fn stream_chat(request: HttpRequest, protocol: Protocol, events: async_chann
             return;
         }
     };
-    let mut call = agent.post(&request.url);
-    for (name, value) in &request.headers {
-        call = call.header(name, value);
-    }
     // Compact JSON: the documents can be hundreds of kilobytes, and indentation only adds to them.
-    let mut response = match call.send(request.body.to_string()) {
-        Ok(response) => response,
-        Err(err) => {
-            send(ChatEvent::Error(network_error(err)));
-            return;
+    let body = request.body.to_string();
+    let mut tries = 0;
+    let mut response = loop {
+        let mut call = agent.post(&request.url);
+        for (name, value) in &request.headers {
+            call = call.header(name, value);
         }
+        let last = tries >= RETRY_WAITS.len();
+        let (why, wait) = match call.send(body.as_str()) {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if last || !retryable(status) { break response }
+                // The service may say how long it wants to be left alone.
+                let asked = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<f64>().ok()).map(|seconds| ((seconds.max(0.) * 1000.) as u64).min(RETRY_AFTER_CAP));
+                (format!("HTTP {status}"), asked)
+            }
+            // A request that waited two minutes for nothing is not worth two more waits.
+            Err(err) if last || matches!(err, ureq::Error::Timeout(_)) => {
+                send(ChatEvent::Error(network_error(err)));
+                return;
+            }
+            Err(err) => (network_error(err), None),
+        };
+        let wait = wait.unwrap_or(RETRY_WAITS[tries]);
+        tries += 1;
+        if !send(ChatEvent::Retrying(tries, why)) { return }
+        std::thread::sleep(Duration::from_millis(wait));
     };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
@@ -198,6 +231,7 @@ pub fn complete(request: HttpRequest, protocol: Protocol) -> Result<String, Stri
     while let Ok(event) = events.try_recv() {
         match event {
             ChatEvent::Text(more) => text.push_str(&more),
+            ChatEvent::Retrying(..) => {}
             ChatEvent::Error(error) => return Err(error),
             // A reply that was cut off or declined is not one to parse.
             ChatEvent::Done(turn) => {
@@ -217,29 +251,36 @@ mod tests {
 
     /// Serve one canned HTTP response on a local port; returns the base URL and the request it received.
     fn serve(response: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        serve_in_turn(vec![response])
+    }
+
+    /// Serve one canned response to each connection in turn; returns the base URL and the last request received.
+    fn serve_in_turn(responses: Vec<&'static str>) -> (String, std::thread::JoinHandle<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut received = vec![];
-            let mut buffer = [0u8; 4096];
-            // Read the headers and the body they announce.
-            loop {
-                let n = stream.read(&mut buffer).unwrap();
-                received.extend_from_slice(&buffer[..n]);
-                let text = String::from_utf8_lossy(&received).to_string();
-                if let Some(end) = text.find("\r\n\r\n") {
-                    let length: usize = text.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
-                    // ureq sends a JSON body chunked: it ends with a zero-length chunk.
-                    let chunked = text.to_lowercase().contains("transfer-encoding: chunked");
-                    if (chunked && text.ends_with("0
-
-")) || (!chunked && received.len() >= end + 4 + length) { break }
+            let mut last = String::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut received = vec![];
+                let mut buffer = [0u8; 4096];
+                // Read the headers and the body they announce.
+                loop {
+                    let n = stream.read(&mut buffer).unwrap();
+                    received.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&received).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length: usize = text.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+                        // ureq sends a JSON body chunked: it ends with a zero-length chunk.
+                        let chunked = text.to_lowercase().contains("transfer-encoding: chunked");
+                        if (chunked && text.ends_with("0\r\n\r\n")) || (!chunked && received.len() >= end + 4 + length) { break }
+                    }
+                    if n == 0 { break }
                 }
-                if n == 0 { break }
+                stream.write_all(response.as_bytes()).unwrap();
+                last = String::from_utf8_lossy(&received).to_string();
             }
-            stream.write_all(response.as_bytes()).unwrap();
-            String::from_utf8_lossy(&received).to_string()
+            last
         });
         (base, handle)
     }
@@ -416,9 +457,27 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
         assert_eq!(events, [ChatEvent::Error("API Key 无效或没有权限（HTTP 401）：invalid x-api-key".into())]);
         server.join().unwrap();
 
-        // Nothing listening: a network error, not a hang.
+        // Nothing listening: tried three times, then a network error, not a hang.
         let (events, _) = ask("http://127.0.0.1:9".into(), Protocol::OpenAI);
-        assert!(matches!(&events[..], [ChatEvent::Error(e)] if e.starts_with("网络请求失败")));
+        assert!(matches!(&events[..], [ChatEvent::Retrying(1, _), ChatEvent::Retrying(2, _), ChatEvent::Error(e)] if e.starts_with("网络请求失败")), "{events:?}");
+    }
+
+    #[test]
+    fn a_busy_service_is_asked_again() {
+        const BUSY: &str = "HTTP/1.1 529 Overloaded\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+        const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0.01\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        const ANSWER: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+        // Overloaded, then rate-limited, then answered: the answer arrives once, after two notices.
+        let (base, server) = serve_in_turn(vec![BUSY, LIMITED, ANSWER]);
+        let (events, _) = ask(format!("{base}/v1"), Protocol::OpenAI);
+        assert_eq!(events[..3], [ChatEvent::Retrying(1, "HTTP 529".into()), ChatEvent::Retrying(2, "HTTP 429".into()), ChatEvent::Text("Hi".into())], "{events:?}");
+        assert!(matches!(&events[3], ChatEvent::Done(turn) if turn.stop == "stop"));
+        server.join().unwrap();
+        // Still busy on the third try: the service's own words, and no fourth request.
+        let (base, server) = serve_in_turn(vec![BUSY, BUSY, BUSY]);
+        let (events, _) = ask(base, Protocol::Anthropic);
+        assert!(matches!(&events[..], [ChatEvent::Retrying(1, _), ChatEvent::Retrying(2, _), ChatEvent::Error(e)] if e.contains("Overloaded")), "{events:?}");
+        server.join().unwrap();
     }
 
     #[test]

@@ -84,7 +84,8 @@ impl Profile {
 }
 
 /// What a label in the answer points at.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Source {
     /// `P3`
     pub label: String,
@@ -126,7 +127,7 @@ impl Context {
     /// whole library, and what they find must be citable. The new labels
     /// continue after the highest one in use.
     pub fn add_sources(&mut self, papers: &[Paper]) {
-        let mut next = self.sources.iter().filter_map(|s| s.label[1..].parse::<usize>().ok()).max().unwrap_or(0);
+        let mut next = self.sources.iter().filter_map(|s| s.label.get(1..).and_then(|n| n.parse::<usize>().ok())).max().unwrap_or(0);
         for paper in papers {
             if self.sources.iter().any(|s| s.paper_id == paper.id) { continue }
             next += 1;
@@ -167,13 +168,25 @@ fn record(label_text: &str, p: &Paper, fields: &[FieldDef]) -> String {
 }
 
 /// Assemble what the model reads. `papers` is the scope's list in display
-/// order; `fulltext` holds the extracted pages by paper id.
-pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields: &[FieldDef], fulltext: &BTreeMap<String, (PaperFile, Vec<String>)>, scope: &Scope, question: &str) -> Context {
+/// order; `fulltext` holds the extracted pages by paper id. `known` is what
+/// the labels of an earlier part of the conversation name (one reopened
+/// from the history): those papers keep their labels, so what was cited
+/// before still points at the same paper, and the others are numbered on.
+pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields: &[FieldDef], fulltext: &BTreeMap<String, (PaperFile, Vec<String>)>, scope: &Scope, question: &str, known: &[Source]) -> Context {
     let mut ctx = Context::default();
     let words = terms(question);
-    let labels: BTreeMap<&str, String> = papers.iter().enumerate().map(|(i, p)| (p.id.as_str(), format!("P{}", i + 1))).collect();
+    let mut next = known.iter().filter_map(|s| s.label.get(1..).and_then(|n| n.parse::<usize>().ok())).max().unwrap_or(0);
+    let mut labels: BTreeMap<&str, String> = BTreeMap::new();
     for p in papers {
-        ctx.sources.push(Source { label: labels[p.id.as_str()].clone(), paper_id: p.id.clone(), title: p.title.clone() });
+        let label = match known.iter().find(|s| s.paper_id == p.id) {
+            Some(source) => source.label.clone(),
+            None => {
+                next += 1;
+                format!("P{next}")
+            }
+        };
+        ctx.sources.push(Source { label: label.clone(), paper_id: p.id.clone(), title: p.title.clone() });
+        labels.insert(p.id.as_str(), label);
     }
     let mut documents = String::new();
 
@@ -303,6 +316,10 @@ pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields:
 - 用用户提问的语言回答，直接回答问题，不必复述材料。"
     );
     ctx.documents = documents;
+    // A paper cited earlier that is not among these keeps its label too.
+    for source in known {
+        if !ctx.sources.iter().any(|s| s.paper_id == source.paper_id) { ctx.sources.push(source.clone()) }
+    }
     ctx
 }
 
@@ -438,6 +455,49 @@ pub fn user_message(text: &str) -> Value {
     json!({"role": "user", "content": text})
 }
 
+/// A picture that goes with a question.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageData {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`: what every protocol takes.
+    pub media_type: String,
+    /// The file's bytes in base64.
+    pub data: String,
+}
+
+/// A question with pictures, as each protocol carries them. Without
+/// pictures it is `user_message`; without text only the pictures go.
+pub fn user_message_with(protocol: Protocol, text: &str, images: &[ImageData]) -> Value {
+    if images.is_empty() { return user_message(text) }
+    let url = |image: &ImageData| format!("data:{};base64,{}", image.media_type, image.data);
+    let mut content: Vec<Value> = match protocol {
+        // Claude reads a picture best when it comes before the question about it.
+        Protocol::Anthropic => images.iter().map(|image| json!({"type": "image", "source": {"type": "base64", "media_type": image.media_type, "data": image.data}})).collect(),
+        Protocol::OpenAI => images.iter().map(|image| json!({"type": "image_url", "image_url": {"url": url(image)}})).collect(),
+        Protocol::Responses => images.iter().map(|image| json!({"type": "input_image", "image_url": url(image)})).collect(),
+    };
+    if !text.trim().is_empty() {
+        match protocol {
+            Protocol::Anthropic => content.push(json!({"type": "text", "text": text})),
+            Protocol::OpenAI => content.insert(0, json!({"type": "text", "text": text})),
+            Protocol::Responses => content.insert(0, json!({"type": "input_text", "text": text})),
+        }
+    }
+    json!({"role": "user", "content": content})
+}
+
+/// Bytes as standard base64, padded: how a picture travels in a request.
+pub fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= chunk.len() { TABLE[(n >> shift & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
 /// An answer already given, when a conversation is replayed to another protocol.
 pub fn assistant_message(text: &str) -> Value {
     json!({"role": "assistant", "content": text})
@@ -559,6 +619,8 @@ impl Turn {
 pub enum ChatEvent {
     /// More of the answer's text.
     Text(String),
+    /// The service was busy or unreachable and is being asked again: which try this is, and why.
+    Retrying(usize, String),
     Done(Turn),
     Error(String),
 }
@@ -751,6 +813,20 @@ pub fn tool_results(protocol: Protocol, results: &[(String, String, bool)]) -> V
     }
 }
 
+/// Add a word from the app to the tool results that are about to go back,
+/// without a turn of its own: for Claude a text block after the results in
+/// the same message, for the other two a message after them.
+pub fn with_note(protocol: Protocol, mut messages: Vec<Value>, note: &str) -> Vec<Value> {
+    match (protocol, messages.last_mut().and_then(|last| last["content"].as_array_mut())) {
+        (Protocol::Anthropic, Some(blocks)) => blocks.push(json!({"type": "text", "text": note})),
+        _ => messages.push(user_message(note)),
+    }
+    messages
+}
+
+/// What the model is told with the results before the last step it gets for a question.
+pub const LAST_STEP_NOTE: &str = "（系统提示）这次提问的步数快用完了：下一步请根据已经查到的内容直接回答，不要再调用工具。还没查完的部分在回答里说明，用户可以接着问。";
+
 // ---- labels in tool calls
 
 /// The paper a label or an id names: `P3` (any case) or the id itself.
@@ -781,30 +857,143 @@ pub fn add_labels(value: &mut Value, sources: &[Source]) {
 
 // ---- slash commands
 
-/// `/name`, what it does, and the request it stands for (`{}` is what follows the name).
-pub const SLASH: [(&str, &str, &str); 2] = [
-    (
-        "search",
-        "在全文和记录里检索",
-        "在文献库里检索：{}\n\n先用 search_fulltext 查已保存的全文，再用 list_papers 查题目、摘要、标签和笔记。列出命中的文献；全文命中的给出页码和原句。有文献因为没有保存全文而只查了记录时，说明这一点。",
-    ),
-    (
-        "cite",
-        "为一段文字逐句配引用",
-        "为下面这段文字逐句找出文献库中可以引用的文献：\n\n{}\n\n先调用 find_citations 取得每句的候选，再用 read_fulltext 或文献记录核对候选是否真的支持这句话。逐句给出结果：可以引用的文献（标签和页码）和它依据的原句；没有合适文献的句子直接说明没有，不要勉强配引用。",
-    ),
+/// A command typed at the start of a message.
+pub struct Slash {
+    /// What follows the slash.
+    pub name: &'static str,
+    pub about: &'static str,
+    /// What to write after the name; empty when the command stands alone.
+    pub hint: &'static str,
+    /// The request it stands for (`{}` is what follows the name); empty for
+    /// a command the window carries out itself.
+    pub template: &'static str,
+}
+
+pub const SLASH: [Slash; 5] = [
+    Slash {
+        name: "search",
+        about: "在全文和记录里检索",
+        hint: "关键词或短语",
+        template: "在文献库里检索：{}\n\n先用 search_fulltext 查已保存的全文，再用 list_papers 查题目、摘要、标签和笔记。列出命中的文献；全文命中的给出页码和原句。有文献因为没有保存全文而只查了记录时，说明这一点。",
+    },
+    Slash {
+        name: "cite",
+        about: "为一段文字逐句配引用",
+        hint: "要配引用的文字",
+        template: "为下面这段文字逐句找出文献库中可以引用的文献：\n\n{}\n\n先调用 find_citations 取得每句的候选，再用 read_fulltext 或文献记录核对候选是否真的支持这句话。逐句给出结果：可以引用的文献（标签和页码）和它依据的原句；没有合适文献的句子直接说明没有，不要勉强配引用。",
+    },
+    Slash {
+        name: "review",
+        about: "围绕一个主题写带引用的小综述",
+        hint: "主题",
+        template: "依据文献库里的文献，围绕下面的主题写一段综述：{}\n\n先用 list_papers 和 search_fulltext 找出相关的文献，拿不准的地方用 read_fulltext 核对原文。按观点组织，不要逐篇罗列；每个论断后面给出引用标签，依据全文的写上页码；文献之间一致和分歧的地方要指出来；文献库里证据不足的部分直接说明，不要用常识补齐。",
+    },
+    Slash {
+        name: "compare",
+        about: "比较几篇文献的方法和结论",
+        hint: "文献标签或题目，如 P1 P3",
+        template: "比较下面这几篇文献：{}\n\n先用 get_paper 和 read_fulltext 把它们读一遍。用一张表列出各自的研究问题、材料与方法、主要结论和局限，表后用几句话说明它们一致、互补和矛盾的地方。依据全文的内容给出页码；只有摘要可依据的文献要说明。",
+    },
+    Slash { name: "new", about: "开始一次新对话", hint: "", template: "" },
 ];
 
-/// What a typed message asks for: itself, or the request behind a slash command.
-pub fn expand_slash(input: &str) -> Result<String, String> {
+/// What a typed message asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Input {
+    /// A request for the model: the message itself, or what a slash command stands for.
+    Ask(String),
+    /// `/new`: leave this conversation and start another.
+    NewChat,
+}
+
+/// Read a typed message. The error is a sentence for the person: an unknown
+/// command, or one that is missing what it works on.
+pub fn read_input(input: &str) -> Result<Input, String> {
     let input = input.trim();
-    let Some(rest) = input.strip_prefix('/') else { return Ok(input.to_string()) };
+    let Some(rest) = input.strip_prefix('/') else { return Ok(Input::Ask(input.to_string())) };
     let (name, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-    let Some((_, about, template)) = SLASH.iter().find(|(command, _, _)| *command == name) else {
-        return Err(format!("没有 /{name} 这个命令。可用：{}", SLASH.iter().map(|(command, about, _)| format!("/{command}（{about}）")).collect::<Vec<_>>().join("、")));
+    let Some(command) = SLASH.iter().find(|command| command.name == name) else {
+        return Err(format!("没有 /{name} 这个命令。可用：{}", SLASH.iter().map(|command| format!("/{}（{}）", command.name, command.about)).collect::<Vec<_>>().join("、")));
     };
-    if argument.trim().is_empty() { return Err(format!("/{name} 后面写上内容：{about}。")) }
-    Ok(template.replace("{}", argument.trim()))
+    if command.template.is_empty() { return Ok(Input::NewChat) }
+    if argument.trim().is_empty() { return Err(format!("/{name} 后面写上内容：{}。", command.about)) }
+    Ok(Input::Ask(command.template.replace("{}", argument.trim())))
+}
+
+/// The request behind a message that was already accepted once: what goes
+/// to the model when a conversation is replayed.
+pub fn expand_slash(input: &str) -> String {
+    match read_input(input) {
+        Ok(Input::Ask(prompt)) => prompt,
+        _ => input.trim().to_string(),
+    }
+}
+
+/// The commands to offer while a message is still the beginning of one: a
+/// slash and perhaps part of a name, nothing after it. Those whose name
+/// starts with what was typed come first, then those described by it
+/// (`/引` finds 「配引用」).
+pub fn slash_matches(input: &str) -> Vec<&'static Slash> {
+    let Some(typed) = input.strip_prefix('/') else { return vec![] };
+    if typed.chars().any(char::is_whitespace) { return vec![] }
+    let typed = typed.to_lowercase();
+    let mut found: Vec<&Slash> = SLASH.iter().filter(|command| command.name.starts_with(&typed)).collect();
+    if !typed.is_empty() { found.extend(SLASH.iter().filter(|command| !command.name.starts_with(&typed) && command.about.contains(&typed))) }
+    found
+}
+
+// ---- what a conversation leaves behind
+
+/// One thing said in a conversation, as it is kept in the library.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Said {
+    /// A question as typed, with the ids of the pictures that went with it.
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+    },
+    Answer { text: String },
+    /// A tool the assistant called, as the window described it, and what came back.
+    Tool {
+        call: String,
+        #[serde(default)]
+        result: String,
+        #[serde(default)]
+        failed: bool,
+    },
+}
+
+/// A conversation as it is kept: what was said, and the papers its labels
+/// name. What the model read is not kept: a conversation taken up again
+/// reads the library as it is then, under the same labels.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Transcript {
+    pub items: Vec<Said>,
+    pub sources: Vec<Source>,
+}
+
+impl Transcript {
+    /// What the conversation is listed as: the start of its first question.
+    pub fn title(&self) -> String {
+        let first = self.items.iter().find_map(|item| match item {
+            Said::User { text, images } => Some((text.split_whitespace().collect::<Vec<_>>().join(" "), !images.is_empty())),
+            _ => None,
+        });
+        match first {
+            Some((text, _)) if !text.is_empty() => {
+                if text.chars().count() > 48 { format!("{}…", text.chars().take(48).collect::<String>()) } else { text }
+            }
+            Some((_, true)) => "（图片）".into(),
+            _ => "未命名对话".into(),
+        }
+    }
+
+    pub fn questions(&self) -> usize {
+        self.items.iter().filter(|item| matches!(item, Said::User { .. })).count()
+    }
 }
 
 // ---- one-off requests
@@ -1037,7 +1226,7 @@ mod tests {
         let mut a2 = a.clone();
         a2.fields.insert("F1".into(), vec!["Arabidopsis".into()]);
         let text = fulltext("a", &["Introduction about leaves.", "WOX5 expression in the root tip."]);
-        let ctx = build_context("根", "根尖发育", &[&a2, &b], &fields, &text, &Scope::Library, "What does WOX5 do in the root?");
+        let ctx = build_context("根", "根尖发育", &[&a2, &b], &fields, &text, &Scope::Library, "What does WOX5 do in the root?", &[]);
         assert_eq!((ctx.full, ctx.titles_only, ctx.omitted, ctx.pages), (2, 0, 0, 1));
         assert!(ctx.instructions.contains("「根」") && ctx.instructions.contains("根尖发育") && ctx.instructions.contains("2 篇"));
         assert!(ctx.documents.contains("[P1] Root stem cell niche\n"));
@@ -1052,11 +1241,11 @@ mod tests {
         let a = paper("a", "Root", "Abs");
         let b = paper("b", "Leaf", "Abs");
         let text = fulltext("b", &["one", "two"]);
-        let ctx = build_context("L", "", &[&a, &b], &[], &text, &Scope::Paper("b".into()), "summarise");
+        let ctx = build_context("L", "", &[&a, &b], &[], &text, &Scope::Paper("b".into()), "summarise", &[]);
         assert_eq!((ctx.full, ctx.pages, ctx.pages_omitted, ctx.sources.len()), (1, 2, 0, 1));
         assert!(ctx.documents.contains("[P2 p.1]\none") && ctx.documents.contains("[P2 p.2]\ntwo"));
         assert!(!ctx.documents.contains("Root"));
-        let none = build_context("L", "", &[&a], &[], &BTreeMap::new(), &Scope::Paper("a".into()), "q");
+        let none = build_context("L", "", &[&a], &[], &BTreeMap::new(), &Scope::Paper("a".into()), "q", &[]);
         assert!(none.documents.contains("没有可读取的全文"));
     }
 
@@ -1065,7 +1254,7 @@ mod tests {
         let big = "x".repeat(150_000);
         let papers: Vec<Paper> = (0..4).map(|i| paper(&format!("p{i}"), &format!("Paper {i}"), &big)).collect();
         let refs: Vec<&Paper> = papers.iter().collect();
-        let ctx = build_context("L", "", &refs, &[], &BTreeMap::new(), &Scope::Library, "anything");
+        let ctx = build_context("L", "", &refs, &[], &BTreeMap::new(), &Scope::Library, "anything", &[]);
         assert_eq!((ctx.full, ctx.titles_only), (2, 2));
         assert!(ctx.documents.contains("仅列出题目"));
         assert!(ctx.instructions.contains("另有 2 篇只列出题目"));
@@ -1348,11 +1537,11 @@ mod tests {
         let b = paper("b", "Leaf", "");
         let c = paper("c", "Stem", "");
         // The list in view is a and b; the library also holds c.
-        let mut ctx = build_context("L", "", &[&a, &b], &[], &BTreeMap::new(), &Scope::Library, "q");
+        let mut ctx = build_context("L", "", &[&a, &b], &[], &BTreeMap::new(), &Scope::Library, "q", &[]);
         ctx.add_sources(&[a.clone(), c.clone()]);
         assert_eq!(ctx.sources.iter().map(|s| (s.label.as_str(), s.paper_id.as_str())).collect::<Vec<_>>(), [("P1", "a"), ("P2", "b"), ("P3", "c")]);
         // One paper keeps the label it has in the whole list; the others follow the highest.
-        let mut one = build_context("L", "", &[&a, &b], &[], &BTreeMap::new(), &Scope::Paper("b".into()), "q");
+        let mut one = build_context("L", "", &[&a, &b], &[], &BTreeMap::new(), &Scope::Paper("b".into()), "q", &[]);
         one.add_sources(&[a.clone(), b.clone(), c.clone()]);
         assert_eq!(one.sources.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), ["P2", "P3", "P4"]);
 
@@ -1423,12 +1612,91 @@ mod tests {
 
     #[test]
     fn slash_commands() {
-        assert_eq!(expand_slash("  WOX5 做什么？ ").unwrap(), "WOX5 做什么？");
-        let search = expand_slash("/search 10x Genomics").unwrap();
+        assert_eq!(read_input("  WOX5 做什么？ ").unwrap(), Input::Ask("WOX5 做什么？".into()));
+        let search = expand_slash("/search 10x Genomics");
         assert!(search.starts_with("在文献库里检索：10x Genomics\n") && search.contains("search_fulltext"));
-        let cite = expand_slash("/cite 根尖有干细胞。\n它们由 WOX5 维持。").unwrap();
+        let cite = expand_slash("/cite 根尖有干细胞。\n它们由 WOX5 维持。");
         assert!(cite.contains("根尖有干细胞。\n它们由 WOX5 维持。") && cite.contains("find_citations"));
-        assert!(expand_slash("/search").unwrap_err().contains("/search 后面写上内容"));
-        assert!(expand_slash("/dance now").unwrap_err().contains("/cite"));
+        assert!(read_input("/search").unwrap_err().contains("/search 后面写上内容"));
+        assert!(read_input("/dance now").unwrap_err().contains("/cite"));
+        assert_eq!(read_input("/new").unwrap(), Input::NewChat);
+        // A message that cannot be expanded is replayed as it was typed.
+        assert_eq!(expand_slash("/dance now"), "/dance now");
+        // Every command that stands for a request says what to write after it.
+        assert!(SLASH.iter().all(|command| command.template.is_empty() == command.hint.is_empty() && command.template.contains("{}") != command.template.is_empty()));
+    }
+
+    #[test]
+    fn slash_popup() {
+        let names = |input: &str| slash_matches(input).iter().map(|command| command.name).collect::<Vec<_>>();
+        assert_eq!(names("/"), ["search", "cite", "review", "compare", "new"]);
+        assert_eq!(names("/c"), ["cite", "compare"]);
+        assert_eq!(names("/RE"), ["review"]);
+        // Found by what it does, after those found by name.
+        assert_eq!((names("/配"), names("/引")), (vec!["cite"], vec!["cite", "review"]));
+        assert_eq!(names("/综述"), ["review"]);
+        // Not a command being typed: no slash, something after the name, or no such command.
+        assert!(names("search").is_empty() && names("/search ").is_empty() && names("/search x").is_empty() && names("/zz").is_empty() && names(" /s").is_empty());
+    }
+
+    #[test]
+    fn pictures_in_a_question() {
+        assert_eq!((base64(b""), base64(b"f"), base64(b"fo"), base64(b"foo"), base64(b"foob")), (String::new(), "Zg==".into(), "Zm8=".into(), "Zm9v".into(), "Zm9vYg==".into()));
+        let image = ImageData { media_type: "image/png".into(), data: "AAAA".into() };
+        assert_eq!(user_message_with(Protocol::Anthropic, "这是什么？", &[]), user_message("这是什么？"));
+        assert_eq!(
+            user_message_with(Protocol::Anthropic, "这是什么？", std::slice::from_ref(&image)),
+            json!({"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}, {"type": "text", "text": "这是什么？"}]})
+        );
+        assert_eq!(
+            user_message_with(Protocol::OpenAI, "这是什么？", std::slice::from_ref(&image)),
+            json!({"role": "user", "content": [{"type": "text", "text": "这是什么？"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]})
+        );
+        // A picture alone: no empty text block, which Claude would refuse.
+        assert_eq!(user_message_with(Protocol::Responses, " ", &[image]), json!({"role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}));
+    }
+
+    #[test]
+    fn a_note_with_the_results() {
+        let results = [("toolu_1".to_string(), "{}".to_string(), false)];
+        let claude = with_note(Protocol::Anthropic, tool_results(Protocol::Anthropic, &results), "快到头了");
+        assert_eq!(claude, [json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "{}", "is_error": false}, {"type": "text", "text": "快到头了"}]})]);
+        let openai = with_note(Protocol::OpenAI, tool_results(Protocol::OpenAI, &results), "快到头了");
+        assert_eq!(openai[1], json!({"role": "user", "content": "快到头了"}));
+        assert_eq!(with_note(Protocol::Responses, tool_results(Protocol::Responses, &results), "快到头了").len(), 2);
+    }
+
+    #[test]
+    fn labels_survive_a_reopened_conversation() {
+        let (a, b, c) = (paper("a", "Alpha", ""), paper("b", "Beta", ""), paper("c", "Gamma", ""));
+        // The earlier conversation knew b as P1 and a paper since removed from the list as P4.
+        let known = [Source { label: "P1".into(), paper_id: "b".into(), title: "Beta".into() }, Source { label: "P4".into(), paper_id: "gone".into(), title: "Gone".into() }];
+        let ctx = build_context("L", "", &[&a, &b, &c], &[], &BTreeMap::new(), &Scope::Library, "q", &known);
+        let label = |id: &str| ctx.sources.iter().find(|s| s.paper_id == id).map(|s| s.label.as_str());
+        assert_eq!((label("a"), label("b"), label("c"), label("gone")), (Some("P5"), Some("P1"), Some("P6"), Some("P4")));
+        assert!(ctx.documents.contains("[P1] Beta") && ctx.documents.contains("[P5] Alpha"));
+        // A question about one paper keeps the others' labels as well.
+        let one = build_context("L", "", &[&a, &b, &c], &[], &BTreeMap::new(), &Scope::Paper("a".into()), "q", &known);
+        assert_eq!(one.sources.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), ["P5", "P1", "P4"]);
+    }
+
+    #[test]
+    fn transcripts() {
+        let transcript = Transcript {
+            items: vec![
+                Said::User { text: "这张图\n说明了什么？".into(), images: vec!["I-1".into()] },
+                Said::Tool { call: "检索全文：WOX5".into(), result: "3 条结果".into(), failed: false },
+                Said::Answer { text: "见 [P1]。".into() },
+            ],
+            sources: vec![Source { label: "P1".into(), paper_id: "a".into(), title: "Alpha".into() }],
+        };
+        let text = serde_json::to_string(&transcript).unwrap();
+        assert!(text.contains(r#""kind":"user""#) && text.contains(r#""paperId":"a""#));
+        assert_eq!(serde_json::from_str::<Transcript>(&text).unwrap(), transcript);
+        assert_eq!((transcript.title(), transcript.questions()), ("这张图 说明了什么？".to_string(), 1));
+        // Kept by an older build, or damaged: what is missing is empty, not an error.
+        assert_eq!(serde_json::from_str::<Transcript>("{}").unwrap(), Transcript::default());
+        let pictures = Transcript { items: vec![Said::User { text: String::new(), images: vec!["I-1".into()] }], sources: vec![] };
+        assert_eq!((pictures.title(), Transcript::default().title()), ("（图片）".to_string(), "未命名对话".to_string()));
     }
 }

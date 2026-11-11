@@ -15,6 +15,7 @@ mod input;
 mod library;
 mod markdown;
 mod pdf;
+mod picture;
 mod screen;
 mod searches;
 mod settings;

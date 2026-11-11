@@ -20,7 +20,7 @@ cargo run -p wisp_core --example seed -- /tmp/wisp-demo some.pdf
 WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 ```
 
-手头没有 API Key 时，`cargo run -p wisp_core --example mock_model -- 8787` 是一个假的 Claude 接口；把示例目录 `settings.json` 里的一个模型服务指向 `http://127.0.0.1:8787` 即可。端口后面再写一个毫秒数（`-- 8787 1500`），每个回答就晚这么久，可以看清批量筛选的进度；它会打印每个请求的模型和思考参数，用来核对各个任务用的是哪个模型。
+手头没有 API Key 时，`cargo run -p wisp_core --example mock_model -- 8787` 是一个假的 Claude 接口；把示例目录 `settings.json` 里的一个模型服务指向 `http://127.0.0.1:8787` 即可。端口后面再写一个毫秒数（`-- 8787 1500`），每个回答就晚这么久，可以看清批量筛选的进度；它会打印每个请求的模型和思考参数，用来核对各个任务用的是哪个模型。提问里带「试试撤销」时，它改为调用 `undo_import`，用来看助手改动文献库前的确认。
 
 ## 调试用的环境变量
 

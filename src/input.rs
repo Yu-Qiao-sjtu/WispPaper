@@ -7,7 +7,7 @@ use gpui::*;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
-actions!(text_input, [Backspace, Delete, Left, Right, SelectLeft, SelectRight, Home, End, SelectHome, SelectEnd, SelectAll, Copy, Cut, Paste, Enter, ShiftEnter, Escape, Up, Down]);
+actions!(text_input, [Backspace, Delete, Left, Right, SelectLeft, SelectRight, Home, End, SelectHome, SelectEnd, SelectAll, Copy, Cut, Paste, Enter, ShiftEnter, Escape, Up, Down, Complete]);
 
 pub fn bind_keys(cx: &mut App) {
     let c = Some("TextInput");
@@ -31,6 +31,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", Escape, c),
         KeyBinding::new("up", Up, c),
         KeyBinding::new("down", Down, c),
+        KeyBinding::new("tab", Complete, c),
     ]);
 }
 
@@ -40,6 +41,12 @@ pub enum InputEvent {
     /// Enter in a single-line field, or in a multi-line one that sends on Enter.
     Submit,
     Cancel,
+    /// While `choosing`: the arrow keys and Tab go to the list the owner shows, not to the caret.
+    Up,
+    Down,
+    Tab,
+    /// Pictures were pasted (a field that `accepts_images`); the owner takes them with `take_images`.
+    Images,
 }
 
 /// What the last paint laid out, for hit-testing and the IME.
@@ -66,6 +73,12 @@ pub struct TextInput {
     pub masked: bool,
     /// The least height of a multi-line field, in lines.
     pub min_lines: usize,
+    /// The owner is showing a list to choose from (the slash commands): Up,
+    /// Down and Tab are its keys, and Escape closes it and nothing else.
+    pub choosing: bool,
+    /// Pasting a picture hands it to the owner instead of being ignored.
+    pub accepts_images: bool,
+    pasted: Vec<Image>,
     layout: Option<Layout>,
     selecting: bool,
     scroll_x: Pixels,
@@ -94,6 +107,9 @@ impl TextInput {
             submit_on_enter: false,
             masked: false,
             min_lines: 1,
+            choosing: false,
+            accepts_images: false,
+            pasted: vec![],
             layout: None,
             selecting: false,
             scroll_x: px(0.),
@@ -122,6 +138,11 @@ impl TextInput {
         self.marked = None;
         self.scroll_x = px(0.);
         cx.notify();
+    }
+
+    /// The pictures pasted since this was last asked.
+    pub fn take_images(&mut self) -> Vec<Image> {
+        std::mem::take(&mut self.pasted)
     }
 
     pub fn focus(&self, window: &mut Window) {
@@ -249,9 +270,16 @@ impl TextInput {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
-            self.replace(self.sel.clone(), &t, cx);
+        let Some(item) = cx.read_from_clipboard() else { return };
+        // A screenshot may come with a text fallback beside it: where pictures are taken, the picture is what was meant.
+        if self.accepts_images {
+            let images: Vec<Image> = item.entries().iter().filter_map(|entry| if let ClipboardEntry::Image(image) = entry { Some(image.clone()) } else { None }).collect();
+            if !images.is_empty() {
+                self.pasted.extend(images);
+                return cx.emit(InputEvent::Images);
+            }
         }
+        if let Some(t) = item.text() { self.replace(self.sel.clone(), &t, cx) }
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
@@ -270,16 +298,22 @@ impl TextInput {
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(InputEvent::Cancel);
-        // The dialog or panel around the field handles Escape too.
-        cx.propagate();
+        // The dialog or panel around the field handles Escape too, unless it only closes the list.
+        if !self.choosing { cx.propagate() }
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.choosing { return cx.emit(InputEvent::Up) }
         self.move_line(-1., cx);
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.choosing { return cx.emit(InputEvent::Down) }
         self.move_line(1., cx);
+    }
+
+    fn tab(&mut self, _: &Complete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.choosing { cx.emit(InputEvent::Tab) } else { cx.propagate() }
     }
 
     /// Move the caret a visual line up or down; past the first or last line it goes to the start or end.
@@ -466,6 +500,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::tab))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_down))
             .on_mouse_move(cx.listener(Self::on_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_up))
