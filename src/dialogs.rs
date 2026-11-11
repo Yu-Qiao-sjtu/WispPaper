@@ -1,0 +1,225 @@
+//! The dialogs: library, add by identifier, paper form, custom fields,
+//! settings and confirmations. Their state and what happens on submit are
+//! in app.rs; this file draws them.
+
+use crate::app::{Cmd, Modal, Workspace};
+use crate::theme::{self, Theme};
+use crate::ui;
+use gpui::{prelude::FluentBuilder, *};
+use wisp_core::ai::Protocol;
+use wisp_core::model::FieldKind;
+
+/// A choice among a few: the chosen one filled with the accent.
+fn option_chip(id: impl Into<ElementId>, label: impl Into<SharedString>, chosen: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(28.))
+        .px(px(11.))
+        .rounded(px(14.))
+        .border_1()
+        .cursor_pointer()
+        .text_size(px(12.))
+        .when(chosen, |d| d.bg(Theme::accent()).border_color(Theme::accent()).text_color(gpui::white()))
+        .when(!chosen, |d| d.border_color(Theme::line_strong()).text_color(Theme::text_secondary()).hover(|s| s.bg(Theme::hover())))
+        .child(label.into())
+}
+
+impl Workspace {
+    pub fn render_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let modal = self.modal.as_ref()?;
+        let error = ui::error_line(&self.modal_error);
+        let footer = |confirm: &str, danger: bool, this: &Self, cx: &mut Context<Self>| {
+            div()
+                .flex()
+                .flex_none()
+                .justify_end()
+                .gap(px(8.))
+                .px(px(20.))
+                .py(px(14.))
+                .child(ui::secondary_button("modal-cancel", "取消").on_click(this.on(Cmd::CloseModal, cx)))
+                .child(ui::primary_button("modal-ok", confirm.to_string()).when(danger, |d| d.bg(Theme::danger())).on_click(this.on(Cmd::SubmitModal, cx)))
+        };
+        let body = || div().id("modal-body").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(12.)).px(px(20.)).py(px(8.));
+
+        let card = match modal {
+            Modal::Confirm { title, message, action, .. } => ui::dialog(440.).child(ui::dialog_title(title.clone())).child(body().child(div().text_color(Theme::text_secondary()).line_height(px(21.)).child(message.clone())).child(error)).child(footer(action, true, self, cx)),
+
+            Modal::Library { editing, name, topic, color } => {
+                let swatches: Vec<Stateful<Div>> = theme::ACCENTS.iter().map(|accent| {
+                    let chosen = accent.key == color;
+                    div()
+                        .id(accent.key)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(28.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .border_2()
+                        .border_color(if chosen { theme::c(accent.strong) } else { gpui::transparent_black() })
+                        .on_click(self.on(Cmd::PickColor(accent.key.to_string()), cx))
+                        .child(div().size(px(18.)).rounded_full().bg(theme::c(accent.strong)))
+                }).collect();
+                ui::dialog(480.)
+                    .child(ui::dialog_title(if editing.is_some() { "编辑文献库" } else { "新建文献库" }))
+                    .child(
+                        body()
+                            .child(ui::form_row("名称", ui::field(name, window, cx)))
+                            .child(ui::form_row("主题", ui::field(topic, window, cx)))
+                            .child(ui::form_row("标识色", div().flex().gap(px(6.)).children(swatches)))
+                            .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("每个文献库是独立的文件夹：自己的数据库、PDF 和自定义词条，可以单独备份或拷走。"))
+                            .child(error),
+                    )
+                    .child(footer(if editing.is_some() { "保存" } else { "创建" }, false, self, cx))
+            }
+
+            Modal::AddById { input, busy } => ui::dialog(480.)
+                .child(ui::dialog_title("通过 DOI / PMID 添加"))
+                .child(
+                    body()
+                        .child(ui::form_row("DOI 或 PMID", ui::field(input, window, cx)))
+                        .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("题目、作者、期刊、年份和摘要会从 Crossref 与 Europe PMC 查询后填入。查询会把这个编号发送给这两个服务。"))
+                        .child(error),
+                )
+                .child(footer(if *busy { "正在查询…" } else { "查询并添加" }, false, self, cx)),
+
+            Modal::Paper(form) => {
+                let lib = self.lib.as_ref()?;
+                let pair = |a: AnyElement, b: AnyElement| div().flex().gap(px(12.)).child(div().flex_1().min_w_0().child(a)).child(div().flex_1().min_w_0().child(b));
+                let custom: Vec<AnyElement> = lib
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| match field.kind {
+                        FieldKind::Select => {
+                            let current = form.selects.get(&field.id);
+                            ui::form_row(
+                                field.name.clone(),
+                                div().flex().flex_wrap().gap(px(6.)).children(field.options.iter().enumerate().map(|(j, option)| option_chip(SharedString::from(format!("option-{i}-{j}")), option.clone(), current == Some(option)).on_click(self.on(Cmd::PickOption(field.id.clone(), option.clone()), cx)))),
+                            )
+                            .into_any_element()
+                        }
+                        _ => match form.fields.iter().find(|(id, _)| id == &field.id) {
+                            Some((_, input)) => {
+                                let hint = if field.kind == FieldKind::Tags && !field.options.is_empty() { format!("{}（常用：{}）", field.name, field.options.join("、")) } else { field.name.clone() };
+                                ui::form_row(hint, ui::field(input, window, cx)).into_any_element()
+                            }
+                            None => div().into_any_element(),
+                        },
+                    })
+                    .collect();
+                ui::dialog(620.)
+                    .child(ui::dialog_title(if form.id.is_some() { "编辑文献" } else { "手动录入文献" }))
+                    .child(
+                        body()
+                            .child(ui::form_row("题目", ui::field(&form.title, window, cx)))
+                            .child(ui::form_row("作者", ui::field(&form.authors, window, cx)))
+                            .child(pair(ui::form_row("期刊 / 会议", ui::field(&form.journal, window, cx)).into_any_element(), ui::form_row("年份", ui::field(&form.year, window, cx)).into_any_element()))
+                            .child(pair(ui::form_row("DOI", ui::field(&form.doi, window, cx)).into_any_element(), ui::form_row("PMID", ui::field(&form.pmid, window, cx)).into_any_element()))
+                            .child(ui::form_row("网址", ui::field(&form.url, window, cx)))
+                            .child(ui::form_row("标签", ui::field(&form.tags, window, cx)))
+                            .when(!custom.is_empty(), |d| d.child(div().pt(px(6.)).border_t_1().border_color(Theme::line()).child(ui::caption("自定义词条"))).children(custom))
+                            .child(ui::form_row("摘要", ui::field(&form.abstract_text, window, cx)))
+                            .child(error),
+                    )
+                    .child(footer("保存", false, self, cx))
+            }
+
+            Modal::Fields { editing, name, options, kind, in_table } => {
+                let lib = self.lib.as_ref()?;
+                let count = lib.fields.len();
+                let rows: Vec<AnyElement> = lib
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        let current = editing.as_ref() == Some(&field.id);
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .h(px(38.))
+                            .px(px(8.))
+                            .rounded(px(8.))
+                            .when(current, |d| d.bg(Theme::accent_soft()))
+                            .child(div().flex_1().min_w_0().truncate().child(field.name.clone()))
+                            .child(ui::chip(field.kind.label(), Theme::text_secondary(), Theme::bg_sunken()))
+                            .child(option_chip(("field-table", i), "表格列", field.in_table).h(px(22.)).px(px(8.)).on_click(self.on(Cmd::ToggleFieldInTable(field.id.clone()), cx)))
+                            .child(ui::ghost_button(("field-up", i), Some("chevron-up"), None).when(i == 0, |d| d.opacity(0.3)).on_click(self.on(Cmd::MoveField(field.id.clone(), -1), cx)))
+                            .child(ui::ghost_button(("field-down", i), Some("chevron-down"), None).when(i + 1 == count, |d| d.opacity(0.3)).on_click(self.on(Cmd::MoveField(field.id.clone(), 1), cx)))
+                            .child(ui::ghost_button(("field-edit", i), Some("pen-line"), None).on_click(self.on(Cmd::EditField(field.id.clone()), cx)))
+                            .child(ui::ghost_button(("field-delete", i), Some("bin"), None).on_click(self.on(Cmd::DeleteField(field.id.clone()), cx)))
+                            .into_any_element()
+                    })
+                    .collect();
+                ui::dialog(560.)
+                    .child(ui::dialog_title("自定义词条"))
+                    .child(
+                        body()
+                            .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("词条是这个文献库给每篇文献加的字段，可以填写、筛选，也可以作为表格的一列。它们只属于当前文献库。删除词条会同时删除各文献里它的值。"))
+                            .child(if rows.is_empty() {
+                                div().flex().items_center().gap(px(10.)).p(px(12.)).rounded(px(8.)).bg(Theme::bg_sunken()).child(div().flex_1().text_color(Theme::text_secondary()).child("还没有词条。可以从一组预设开始，再按自己的主题修改。")).child(ui::secondary_button("field-preset", "添加单细胞文献预设").on_click(self.on(Cmd::AddPreset, cx)))
+                            } else {
+                                div().flex().flex_col().gap(px(2.)).children(rows)
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(10.))
+                                    .p(px(12.))
+                                    .rounded(px(10.))
+                                    .border_1()
+                                    .border_color(Theme::line())
+                                    .child(ui::caption(if editing.is_some() { "修改词条" } else { "新增词条" }))
+                                    .child(ui::field(name, window, cx))
+                                    .child(div().flex().items_center().gap(px(6.)).children(FieldKind::ALL.iter().map(|k| option_chip(k.as_str(), k.label(), k == kind).on_click(self.on(Cmd::PickKind(*k), cx)))).child(div().flex_1()).child(option_chip("new-in-table", "显示为表格列", *in_table).on_click(self.on(Cmd::ToggleInTable, cx))))
+                                    .when(*kind != FieldKind::Text, |d| d.child(ui::field(options, window, cx)))
+                                    .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child(match kind {
+                                        FieldKind::Text => "文本：一行自由文字，例如“实验室”“备注编号”。",
+                                        FieldKind::Tags => "多值：一篇文献可以有多个值，例如物种、方法；可按值筛选。",
+                                        FieldKind::Select => "单选：从固定选项里选一个，例如“证据等级：高 / 中 / 低”。",
+                                    }))
+                                    .child(error),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .justify_end()
+                            .gap(px(8.))
+                            .px(px(20.))
+                            .py(px(14.))
+                            .child(ui::secondary_button("modal-cancel", "完成").on_click(self.on(Cmd::CloseModal, cx)))
+                            .child(ui::primary_button("modal-ok", if editing.is_some() { "保存修改" } else { "添加词条" }).on_click(self.on(Cmd::SubmitModal, cx))),
+                    )
+            }
+
+            Modal::Settings { data_dir, base_url, api_key, model, protocol } => ui::dialog(540.)
+                .child(ui::dialog_title("设置"))
+                .child(
+                    body()
+                        .child(ui::caption("数据"))
+                        .child(ui::form_row("数据目录（所有文献库都在这个文件夹下）", ui::field(data_dir, window, cx)))
+                        .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("改到别的目录后，首页显示那个目录里的文献库；原目录里的文献库不会被移动。"))
+                        .child(div().pt(px(8.)).child(ui::caption("提问使用的模型")))
+                        .child(div().flex().gap(px(6.)).child(option_chip("protocol-anthropic", "Claude API", *protocol == Protocol::Anthropic).on_click(self.on(Cmd::PickProtocol(Protocol::Anthropic), cx))).child(option_chip("protocol-openai", "OpenAI 兼容", *protocol == Protocol::OpenAI).on_click(self.on(Cmd::PickProtocol(Protocol::OpenAI), cx))))
+                        .child(ui::form_row("服务地址", ui::field(base_url, window, cx)))
+                        .child(ui::form_row("模型", ui::field(model, window, cx)))
+                        .child(ui::form_row("API Key", ui::field(api_key, window, cx)))
+                        .child(div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_tertiary()).child(match protocol {
+                            Protocol::Anthropic => "API Key 以明文保存在本机的 settings.json 里；留空则读取环境变量 ANTHROPIC_API_KEY。提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。",
+                            Protocol::OpenAI => "适用于任何兼容 chat/completions 的服务，地址写到 /v1。API Key 以明文保存在本机的 settings.json 里；留空则读取环境变量 OPENAI_API_KEY。提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。",
+                        }))
+                        .child(error),
+                )
+                .child(footer("保存", false, self, cx)),
+        };
+        // The top strip still drags the window while a dialog is open.
+        Some(div().absolute().top_0().left_0().size_full().occlude().flex().items_center().justify_center().bg(Theme::scrim()).child(ui::title_strip().absolute().top_0().left_0()).child(card).into_any_element())
+    }
+}

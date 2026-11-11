@@ -1,0 +1,18 @@
+[package]
+name = "wisp_core"
+version = "0.1.0"
+edition = "2024"
+description = "Wisp Paper's library engine: papers, custom fields, SQLite store, import and export. No GPUI."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+pdf-extract = "0.9"
+
+[lints]
+workspace = true

@@ -1,0 +1,341 @@
+//! Papers, custom field definitions and attachments. Plain data plus the
+//! normalisation every write goes through.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// One paper. `fields` holds the values of the library's custom fields
+/// (自定义词条) by field id; an absent or empty list means "not filled in".
+/// `fulltext` is computed from the attachments: missing, linked or stored.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Paper {
+    pub id: String,
+    pub title: String,
+    pub doi: String,
+    pub pmid: String,
+    /// Names separated by "; ".
+    pub authors: String,
+    pub year: Option<i32>,
+    pub journal: String,
+    /// unknown, preprint, published or unpublished.
+    pub publication_status: String,
+    pub url: String,
+    #[serde(rename = "abstract")]
+    pub abstract_text: String,
+    pub notes: String,
+    pub tags: Vec<String>,
+    /// pending, included, excluded, uncertain or irrelevant.
+    pub screening: String,
+    pub screening_reason: String,
+    /// When the screening decision was made; empty while pending.
+    pub reviewed_at: String,
+    /// unread, skimmed or read.
+    pub reading: String,
+    pub starred: bool,
+    pub source: String,
+    pub fields: BTreeMap<String, Vec<String>>,
+    pub fulltext: String,
+    pub added_at: String,
+    pub updated_at: String,
+}
+
+pub const SCREENINGS: [(&str, &str); 5] = [("pending", "待判断"), ("included", "已纳入"), ("excluded", "相关"), ("uncertain", "证据不足"), ("irrelevant", "不相关")];
+pub const READINGS: [(&str, &str); 3] = [("unread", "未读"), ("skimmed", "已浏览"), ("read", "已精读")];
+pub const FULLTEXTS: [(&str, &str); 3] = [("missing", "无全文"), ("linked", "有链接"), ("stored", "已存 PDF")];
+pub const PUBLICATION_STATUSES: [(&str, &str); 4] = [("unknown", "尚未确认"), ("preprint", "预印本"), ("published", "正式发表"), ("unpublished", "未发表")];
+
+/// The display label of a stored value; the value itself when unknown.
+pub fn label<'a>(table: &'a [(&'a str, &'a str)], value: &'a str) -> &'a str {
+    table.iter().find(|(v, _)| *v == value).map_or(value, |(_, l)| l)
+}
+
+pub fn one_of(table: &[(&str, &str)], value: &str) -> bool {
+    table.iter().any(|(v, _)| *v == value)
+}
+
+/// What kind of values a custom field takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldKind {
+    /// One free line of text.
+    #[default]
+    Text,
+    /// Any number of values, comma separated when typed.
+    Tags,
+    /// One value out of `options`.
+    Select,
+}
+
+impl FieldKind {
+    pub const ALL: [FieldKind; 3] = [FieldKind::Text, FieldKind::Tags, FieldKind::Select];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldKind::Text => "text",
+            FieldKind::Tags => "tags",
+            FieldKind::Select => "select",
+        }
+    }
+
+    pub fn parse(value: &str) -> FieldKind {
+        match value {
+            "tags" => FieldKind::Tags,
+            "select" => FieldKind::Select,
+            _ => FieldKind::Text,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FieldKind::Text => "文本",
+            FieldKind::Tags => "多值",
+            FieldKind::Select => "单选",
+        }
+    }
+}
+
+/// A custom field (自定义词条) of the library: 物种, 研究方法, 课题…
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FieldDef {
+    pub id: String,
+    pub name: String,
+    pub kind: FieldKind,
+    /// Choices of a Select field; suggestions for a Tags field.
+    pub options: Vec<String>,
+    /// Shown as a column of the paper table.
+    pub in_table: bool,
+}
+
+/// A file stored under the library's `papers/` folder.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PaperFile {
+    pub id: String,
+    pub paper_id: String,
+    /// fulltext, supplement or other.
+    pub kind: String,
+    /// The original file name.
+    pub title: String,
+    /// Lowercase extension without the dot.
+    pub format: String,
+    /// Relative to the library folder, `/` separated.
+    pub local_path: String,
+    pub size_bytes: u64,
+    pub added_at: String,
+}
+
+pub fn file_size(bytes: u64) -> String {
+    if bytes < 1024 * 1024 { format!("{} KB", (bytes as f64 / 1024.).round().max(1.) as u64) } else { format!("{:.1} MB", bytes as f64 / 1024. / 1024.) }
+}
+
+// ---- normalisation
+
+/// The bare lowercase DOI, without a link or label around it or the
+/// punctuation a citation leaves behind.
+pub fn normalize_doi(value: &str) -> String {
+    let lower = value.trim().to_lowercase();
+    let mut rest = lower.as_str();
+    let after_scheme = rest.strip_prefix("https://").or_else(|| rest.strip_prefix("http://")).unwrap_or(rest);
+    let after_host = after_scheme.strip_prefix("dx.").or_else(|| after_scheme.strip_prefix("www.")).unwrap_or(after_scheme);
+    if let Some(bare) = after_host.strip_prefix("doi.org/") {
+        rest = bare;
+    } else if let Some(labelled) = rest.strip_prefix("doi") && labelled.starts_with(|c: char| c == ':' || c.is_whitespace()) {
+        rest = labelled[1..].trim_start();
+    }
+    rest.trim().trim_end_matches(['.', ',', ';']).to_string()
+}
+
+/// `10.<4–9 digits>/<anything without spaces>`; an empty DOI is fine.
+pub fn valid_doi(value: &str) -> bool {
+    if value.is_empty() { return true }
+    let Some(rest) = value.strip_prefix("10.") else { return false };
+    let Some((registrant, suffix)) = rest.split_once('/') else { return false };
+    (4..=9).contains(&registrant.len()) && registrant.bytes().all(|b| b.is_ascii_digit()) && !suffix.is_empty() && !suffix.contains(char::is_whitespace)
+}
+
+/// The bare PMID from a label or a PubMed link.
+pub fn normalize_pmid(value: &str) -> String {
+    let lower = value.trim().to_lowercase();
+    let mut rest = lower.as_str();
+    let after_scheme = rest.strip_prefix("https://").or_else(|| rest.strip_prefix("http://")).unwrap_or(rest);
+    let after_www = after_scheme.strip_prefix("www.").unwrap_or(after_scheme);
+    if let Some(bare) = after_www.strip_prefix("pubmed.ncbi.nlm.nih.gov/").or_else(|| after_www.strip_prefix("ncbi.nlm.nih.gov/pubmed/")) {
+        rest = bare;
+    } else if let Some(labelled) = rest.strip_prefix("pmid") && labelled.starts_with(|c: char| c == ':' || c.is_whitespace()) {
+        rest = labelled[1..].trim_start();
+    }
+    rest.trim().trim_end_matches(['/', '.', ',', ';']).to_string()
+}
+
+/// A title reduced to its lowercase letters and digits, so markup,
+/// punctuation and hyphenation cannot hide a duplicate.
+pub fn title_key(title: &str) -> String {
+    strip_markup(title).chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// Text without `<tags>`, with whitespace collapsed.
+pub fn strip_markup(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for c in value.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ");
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Trim every entry, drop blanks and duplicates, keep the order.
+pub fn clean_strings<I: IntoIterator<Item = S>, S: AsRef<str>>(values: I) -> Vec<String> {
+    let mut clean: Vec<String> = vec![];
+    for value in values {
+        let value = value.as_ref().trim();
+        if !value.is_empty() && !clean.iter().any(|kept| kept == value) {
+            clean.push(value.to_string());
+        }
+    }
+    clean
+}
+
+/// Split what a person typed into a list: commas, semicolons (either width) and newlines separate.
+pub fn split_list(value: &str) -> Vec<String> {
+    clean_strings(value.split([',', '，', ';', '；', '\n']))
+}
+
+pub fn clean_authors(value: &str) -> String {
+    clean_strings(value.split([';', '；'])).join("; ")
+}
+
+/// Unique enough ids without a random number crate: time plus a hashed counter.
+pub fn new_id(prefix: &str) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    format!("{prefix}-{}-{:08x}", crate::time::now_millis(), hasher.finish() as u32)
+}
+
+impl Paper {
+    /// Bring every field into its stored shape and fill the defaults.
+    pub fn normalize(&mut self) {
+        self.id = self.id.trim().to_string();
+        self.title = strip_markup(&self.title);
+        self.doi = normalize_doi(&self.doi);
+        self.pmid = normalize_pmid(&self.pmid);
+        self.authors = clean_authors(&self.authors);
+        self.journal = self.journal.trim().to_string();
+        self.url = self.url.trim().to_string();
+        self.abstract_text = self.abstract_text.trim().to_string();
+        self.tags = clean_strings(&self.tags);
+        self.screening_reason = self.screening_reason.trim().to_string();
+        self.source = self.source.trim().to_string();
+        for values in self.fields.values_mut() {
+            *values = clean_strings(values.iter());
+        }
+        self.fields.retain(|_, values| !values.is_empty());
+        if self.screening.is_empty() { self.screening = "pending".into() }
+        if self.reading.is_empty() { self.reading = "unread".into() }
+        if self.publication_status.is_empty() { self.publication_status = "unknown".into() }
+        if self.source.is_empty() { self.source = "手动添加".into() }
+        if self.fulltext.is_empty() { self.fulltext = "missing".into() }
+        let now = crate::time::now_iso();
+        if self.added_at.is_empty() { self.added_at = now.clone() }
+        self.updated_at = now;
+    }
+
+    /// What is wrong with this paper, in words a person can act on.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.title.is_empty() { return Err("请填写文献题目。".into()) }
+        if !valid_doi(&self.doi) { return Err(format!("DOI 格式不正确：{}", self.doi)) }
+        if !self.pmid.is_empty() && !self.pmid.bytes().all(|b| b.is_ascii_digit()) { return Err(format!("PMID 应为数字：{}", self.pmid)) }
+        if let Some(year) = self.year && !(1800..=2200).contains(&year) { return Err("年份应在 1800–2200 之间，或留空。".into()) }
+        if !one_of(&SCREENINGS, &self.screening) { return Err(format!("不支持的收录状态：{}", self.screening)) }
+        if !one_of(&READINGS, &self.reading) { return Err(format!("不支持的阅读状态：{}", self.reading)) }
+        if !one_of(&PUBLICATION_STATUSES, &self.publication_status) { return Err(format!("不支持的发表状态：{}", self.publication_status)) }
+        Ok(())
+    }
+
+    /// Record a screening decision; pending means nobody has decided.
+    pub fn decide(&mut self, status: &str, reason: &str) {
+        self.screening = status.to_string();
+        self.screening_reason = reason.trim().to_string();
+        self.reviewed_at = if status == "pending" { String::new() } else { crate::time::now_iso() };
+    }
+
+    /// Where the paper lives on the web: its own URL, else the DOI or PubMed page.
+    pub fn link(&self) -> String {
+        if self.url.starts_with("http://") || self.url.starts_with("https://") {
+            self.url.clone()
+        } else if !self.doi.is_empty() {
+            format!("https://doi.org/{}", self.doi)
+        } else if !self.pmid.is_empty() {
+            format!("https://pubmed.ncbi.nlm.nih.gov/{}/", self.pmid)
+        } else {
+            String::new()
+        }
+    }
+
+    /// "Zhang et al." style short author line.
+    pub fn short_authors(&self) -> String {
+        let names: Vec<&str> = self.authors.split(';').map(str::trim).filter(|n| !n.is_empty()).collect();
+        match names.len() {
+            0 => String::new(),
+            1 | 2 => names.join("; "),
+            _ => format!("{} 等", names[0]),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doi_forms() {
+        for raw in ["10.1038/S41586-020-2649-2", "https://doi.org/10.1038/s41586-020-2649-2", "http://dx.doi.org/10.1038/s41586-020-2649-2.", "doi: 10.1038/s41586-020-2649-2;", "DOI:10.1038/s41586-020-2649-2"] {
+            assert_eq!(normalize_doi(raw), "10.1038/s41586-020-2649-2", "{raw}");
+        }
+        assert!(valid_doi("10.1038/s41586-020-2649-2"));
+        assert!(valid_doi(""));
+        assert!(!valid_doi("10.1/x"));
+        assert!(!valid_doi("11.1038/x"));
+        assert!(!valid_doi("10.1038/a b"));
+    }
+
+    #[test]
+    fn pmid_forms() {
+        assert_eq!(normalize_pmid("PMID: 32939066"), "32939066");
+        assert_eq!(normalize_pmid("https://pubmed.ncbi.nlm.nih.gov/32939066/"), "32939066");
+    }
+
+    #[test]
+    fn title_keys_ignore_markup() {
+        assert_eq!(title_key("Single-cell <i>RNA</i> atlas."), title_key("single cell rna atlas"));
+    }
+
+    #[test]
+    fn normalize_fills_defaults() {
+        let mut p = Paper { title: "  A <b>title</b> ".into(), authors: "A B ;C D;; ".into(), tags: vec!["x".into(), " x ".into(), "".into()], ..Default::default() };
+        p.normalize();
+        assert_eq!(p.title, "A title");
+        assert_eq!(p.authors, "A B; C D");
+        assert_eq!(p.tags, vec!["x"]);
+        assert_eq!((p.screening.as_str(), p.reading.as_str(), p.fulltext.as_str()), ("pending", "unread", "missing"));
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn ids_differ() {
+        assert_ne!(new_id("P"), new_id("P"));
+    }
+}
