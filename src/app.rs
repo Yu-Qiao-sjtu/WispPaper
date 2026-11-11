@@ -29,6 +29,8 @@ pub enum Page {
     /// 文献库提问: questions over the current list.
     Ask,
     Trash,
+    /// The guide of a new library: where to start, and searches composed with the assistant.
+    Guide,
     /// 检索与导入: saved searches for the literature databases and what they brought in.
     Sources,
 }
@@ -150,6 +152,14 @@ pub enum Cmd {
     AskUndoImport(String),
     UndoImport(String),
     PickSource(String),
+    // The guide
+    /// Show the guide; true starts at the choice a new library gets.
+    OpenGuide(bool),
+    GuideSearch,
+    GuideToggleSource(String),
+    GuideGenerate,
+    GuideToggleIdea(usize),
+    GuideImport,
     // Dialogs
     CloseModal,
     SubmitModal,
@@ -175,6 +185,36 @@ pub struct Toast {
     pub message: SharedString,
     pub error: bool,
     pub at: Instant,
+}
+
+/// A search the assistant proposed in the guide, with what a trial run of it found.
+pub struct GuideIdea {
+    pub idea: ai::QueryIdea,
+    /// Whether the person wants it saved and run.
+    pub chosen: bool,
+    pub trial: Option<Result<Value, String>>,
+}
+
+/// The guide page of a library: a choice of where to start, then searches
+/// composed from a topic for the person to judge.
+pub struct Guide {
+    /// Still at the first choice (a new library), not yet composing searches.
+    pub choosing: bool,
+    pub keywords: Entity<TextInput>,
+    /// The databases to compose searches for.
+    pub kinds: Vec<String>,
+    pub busy: bool,
+    pub error: String,
+    pub ideas: Vec<GuideIdea>,
+    /// Bumped with every generation, so answers to an earlier one are dropped.
+    round: u64,
+}
+
+impl Guide {
+    fn new(topic: &str, cx: &mut App) -> Guide {
+        let keywords = cx.new(|cx| TextInput::new("研究主题或关键词，中文英文都可以。例如：植物根尖 单细胞转录组 干细胞微环境", cx).multiline(2).with_text(topic));
+        Guide { choosing: false, keywords, kinds: vec!["pubmed".into()], busy: false, error: String::new(), ideas: vec![], round: 0 }
+    }
 }
 
 /// The steps one question may take. Each is a request to the model; all but
@@ -264,6 +304,7 @@ pub struct Library {
     pub detail_scroll: ScrollHandle,
     /// Files whose text is being extracted.
     pub extracting: HashSet<String>,
+    pub guide: Guide,
     pub searches: Vec<SavedSearch>,
     /// The latest import batches, newest first.
     pub batches: Vec<ImportBatch>,
@@ -823,6 +864,53 @@ impl Workspace {
                 if let Some(Modal::Search { kind, .. }) = self.modal.as_mut() { *kind = value }
             }
 
+            Cmd::OpenGuide(choosing) => {
+                if let Some(lib) = self.lib.as_mut() {
+                    lib.page = Page::Guide;
+                    lib.guide.choosing = choosing;
+                    if !choosing { lib.guide.keywords.read(cx).focus(window) }
+                }
+            }
+            Cmd::GuideSearch => {
+                if let Some(lib) = self.lib.as_mut() {
+                    lib.guide.choosing = false;
+                    lib.guide.keywords.read(cx).focus(window);
+                }
+            }
+            Cmd::GuideToggleSource(kind) => {
+                if let Some(lib) = self.lib.as_mut() {
+                    let kinds = &mut lib.guide.kinds;
+                    // At least one database stays chosen.
+                    if let Some(at) = kinds.iter().position(|k| *k == kind) { if kinds.len() > 1 { kinds.remove(at); } } else { kinds.push(kind) }
+                }
+            }
+            Cmd::GuideGenerate => self.guide_generate(cx),
+            Cmd::GuideToggleIdea(index) => {
+                if let Some(idea) = self.lib.as_mut().and_then(|l| l.guide.ideas.get_mut(index)) { idea.chosen = !idea.chosen }
+            }
+            Cmd::GuideImport => {
+                let Some(lib) = self.lib.as_mut() else { return };
+                let mut saved = vec![];
+                let mut failure = None;
+                for entry in lib.guide.ideas.iter().filter(|entry| entry.chosen) {
+                    // Named after what the search aims at, as far as a name may go.
+                    let mut search = SavedSearch { kind: entry.idea.source.clone(), name: entry.idea.why.chars().take(40).collect(), query: entry.idea.query.clone(), max_results: wisp_core::sources::MAX_RESULTS, enabled: true, ..Default::default() };
+                    match lib.store.save_search(&mut search) {
+                        Ok(()) => saved.push(search.id),
+                        Err(err) => failure = Some(format!("{err:#}")),
+                    }
+                }
+                if saved.is_empty() && failure.is_none() { return }
+                // What was saved is on the searches page from here on.
+                lib.guide.ideas.retain(|entry| !entry.chosen);
+                lib.page = Page::Sources;
+                self.change(cx, |_| Ok(()));
+                if let Some(err) = failure { self.fail(err, cx) }
+                for id in saved {
+                    self.run(Cmd::RunSearch(id), window, cx);
+                }
+            }
+
             Cmd::CloseModal => {
                 self.modal = None;
                 self.modal_subscriptions.clear();
@@ -926,6 +1014,7 @@ impl Workspace {
                 if *event == InputEvent::Submit { this.ask(paper, cx) }
             }));
         }
+        let guide = Guide::new(&info.topic, cx);
         let mut lib = Library {
             info,
             store,
@@ -947,6 +1036,7 @@ impl Workspace {
             table_scroll: UniformListScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
             extracting: HashSet::new(),
+            guide,
             searches: vec![],
             batches: vec![],
             trial: None,
@@ -1514,6 +1604,56 @@ impl Workspace {
         self.modal = Some(Modal::Search { editing, kind: search.kind, name, query, max });
     }
 
+    /// Ask the model for searches on the guide's topic, then try each one so
+    /// the person can judge them by what they find.
+    fn guide_generate(&mut self, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_or_default();
+        let Some(lib) = self.lib.as_mut() else { return };
+        if lib.guide.busy { return }
+        let keywords = lib.guide.keywords.read(cx).text().trim().to_string();
+        lib.guide.error.clear();
+        if keywords.is_empty() && lib.info.topic.trim().is_empty() {
+            lib.guide.error = "先写下研究主题或几个关键词。".into();
+            return cx.notify();
+        }
+        let (system, prompt) = ai::query_prompt(&lib.info.name, &lib.info.topic, &keywords, &lib.guide.kinds);
+        let request = match ai::plain_request(&profile, &system, &prompt) {
+            Ok(request) => request,
+            Err(err) => {
+                lib.guide.error = err;
+                return cx.notify();
+            }
+        };
+        lib.guide.busy = true;
+        lib.guide.round += 1;
+        let (round, library, protocol) = (lib.guide.round, lib.info.id.clone(), profile.protocol);
+        cx.notify();
+        let work = cx.background_executor().spawn(async move { wisp_net::complete(request, protocol).and_then(|reply| ai::parse_queries(&reply)) });
+        cx.spawn(async move |this, cx| {
+            let ideas = work.await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library && l.guide.round == round) else { return };
+                lib.guide.busy = false;
+                match ideas {
+                    Err(err) => lib.guide.error = err,
+                    Ok(ideas) => {
+                        lib.guide.ideas = ideas.into_iter().map(|idea| GuideIdea { idea, chosen: false, trial: None }).collect();
+                        let trials: Vec<(usize, Value)> = lib.guide.ideas.iter().enumerate().map(|(i, entry)| (i, serde_json::json!({"source": entry.idea.source, "query": entry.idea.query, "limit": 8}))).collect();
+                        for (index, args) in trials {
+                            this.library_tool("search_online", args, cx, move |this, result, _| {
+                                // Only for the ideas this trial was started for.
+                                if let Some(lib) = this.lib.as_mut().filter(|l| l.guide.round == round) && let Some(entry) = lib.guide.ideas.get_mut(index) { entry.trial = Some(result) }
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Run a library tool off the main thread, on a connection of its own
     /// and with the network, and hand the result back if the same library
     /// is still open.
@@ -1549,8 +1689,9 @@ impl Workspace {
             }
             Modal::Library { editing, name, topic, color } => {
                 let (name, topic, color) = (text(name, cx), text(topic, cx), color.clone());
+                let mut created = None;
                 let result = match editing.clone() {
-                    None => libraries::create(&self.root, &name, &topic, &color).map(|_| ()),
+                    None => libraries::create(&self.root, &name, &topic, &color).map(|info| created = Some(info.id)),
                     Some(id) => {
                         let Some(mut info) = self.libraries.iter().find(|l| l.id == id).cloned() else { return };
                         (info.name, info.topic, info.color) = (name, topic, color);
@@ -1570,6 +1711,11 @@ impl Workspace {
                     Ok(()) => {
                         self.libraries = libraries::list(&self.root);
                         self.run(Cmd::CloseModal, window, cx);
+                        // A new library opens on its guide: where to start filling it.
+                        if let Some(id) = created {
+                            self.run(Cmd::OpenLibrary(id), window, cx);
+                            self.run(Cmd::OpenGuide(true), window, cx);
+                        }
                     }
                     Err(err) => self.modal_error = format!("{err:#}"),
                 }
@@ -1693,6 +1839,11 @@ impl Workspace {
                 "select" => self.lib.as_ref().and_then(|l| l.shown.get(arg.parse::<usize>().unwrap_or(0)).map(|&i| Cmd::Select(l.papers[i].id.clone()))),
                 "tab" => Some(Cmd::SetTab(match arg { "pdf" => Tab::Pdf, "ask" => Tab::Ask, _ => Tab::Info })),
                 "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, "sources" => Page::Sources, _ => Page::Papers })),
+                // `guide:new` is what a new library shows; `guide:search` goes straight to composing, `guide:go` also generates.
+                "guide" => {
+                    self.run(Cmd::OpenGuide(arg == "new"), window, cx);
+                    (arg == "go").then_some(Cmd::GuideGenerate)
+                }
                 // `try:0` runs the first saved search as a trial.
                 "try" => self.lib.as_ref().and_then(|l| l.searches.get(arg.parse::<usize>().unwrap_or(0)).map(|s| Cmd::TrySearch(s.id.clone()))),
                 "wide" => Some(Cmd::ToggleWide),

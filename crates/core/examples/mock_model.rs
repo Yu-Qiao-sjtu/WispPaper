@@ -5,7 +5,8 @@
 //!
 //! Point a profile at it (协议 Anthropic, 地址 http://127.0.0.1:8787, any
 //! key and model). It speaks the Claude Messages streaming format and always
-//! plays the same two steps: asked a question, it calls `list_papers` and
+//! plays the same parts. Asked for search queries by the guide (a request
+//! without tools), it proposes two for PubMed. In a chat, asked a question, it calls `list_papers` and
 //! `library_status`; given their results, it answers and cites the first
 //! paper the search returned.
 
@@ -30,6 +31,11 @@ fn body(stream: &mut TcpStream) -> String {
     }
 }
 
+/// A text as a JSON string.
+fn quoted(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn event(value: &str) -> String {
     format!("data: {value}\n\n")
 }
@@ -50,7 +56,13 @@ fn main() {
         // The last message decides the step: tool results get the answer, a question gets the calls.
         let answered = request.rfind("\"tool_result\"").is_some_and(|at| request.rfind("\"role\":\"user\"").is_some_and(|user| user < at));
         let mut events = String::new();
-        if answered {
+        if !request.contains("\"tools\"") {
+            // A request without tools is the guide asking for search queries: two for PubMed, as JSON in the text.
+            let reply = r#"[{"source": "pubmed", "query": "(\"single cell\"[Title/Abstract] OR \"single-cell\"[Title/Abstract]) AND root[Title/Abstract] AND Arabidopsis[Title/Abstract]", "why": "宽：单细胞加根加拟南芥，可能带进只是顺带提到根的文章"}, {"source": "pubmed", "query": "\"single cell\"[Title] AND root[Title] AND (atlas OR \"stem cell niche\")", "why": "聚焦：题目里同时有单细胞和根，并限定图谱或干细胞微环境"}]"#;
+            events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
+            events.push_str(&event(&format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{}}}}}"#, quoted(reply))));
+            events.push_str(&event(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#));
+        } else if answered {
             let label = first_label(&request);
             events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
             for piece in ["（假模型）我查了文献库的概况和匹配的文献。", &format!("最相关的一篇是 [{label}]。"), "这段话只用来演示工具调用的显示和引用的跳转。"] {

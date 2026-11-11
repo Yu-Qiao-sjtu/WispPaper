@@ -9,6 +9,7 @@ mod assets;
 mod chat;
 mod detail;
 mod dialogs;
+mod guide;
 mod home;
 mod input;
 mod library;

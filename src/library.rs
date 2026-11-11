@@ -39,7 +39,7 @@ impl Workspace {
     /// The detail panel's width for this window.
     pub fn detail_width(&self, window: &Window) -> f32 {
         let Some(lib) = &self.lib else { return 0. };
-        if lib.selected.is_none() || matches!(lib.page, Page::Trash | Page::Sources) { return 0. }
+        if lib.selected.is_none() || matches!(lib.page, Page::Trash | Page::Sources | Page::Guide) { return 0. }
         let viewport = f32::from(window.viewport_size().width);
         if lib.wide { (viewport * 0.62).max(DETAIL_W).min(viewport - SIDEBAR_W - 80.) } else { DETAIL_W.min(viewport - SIDEBAR_W - 80.).max(280.) }
     }
@@ -53,6 +53,7 @@ impl Workspace {
             Page::Ask => self.render_chat(false, window, cx),
             Page::Trash => self.render_trash(cx),
             Page::Sources => self.render_searches(cx),
+            Page::Guide => self.render_guide(window, cx),
         };
         div()
             .flex()
@@ -149,7 +150,7 @@ impl Workspace {
             )
             .child(ui::primary_button("add-paper", "添加文献").w_full().on_click(self.on_menu(MenuKind::Add, cx)))
             .child(div().flex().flex_col().gap(px(1.)).children(view_rows))
-            .child(div().flex().flex_col().gap(px(1.)).child(nav("page-ask", "sparkle", "向文献库提问", None, lib.page == Page::Ask, Cmd::SetPage(Page::Ask), self, cx)).child(nav("page-sources", "search", "检索与导入", (!lib.searches.is_empty()).then_some(lib.searches.len()), lib.page == Page::Sources, Cmd::SetPage(Page::Sources), self, cx)))
+            .child(div().flex().flex_col().gap(px(1.)).child(nav("page-ask", "sparkle", "向文献库提问", None, lib.page == Page::Ask, Cmd::SetPage(Page::Ask), self, cx)).child(nav("page-sources", "search", "检索与导入", (!lib.searches.is_empty()).then_some(lib.searches.len()), matches!(lib.page, Page::Sources | Page::Guide), Cmd::SetPage(Page::Sources), self, cx)))
             .child(
                 div()
                     .flex()
