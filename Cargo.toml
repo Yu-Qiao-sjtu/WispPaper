@@ -46,3 +46,7 @@ opt-level = 2
 
 [build-dependencies]
 winresource = "0.1"
+
+# Release packages: without the debug symbols nobody downloading them needs.
+[profile.release]
+strip = true
