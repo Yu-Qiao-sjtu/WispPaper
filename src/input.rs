@@ -149,6 +149,17 @@ impl TextInput {
         window.focus(&self.focus);
     }
 
+    /// Where the caret stands, in bytes from the start of the text.
+    pub fn caret(&self) -> usize {
+        self.cursor()
+    }
+
+    /// Put text in at the caret, over what is selected, as if it were typed.
+    pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        let range = self.marked.take().unwrap_or(self.sel.clone());
+        self.replace(range, text, cx);
+    }
+
     fn cursor(&self) -> usize {
         if self.reversed { self.sel.start } else { self.sel.end }
     }

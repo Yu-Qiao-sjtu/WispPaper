@@ -7441,6 +7441,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs 7.0.0",
+ "hayro-interpret",
  "pdf-extract",
  "rusqlite",
  "serde",

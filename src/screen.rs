@@ -27,7 +27,7 @@ fn reading_sheet(running: bool) -> Div {
 }
 
 /// How far a run is, as a bar that fills up to each new answer instead of jumping there.
-fn progress_bar(done: usize, total: usize) -> Div {
+pub(crate) fn progress_bar(done: usize, total: usize) -> Div {
     let at = |n: usize| if total == 0 { 0. } else { (n as f32 / total as f32).min(1.) };
     let (from, to) = (at(done.saturating_sub(1)), at(done));
     let fill = div().h_full().rounded_full().bg(Theme::accent());

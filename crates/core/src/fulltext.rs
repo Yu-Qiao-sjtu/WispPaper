@@ -15,9 +15,21 @@ pub fn file_pages(path: &Path) -> Result<Vec<String>, String> {
         "txt" | "md" | "markdown" => vec![std::fs::read_to_string(path).map_err(|e| format!("无法读取文件：{e}"))?],
         "pdf" => {
             let bytes = std::fs::read(path).map_err(|e| format!("无法读取文件：{e}"))?;
-            // pdf-extract panics on some malformed files.
-            let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes)).map_err(|_| "PDF 结构异常，无法提取文字。".to_string())?.map_err(|e| format!("无法提取 PDF 文字：{e}"))?;
-            pages.into_iter().map(|p| tidy(&p)).collect()
+            // Read off the glyphs first: that keeps the breaks the page shows. pdf-extract
+            // is the second try; it panics on some files hayro reads, and reads some it does not.
+            let laid_out = std::panic::catch_unwind(|| crate::pdftext::pages(bytes.clone())).unwrap_or_else(|_| Err("PDF 结构异常，无法提取文字。".into()));
+            match laid_out {
+                Ok(pages) if pages.iter().any(|p| !p.trim().is_empty()) => pages.into_iter().map(|p| tidy(&p)).collect(),
+                first => {
+                    let plain = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes)).map_err(|_| "PDF 结构异常，无法提取文字。".to_string()).and_then(|pages| pages.map_err(|e| format!("无法提取 PDF 文字：{e}")));
+                    match (plain, first) {
+                        (Ok(pages), _) => pages.into_iter().map(|p| tidy(&p)).collect(),
+                        // Both read it and found no text: said below.
+                        (Err(_), Ok(pages)) => pages,
+                        (Err(error), Err(_)) => return Err(error),
+                    }
+                }
+            }
         }
         other => return Err(format!("不支持提取 .{other} 文件的文字。")),
     };
@@ -35,6 +47,15 @@ pub fn file_pages(path: &Path) -> Result<Vec<String>, String> {
         kept.push(page);
     }
     Ok(kept)
+}
+
+/// The text of a file read again, for a file whose text an earlier build
+/// kept: when it cannot be read now (the file is gone), what was kept stays.
+pub fn reread(path: &Path, known: Option<Result<Vec<String>, String>>) -> Result<Vec<String>, String> {
+    match (file_pages(path), known) {
+        (Err(_), Some(Ok(kept))) => Ok(kept),
+        (pages, _) => pages,
+    }
 }
 
 /// Collapse the spacing PDF extraction leaves behind; keep paragraph breaks.

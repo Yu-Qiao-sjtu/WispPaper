@@ -1,8 +1,10 @@
 //! Fill a data folder with two sample libraries, for trying the app out:
 //!
-//!     cargo run -p wisp_core --example seed -- <data folder> [a.pdf]
+//!     cargo run -p wisp_core --example seed -- <data folder> [a.pdf] [more.pdf …]
 //!
-//! The optional PDF is attached to the first paper of the first library.
+//! The first PDF is attached to the first paper of the first library; any
+//! further ones become papers of the second library, each with its PDF as
+//! full text, so 写作 has sentences to show.
 
 use wisp_core::libraries;
 use wisp_core::model::{FieldDef, FieldKind, Paper};
@@ -12,6 +14,7 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let root = std::path::PathBuf::from(args.next().expect("usage: seed <data folder> [a.pdf]"));
     let pdf = args.next().map(std::path::PathBuf::from);
+    let more: Vec<std::path::PathBuf> = args.map(std::path::PathBuf::from).collect();
     std::fs::create_dir_all(&root)?;
 
     let llm = libraries::create(&root, "大语言模型", "Transformer 架构、预训练语言模型及其评测方法；关注注意力机制的改进与长上下文建模。", "violet")?;
@@ -47,7 +50,20 @@ fn main() -> anyhow::Result<()> {
     }
 
     let roots = libraries::create(&root, "植物根尖单细胞", "根尖分生组织的单细胞转录组研究：细胞类型图谱、发育轨迹和干细胞微环境。", "green")?;
-    Store::open(&roots.dir)?.add_paper(Paper { title: "A single-cell RNA sequencing profiles the developmental landscape of Arabidopsis root".into(), authors: "Zhang, Tian-Qi; Xu, Zhou-Geng; Shang, Guan-Dong; Wang, Jia-Wei".into(), year: Some(2019), journal: "Molecular Plant".into(), doi: "10.1016/j.molp.2019.04.004".into(), ..Default::default() })?;
+    let mut store = Store::open(&roots.dir)?;
+    for (index, path) in more.iter().enumerate() {
+        let pages = wisp_core::fulltext::file_pages(path);
+        // The title is the first heading of some length; a file that gives no text keeps its name.
+        let stem = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let title = pages.as_ref().ok().and_then(|pages| wisp_core::structure::blocks(pages).into_iter().find(|b| b.heading && b.text.split_whitespace().count() >= 6 && !b.text.to_lowercase().contains("open access"))).map_or(stem.clone(), |b| b.text);
+        let record = |title: String| Paper { title, year: Some(2020 + (index % 6) as i32), source: "示例数据".into(), ..Default::default() };
+        // Two files with the same first heading are still two papers.
+        let paper = store.add_paper(record(title)).or_else(|_| store.add_paper(record(stem)))?;
+        let file = store.import_file(&paper.id, path, "fulltext")?;
+        store.save_fulltext_pages(&file.id, &pages)?;
+    }
+    // With PDFs of its own the library needs no sample record (one of them may be this very paper).
+    if more.is_empty() { store.add_paper(Paper { title: "A single-cell RNA sequencing profiles the developmental landscape of Arabidopsis root".into(), authors: "Zhang, Tian-Qi; Xu, Zhou-Geng; Shang, Guan-Dong; Wang, Jia-Wei".into(), year: Some(2019), journal: "Molecular Plant".into(), doi: "10.1016/j.molp.2019.04.004".into(), ..Default::default() })?; }
     println!("seeded {}", root.display());
     Ok(())
 }

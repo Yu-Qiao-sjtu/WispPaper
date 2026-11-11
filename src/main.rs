@@ -22,6 +22,7 @@ mod settings;
 mod shortcuts;
 mod theme;
 mod ui;
+mod write;
 
 use gpui::*;
 
