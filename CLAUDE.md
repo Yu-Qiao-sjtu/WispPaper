@@ -8,7 +8,8 @@ Wisp Paper is a local-first literature library desktop app (collect papers, orga
 
 ```sh
 cargo run --release                     # run the app
-cargo test                              # both crates (workspace default-members)
+cargo test                              # all three crates (workspace default-members)
+cargo run -p wisp_cli -- help           # the `wisp` command line; `-- mcp` is the MCP server
 cargo test -p wisp_core                 # engine only; no GPUI build, much faster
 cargo test -p wisp_core store::         # one module's tests
 cargo test -p wisp_core <test_name>     # one test
@@ -26,7 +27,7 @@ cargo clippy --all-targets              # expected to be warning-free
 
 ## Architecture
 
-A Cargo workspace of two crates. Dependencies point one way only: the app depends on core.
+A Cargo workspace of three crates. Dependencies point one way only: the app and the command line depend on core.
 
 ### `crates/core` (`wisp_core`): the engine, no GPUI
 
@@ -39,6 +40,15 @@ On-disk layout: the data root holds one folder per library, each with `library.j
 - Deduplication is by DOI, PMID (`paper_identifiers`), then `title_key`. Trashed papers stay in `papers` (marked by a `trashed_papers` row) so they keep blocking re-import.
 - `Store::in_memory` is what tests use.
 - Status values are stored as English keys and shown through the label tables in `model.rs` (`SCREENINGS`, `READINGS`, …). The labels are not translations: the stored key `excluded` is displayed as 「相关」.
+
+`tools.rs` is the one table of what an agent can do with a library; the command line, MCP and (next) the in-app assistant all end in `tools::call`, so a rule belongs there and not in a front end.
+- A new tool is an entry in `catalog()` (name, Chinese description, JSON Schema) and an arm in `call_in`. Nothing else: `wisp <tool>` reads its flags off the schema (`cli_args`), and `mcp::handle` lists and calls whatever the catalog holds. The test `every_tool_is_callable` fails when an entry has no arm.
+- Tools take `library` (id or name, optional when there is one library) and return JSON; an error is a Chinese sentence for the caller, person or model.
+- All tools so far only read. When write tools arrive, the screening decision stays the person's: an agent may propose, never set `screening`.
+
+### `crates/cli` (`wisp_cli`): the `wisp` binary
+
+A thin shell over `tools` and `mcp`: argument words in, JSON out; `wisp mcp` is newline-delimited JSON-RPC on stdin/stdout. It is a separate binary because the app is a Windows GUI-subsystem program with no console. It opens the same data folder as the app (`settings::default_root` / `settings_file`), possibly while the app is running.
 
 ### Root crate (`wisp_paper`): the GPUI app
 
@@ -60,4 +70,4 @@ On-disk layout: the data root holds one folder per library, each with `library.j
 
 ## Scope
 
-Ported from BiblioCell, deliberately without its datasets, scheduled source tracking, MCP server, CLI and web version. API keys are stored in plain text in `settings.json`; when empty, `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are read from the environment.
+Ported from BiblioCell, without its datasets and web version. Being added step by step: the tool layer with CLI and MCP (done, read-only tools), search sources with trial queries and batch import, a guide page for a new library that starts from a search, AI screening suggestions that the person confirms (鲸吞法: import broadly by query, let the agent judge, the person decides), scheduled source sync, the chat as an agent loop over the tools, and jumping to the quoted sentence in the PDF. API keys are stored in plain text in `settings.json`; when empty, `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are read from the environment.

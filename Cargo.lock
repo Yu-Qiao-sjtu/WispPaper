@@ -7426,11 +7426,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp_cli"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wisp_core",
+]
+
+[[package]]
 name = "wisp_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dirs 7.0.0",
  "pdf-extract",
  "rusqlite",
  "serde",

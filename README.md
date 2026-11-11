@@ -43,13 +43,54 @@
 
 **会离开本机的数据**：DOI / PMID 查询会把编号发给 Crossref 和 Europe PMC；检查更新会向 GitHub 请求本项目的 `releases/latest`，只读取它跳转到的版本号，不下载、不上传任何内容（可在「设置 › 通用」关闭，新版本需要自己到发布页下载安装）；提问会把问题和相关文献的记录、笔记、全文页面发给你配置的模型服务。API Key 以明文保存在 `settings.json`，留空则读取环境变量 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`。
 
+## 命令行与 MCP
+
+`wisp` 是不开窗口的入口，读写和应用同一个数据目录，应用开着时也能用。它提供的每个工具既是一个子命令，也是一个 MCP 工具，应用内的助手用的也是同一张工具表。
+
+```sh
+cargo build --release -p wisp_cli       # 生成 target/release/wisp
+
+wisp help                               # 命令一览
+wisp list_libraries
+wisp list_papers -l 大语言模型 --query attention --limit 10
+wisp get_paper <文献 ID>
+wisp search_fulltext "10x Genomics Chromium"
+wisp read_fulltext <文献 ID> --page 3
+wisp search_fulltext --help             # 一个工具的参数
+```
+
+输出是 JSON；出错时信息写到 stderr，退出码为 1。只有一个文献库时可以省略 `-l`；`--data-dir 文件夹` 指定另一个数据目录。
+
+目前的工具都是只读的：
+
+| 工具 | 用途 |
+|---|---|
+| `list_libraries` | 所有文献库的 ID、名称、主题和文献数量 |
+| `library_status` | 一个库的概况：各状态的数量、自定义词条、状态值的显示名称 |
+| `list_papers` | 搜索、筛选、翻页；规则与界面上的列表相同 |
+| `get_paper` | 一篇文献的完整记录、词条和附件 |
+| `search_fulltext` | 在已保存的全文里找短语或关键词，返回页码和逐字片段 |
+| `read_fulltext` | 按页读取全文，一次最多 8 页 |
+
+全文检索第一次用到某个 PDF 时会提取它的文字并缓存到库里，之后即时返回。
+
+把 `wisp mcp` 配置给 AI 客户端，它就能通过 MCP（标准输入输出）使用同一组工具：
+
+```json
+{
+  "mcpServers": {
+    "wisp-paper": { "command": "/path/to/wisp", "args": ["mcp"] }
+  }
+}
+```
+
 ## 构建
 
 需要 Rust（版本见 `rust-toolchain.toml`，rustup 会自动安装）。Windows 上需要 MSVC 构建工具。
 
 ```sh
 cargo run --release                 # 运行
-cargo test                          # 核心引擎和网络层的测试
+cargo test                          # 核心引擎、命令行和网络层的测试
 cargo test -- --ignored lookup      # 访问 Crossref / Europe PMC 的真实查询测试
 cargo clippy --all-targets          # 应当没有警告
 ```
@@ -63,7 +104,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 
 ## 代码结构
 
-仓库是一个 Cargo workspace，分两个 crate，依赖只能从应用指向 core：
+仓库是一个 Cargo workspace，分三个 crate，应用和命令行都只依赖 core：
 
 - **`crates/core`（`wisp_core`）**：文献库引擎，不依赖 GPUI，可以单独编译和测试。
 
@@ -77,8 +118,12 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
   | `lookup` | Crossref / Europe PMC 返回值 → 文献 |
   | `fulltext` | PDF 逐页文字提取 |
   | `ai` | 提问的上下文组装、两种协议的请求体、流式返回的解析 |
-  | `settings` | settings.json |
+  | `settings` | settings.json，以及它和数据目录的位置 |
+  | `tools` | agent 能对文献库做的事：命令行、MCP 和应用内助手共用的一张工具表 |
+  | `mcp` | 这些工具的 MCP（JSON-RPC）应答 |
   | `update` | 最新发布的版本号，是否比当前版本新 |
+
+- **`crates/cli`（`wisp_cli`）**：可执行文件 `wisp`。把命令行参数按工具的 schema 转成调用，`wisp mcp` 在标准输入输出上收发 MCP 消息。
 
 - **根 crate（`wisp_paper`）**：GPUI 应用。
 
@@ -97,7 +142,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 
 ## 第一版的范围
 
-BiblioCell 的数据集、来源定时跟踪、MCP 服务、命令行和网页版没有移植。提问的对话不保存，关闭文献库即清空。界面目前只有中文。
+BiblioCell 的数据集和网页版没有移植。命令行和 MCP 目前只有读取工具；检索来源、定时跟踪和 AI 辅助筛选正在逐步加入。提问的对话不保存，关闭文献库即清空。界面目前只有中文。
 
 ## 许可
 

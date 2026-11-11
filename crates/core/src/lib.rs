@@ -10,7 +10,9 @@
 //! - `lookup`   Crossref / Europe PMC records → `Paper`
 //! - `fulltext` page text of a stored PDF
 //! - `ai`       context building, request bodies and stream parsing for 文献库提问
-//! - `settings` settings.json
+//! - `settings` settings.json, and where it and the libraries live
+//! - `tools`    what an agent can do with a library: the one table behind the command line, MCP and the assistant
+//! - `mcp`      the Model Context Protocol replies for those tools
 //! - `update`   which release is the newest, and whether it is newer than this build
 
 pub mod ai;
@@ -20,8 +22,10 @@ pub mod fulltext;
 pub mod import;
 pub mod libraries;
 pub mod lookup;
+pub mod mcp;
 pub mod model;
 pub mod settings;
 pub mod store;
 pub mod time;
+pub mod tools;
 pub mod update;

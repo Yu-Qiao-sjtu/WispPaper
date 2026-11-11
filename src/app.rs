@@ -16,7 +16,8 @@ use wisp_core::filter::{self, Filters, View};
 use wisp_core::libraries::{self, LibraryInfo};
 use wisp_core::lookup::{self, Identifier};
 use wisp_core::model::*;
-use wisp_core::settings::Settings;
+pub(crate) use wisp_core::settings::default_root;
+use wisp_core::settings::{Settings, settings_file};
 use wisp_core::store::{Store, TrashEntry};
 use wisp_core::{export, fulltext, import, time};
 
@@ -248,18 +249,6 @@ pub struct Workspace {
     pub menu: Option<Menu>,
     pub toast: Option<Toast>,
     pub home_scroll: ScrollHandle,
-}
-
-/// Where the libraries live unless the settings say otherwise.
-pub(crate) fn default_root() -> PathBuf {
-    if let Ok(home) = std::env::var("WISP_PAPER_HOME") && !home.trim().is_empty() { return PathBuf::from(home) }
-    dirs::document_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("WispPaper")
-}
-
-fn settings_file() -> PathBuf {
-    // Tests and side-by-side builds keep their settings with their data.
-    if let Ok(home) = std::env::var("WISP_PAPER_HOME") && !home.trim().is_empty() { return PathBuf::from(home).join("settings.json") }
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("WispPaper").join("settings.json")
 }
 
 impl Chat {
