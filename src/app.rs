@@ -40,6 +40,15 @@ pub enum Page {
     Write,
 }
 
+/// An edge between two columns of a library that the pointer can hold and move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    /// Between the sidebar and the list.
+    Sidebar,
+    /// Between the list and the detail panel.
+    Detail,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Info,
@@ -163,6 +172,8 @@ pub enum Cmd {
     ReadPages(String),
     SetTab(Tab),
     ToggleWide,
+    /// Put the library's sidebar away, or bring it back.
+    ToggleSidebar,
     /// Draw the pages of the PDF on show larger, smaller, or at a given size.
     PdfZoom(ZoomTo),
     /// Cut a piece out of a page as a picture for a question, or stop doing so.
@@ -773,8 +784,8 @@ pub struct Workspace {
     pub menu: Option<Menu>,
     pub toast: Option<Toast>,
     pub home_scroll: ScrollHandle,
-    /// The edge between the list and the detail panel is being dragged.
-    pub resizing: bool,
+    /// The edge being dragged: the sidebar's, or the detail panel's.
+    pub resizing: Option<Edge>,
 }
 
 impl Chat {
@@ -1060,7 +1071,7 @@ impl Workspace {
         theme::set_accent("blue");
         shortcuts::rebuild(&settings.shortcuts, cx);
         let libraries = libraries::list(&root);
-        let mut this = Workspace { focus, settings, settings_path, root, libraries, lib: None, settings_view: None, update: UpdateState::Idle, update_told: None, modal: None, modal_error: String::new(), modal_subscriptions: vec![], menu: None, toast, home_scroll: ScrollHandle::new(), resizing: false };
+        let mut this = Workspace { focus, settings, settings_path, root, libraries, lib: None, settings_view: None, update: UpdateState::Idle, update_told: None, modal: None, modal_error: String::new(), modal_subscriptions: vec![], menu: None, toast, home_scroll: ScrollHandle::new(), resizing: None };
         this.apply_appearance(window);
         cx.observe_window_appearance(window, |this, window, _| this.apply_appearance(window)).detach();
         this.watch_updates(cx);
@@ -1491,6 +1502,10 @@ impl Workspace {
             }
             Cmd::ToggleWide => {
                 if let Some(lib) = self.lib.as_mut() { lib.wide = !lib.wide }
+            }
+            Cmd::ToggleSidebar => {
+                self.settings.sidebar_hidden = !self.settings.sidebar_hidden;
+                self.save_settings(cx);
             }
             Cmd::PdfCut => {
                 if let Some(pdf) = self.lib.as_ref().and_then(|lib| lib.pdf.clone()) { pdf.update(cx, |pdf, cx| pdf.toggle_cutting(cx)) }
@@ -1966,6 +1981,7 @@ impl Workspace {
             "import-pdf" => Cmd::ImportPdfs,
             "ask" => Cmd::SetPage(Page::Ask),
             "detail" if self.lib.as_ref().is_some_and(|l| l.selected.is_some()) => Cmd::ToggleWide,
+            "sidebar" => Cmd::ToggleSidebar,
             // The PDF's size, while a PDF is on show.
             "zoom-in" => Cmd::PdfZoom(ZoomTo::In),
             "zoom-out" => Cmd::PdfZoom(ZoomTo::Out),
@@ -3778,14 +3794,16 @@ impl Workspace {
                     return;
                 }
                 // The pointer, as the window hears of it: `press:x;y`, `move:x;y` (the button held), `release:x;y`,
-                // `click:x;y`, and `wheel:x;y;dy;cmd` (dy in pixels; `cmd` or `shift` held, or nothing).
-                "press" | "move" | "release" | "click" | "wheel" => {
+                // `click:x;y`, `click2:x;y` (the second click of a double click), and `wheel:x;y;dy;cmd` (dy in pixels;
+                // `cmd` or `shift` held, or nothing).
+                "press" | "move" | "release" | "click" | "click2" | "wheel" => {
                     let mut numbers = arg.split(';');
                     let mut number = || numbers.next().and_then(|n| n.parse::<f32>().ok()).unwrap_or(0.);
                     let position = point(px(number()), px(number()));
                     let turned = number();
                     let held = arg.rsplit(';').next().unwrap_or("");
                     let modifiers = Modifiers { platform: held == "cmd", control: held == "ctrl", shift: held == "shift", ..Default::default() };
+                    let count = if name == "click2" { 2 } else { 1 };
                     let events = match name {
                         "press" => vec![PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position, modifiers, click_count: 1, first_mouse: false })],
                         "move" => vec![PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: Some(MouseButton::Left), modifiers })],
@@ -3793,8 +3811,8 @@ impl Workspace {
                         "wheel" => vec![PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }), PlatformInput::ScrollWheel(ScrollWheelEvent { position, delta: ScrollDelta::Pixels(point(px(0.), px(turned))), modifiers, touch_phase: TouchPhase::Moved })],
                         _ => vec![
                             PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers }),
-                            PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position, modifiers, click_count: 1, first_mouse: false }),
-                            PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position, modifiers, click_count: 1 }),
+                            PlatformInput::MouseDown(MouseDownEvent { button: MouseButton::Left, position, modifiers, click_count: count, first_mouse: false }),
+                            PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position, modifiers, click_count: count }),
                         ],
                     };
                     window.defer(cx, move |window, cx| {
@@ -3824,6 +3842,13 @@ impl Workspace {
                 }
                 "width" => {
                     self.settings.detail_width = arg.parse().unwrap_or(0.);
+                    cx.notify();
+                    return;
+                }
+                // `sidebar` puts the sidebar away or brings it back; `sidebar:300` gives it a width.
+                "sidebar" if arg.is_empty() => Some(Cmd::ToggleSidebar),
+                "sidebar" => {
+                    self.settings.sidebar_width = arg.parse().unwrap_or(0.);
                     cx.notify();
                     return;
                 }
