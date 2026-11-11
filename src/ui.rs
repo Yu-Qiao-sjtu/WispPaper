@@ -3,9 +3,21 @@
 use crate::input::TextInput;
 use crate::theme::{self, Theme};
 use gpui::{prelude::FluentBuilder, *};
+use std::time::Duration;
 
 pub fn icon(name: &str, size: f32, color: Hsla) -> Svg {
     svg().path(SharedString::from(format!("icons/{name}.svg"))).size(px(size)).flex_none().text_color(color)
+}
+
+/// A turning mark: something is being waited for.
+pub fn spinner(id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoElement {
+    icon("loader", size, color).with_animation(id, Animation::new(Duration::from_millis(900)).repeat(), |mark, turn| mark.with_transformation(Transformation::rotate(percentage(turn))))
+}
+
+/// The element appears over a moment instead of at once. It plays once,
+/// when the element with this id is first drawn.
+pub fn fade_in(id: impl Into<ElementId>, element: Div) -> impl IntoElement {
+    element.with_animation(id, Animation::new(Duration::from_millis(400)).with_easing(ease_out_quint()), |element, shown| element.opacity(shown))
 }
 
 /// The filled button of a dialog or toolbar, in the library's accent.

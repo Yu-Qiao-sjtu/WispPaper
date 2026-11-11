@@ -1,12 +1,13 @@
 //! The detail panel of the selected paper: 信息 (record, statuses, custom
 //! fields, notes, files), PDF (preview) and 提问 (questions about this paper).
 
-use crate::app::{Cmd, MenuKind, Tab, Workspace};
+use crate::app::{Cmd, MenuKind, Tab, Translated, Workspace};
 use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
 use wisp_core::model::*;
-use wisp_core::time;
+use wisp_core::store::translation_key;
+use wisp_core::{ai, time};
 
 impl Workspace {
     pub fn render_detail(&mut self, width: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -63,6 +64,37 @@ impl Workspace {
             Tab::Ask => self.render_chat(true, window, cx),
         };
         div().flex().flex_col().flex_none().w(px(width)).h_full().bg(Theme::bg_body()).border_l_1().border_color(Theme::line()).child(ui::title_strip()).child(header).child(div().flex().flex_col().flex_1().min_h_0().child(body)).into_any_element()
+    }
+
+    /// The paper's title and abstract translated, while translation is on:
+    /// what is there, what is still being made, and what went wrong.
+    fn render_translation(&self, p: &Paper, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let lib = self.lib.as_ref().filter(|l| l.show_translation)?;
+        let prompt = ai::translation_prompt(&self.settings.translation_prompt);
+        let texts: Vec<(String, &Translated)> = [&p.title, &p.abstract_text].into_iter().filter(|text| !text.trim().is_empty()).filter_map(|text| {
+            let key = translation_key(text, prompt);
+            lib.translations.get(&key).map(|state| (key, state))
+        }).collect();
+        if texts.is_empty() { return None }
+        let mut card = div().flex().flex_col().gap(px(6.)).p(px(10.)).rounded(px(8.)).bg(Theme::accent_soft());
+        // The title is the first of the two, and reads as one.
+        let title_key = translation_key(&p.title, prompt);
+        for (key, state) in &texts {
+            if let Translated::Done(text) = state {
+                let line = div().line_height(px(21.)).when(*key == title_key, |d| d.font_weight(FontWeight::MEDIUM)).child(text.clone());
+                card = card.child(ui::fade_in(SharedString::from(format!("translated-{key}")), line));
+            }
+        }
+        if texts.iter().any(|(_, state)| matches!(state, Translated::Busy)) {
+            card = card.child(div().flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(Theme::accent()).child(ui::spinner("translating", 13., Theme::accent())).child("正在翻译…"));
+        }
+        if let Some(error) = texts.iter().find_map(|(_, state)| match state {
+            Translated::Failed(error) => Some(error.clone()),
+            _ => None,
+        }) {
+            card = card.child(div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(ui::error_line(&error))).child(ui::ghost_button("translate-retry", None, Some("重试".into())).on_click(self.on(Cmd::RetryTranslation, cx))));
+        }
+        Some(card.into_any_element())
     }
 
     fn render_info(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -155,6 +187,14 @@ impl Workspace {
             })
             .collect();
         let has_fields = !lib.fields.is_empty();
+        let translating = lib.show_translation;
+        let translation = self.render_translation(p, cx);
+        let abstract_head = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(ui::caption("摘要"))
+            .child(ui::ghost_button("translate", None, Some(if translating { "隐藏译文".into() } else { "翻译".into() })).h(px(22.)).text_size(px(12.)).when(translating, |d| d.text_color(Theme::accent())).on_click(self.on(Cmd::ToggleTranslation, cx)));
         div()
             .id("detail-info")
             .flex()
@@ -203,7 +243,7 @@ impl Workspace {
             } else {
                 div().text_color(Theme::text_placeholder()).child("这个文献库还没有自定义词条。在左下角「自定义词条」里添加，例如物种、研究方法、所属课题。")
             }))
-            .child(section("摘要").child(if p.abstract_text.is_empty() { div().text_color(Theme::text_placeholder()).child("没有摘要") } else { div().text_color(Theme::text_secondary()).line_height(px(21.)).child(p.abstract_text.clone()) }))
+            .child(div().flex().flex_col().gap(px(6.)).child(abstract_head).children(translation).child(if p.abstract_text.is_empty() { div().text_color(Theme::text_placeholder()).child("没有摘要") } else { div().text_color(Theme::text_secondary()).line_height(px(21.)).child(p.abstract_text.clone()) }))
             .child(section("我的笔记").child(ui::field(&lib.notes, window, cx)))
             .child(section("文件").child(div().flex().flex_col().gap(px(6.)).children(file_rows).child(ui::secondary_button("attach", if files.is_empty() { "添加 PDF 或附件" } else { "再添加一个文件" }).on_click(self.on(Cmd::AttachPdf(id.clone()), cx)))))
             .child(div().text_size(px(12.)).text_color(Theme::text_placeholder()).child(format!("来源：{} · 添加于 {}", p.source, time::date_text(&p.added_at))))

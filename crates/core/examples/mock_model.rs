@@ -1,14 +1,21 @@
 //! A stand-in for a model service, for trying the assistant's tool loop
 //! without an API key:
 //!
-//!     cargo run -p wisp_core --example mock_model -- 8787
+//!     cargo run -p wisp_core --example mock_model -- 8787 [milliseconds]
 //!
 //! Point a profile at it (协议 Anthropic, 地址 http://127.0.0.1:8787, any
 //! key and model). It speaks the Claude Messages streaming format and always
 //! plays the same parts. Asked for search queries by the guide (a request
-//! without tools), it proposes two for PubMed. In a chat, asked a question, it calls `list_papers` and
+//! without tools), it proposes two for PubMed. Asked to screen a paper, it
+//! decides by one word; asked to translate, it hands the text back marked
+//! as translated. In a chat, asked a question, it calls `list_papers` and
 //! `library_status`; given their results, it answers and cites the first
 //! paper the search returned.
+//!
+//! Requests are answered side by side, each after the given number of
+//! milliseconds (none by default), so a run of several screening requests
+//! can be watched. Every request is printed with its model and thinking
+//! setting, which shows what each task was sent with.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -46,13 +53,31 @@ fn first_label(body: &str) -> String {
     body.find(marker).map(|at| body[at + marker.len()..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect()).unwrap_or_else(|| "P1".into())
 }
 
+/// The string, object or number after `"name":` in the request, as it was sent.
+fn sent(request: &str, name: &str) -> String {
+    let Some(at) = request.find(&format!("\"{name}\":")) else { return "-".into() };
+    let rest = &request[at + name.len() + 3..];
+    let end = if rest.starts_with('{') { rest.find('}').map_or(rest.len(), |end| end + 1) } else { rest.find([',', '}']).unwrap_or(rest.len()) };
+    rest[..end].to_string()
+}
+
 fn main() {
     let port = std::env::args().nth(1).unwrap_or_else(|| "8787".into());
+    let delay: u64 = std::env::args().nth(2).and_then(|ms| ms.parse().ok()).unwrap_or(0);
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).expect("bind");
     println!("mock model on http://127.0.0.1:{port}");
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
+        let Ok(stream) = stream else { continue };
+        std::thread::spawn(move || answer(stream, delay));
+    }
+}
+
+fn answer(mut stream: TcpStream, delay: u64) {
+    {
         let request = body(&mut stream);
+        let kind = if request.contains("文献筛选助手") { "screen" } else if request.contains("翻译助手") { "translate" } else if request.contains("\"tools\"") { "chat" } else { "queries" };
+        println!("{kind}: model {} thinking {} output_config {}", sent(&request, "model"), sent(&request, "thinking"), sent(&request, "output_config"));
+        std::thread::sleep(std::time::Duration::from_millis(delay));
         // The last message decides the step: tool results get the answer, a question gets the calls.
         let answered = request.rfind("\"tool_result\"").is_some_and(|at| request.rfind("\"role\":\"user\"").is_some_and(|user| user < at));
         let mut events = String::new();
@@ -63,6 +88,12 @@ fn main() {
             let reply = format!(r#"{{"verdict": "{verdict}", "reason": "{reason}", "excerpt": "{}", "confidence": {confidence}}}"#, quote.trim());
             events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
             events.push_str(&event(&format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{}}}}}"#, quoted(&reply))));
+            events.push_str(&event(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#));
+        } else if request.contains("翻译助手") {
+            // A translation request: the start of the text comes back, marked as translated.
+            let source: String = request.rsplit("\"content\":\"").next().map(|rest| rest.chars().take_while(|c| *c != '\\' && *c != '"').take(60).collect()).unwrap_or_default();
+            events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
+            events.push_str(&event(&format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{}}}}}"#, quoted(&format!("（假模型的译文）{}", source.trim())))));
             events.push_str(&event(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#));
         } else if !request.contains("\"tools\"") {
             // A request without tools is the guide asking for search queries: two for PubMed, as JSON in the text.

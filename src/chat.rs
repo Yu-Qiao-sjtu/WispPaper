@@ -14,7 +14,7 @@ impl Workspace {
     pub fn render_chat(&mut self, about_paper: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let lib = self.lib.as_ref().unwrap();
         let chat = if about_paper { &lib.paper_chat } else { &lib.library_chat };
-        let profile = self.settings.profile_or_default();
+        let profile = self.settings.profile_for_or_default(wisp_core::settings::Task::Chat);
         let configured = !profile.key().is_empty();
         let model = profile.model.clone();
 

@@ -5,7 +5,7 @@
 //! The layout follows quiet-md's settings (MIT): grouped rows in rounded
 //! cards, the title on the left and the control on the right.
 
-use crate::app::{Cmd, Workspace, default_root};
+use crate::app::{Cmd, MenuKind, Workspace, default_root};
 use crate::input::{InputEvent, TextInput};
 use crate::shortcuts::{self, GROUPS, SHORTCUTS};
 use crate::theme::{self, Theme};
@@ -16,6 +16,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use wisp_core::ai::{self, Profile, Protocol};
 use wisp_core::libraries;
+use wisp_core::settings::Task;
 use wisp_core::update::{self, Release};
 
 const SIDEBAR_W: f32 = 224.;
@@ -63,19 +64,56 @@ impl SettingsPage {
 pub struct SettingsView {
     pub page: SettingsPage,
     scroll: ScrollHandle,
+    /// The model service the AI page shows the fields of, as an index into `Settings::profiles`.
+    editing: usize,
+    /// Whether those fields are on show, under the model's row.
+    expanded: bool,
     protocol: Protocol,
-    base_url: Entity<TextInput>,
-    model: Entity<TextInput>,
-    api_key: Entity<TextInput>,
-    /// The model service's own proxy, and the proxy for everything.
-    profile_proxy: Entity<TextInput>,
+    /// Its thinking setting, a key of `ai::EFFORTS`.
+    effort: String,
+    fields: ProfileFields,
+    /// The proxy for everything.
     proxy: Entity<TextInput>,
+    translation_prompt: Entity<TextInput>,
     /// The shortcut waiting for its new key. While it waits, every key
     /// binding is cleared, so the keys pressed reach `record_key`.
     recording: Option<String>,
     /// A shortcut and why the key pressed for it was refused.
     shortcut_error: Option<(String, String)>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The text fields of one model service. They are made anew for the
+/// service on show, so a change always belongs to that one.
+struct ProfileFields {
+    name: Entity<TextInput>,
+    base_url: Entity<TextInput>,
+    model: Entity<TextInput>,
+    api_key: Entity<TextInput>,
+    /// The service's own proxy.
+    proxy: Entity<TextInput>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl ProfileFields {
+    fn new(profile: &Profile, cx: &mut Context<Workspace>) -> ProfileFields {
+        let mut input = |placeholder: &'static str, text: &str| cx.new(|cx| TextInput::new(placeholder, cx).with_text(text));
+        let name = input("留空则显示模型名称", &profile.name);
+        let base_url = input("https://…", &profile.base_url);
+        let model = input("模型名称", &profile.model);
+        let api_key = input("留空则读取环境变量", &profile.api_key);
+        let proxy = input("留空则使用全局代理", &profile.proxy);
+        api_key.update(cx, |input, _| input.masked = true);
+        let subscriptions = [&name, &base_url, &model, &api_key, &proxy]
+            .into_iter()
+            .map(|input| {
+                cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+                    if *event == InputEvent::Changed { this.save_profile(cx) }
+                })
+            })
+            .collect();
+        ProfileFields { name, base_url, model, api_key, proxy, _subscriptions: subscriptions }
+    }
 }
 
 /// Where the check for a newer release stands.
@@ -208,26 +246,27 @@ impl Workspace {
                 view.shortcut_error = None;
             }
             None => {
-                let profile = self.settings.profile_or_default();
-                let mut input = |placeholder: &'static str, text: &str| cx.new(|cx| TextInput::new(placeholder, cx).with_text(text));
-                let base_url = input("https://…", &profile.base_url);
-                let model = input("模型名称", &profile.model);
-                let api_key = input("留空则读取环境变量", &profile.api_key);
-                let profile_proxy = input("留空则使用全局代理", &profile.proxy);
-                let proxy = input("http://127.0.0.1:7890", &self.settings.proxy);
-                api_key.update(cx, |input, _| input.masked = true);
-                let mut subscriptions: Vec<Subscription> = [&base_url, &model, &api_key, &profile_proxy]
-                    .into_iter()
-                    .map(|input| {
-                        cx.subscribe(input, |this, _, event: &InputEvent, cx| {
-                            if *event == InputEvent::Changed { this.save_profile(cx) }
-                        })
-                    })
-                    .collect();
-                subscriptions.push(cx.subscribe(&proxy, |this, _, event: &InputEvent, cx| {
-                    if *event == InputEvent::Changed { this.save_proxy(cx) }
-                }));
-                self.settings_view = Some(SettingsView { page, scroll: ScrollHandle::new(), protocol: profile.protocol, base_url, model, api_key, profile_proxy, proxy, recording: None, shortcut_error: None, _subscriptions: subscriptions });
+                // The AI page opens on the model questions go to.
+                let profile = self.settings.profile_for_or_default(Task::Chat);
+                let editing = self.settings.profiles.iter().position(|p| p.id == profile.id).unwrap_or(0);
+                let fields = ProfileFields::new(&profile, cx);
+                let proxy = cx.new(|cx| TextInput::new("http://127.0.0.1:7890", cx).with_text(&self.settings.proxy));
+                let translation_prompt = cx.new(|cx| TextInput::new("留空则使用默认要求：译成简体中文，保留术语、基因名、物种学名和数字原样，只输出译文。", cx).multiline(3).with_text(&self.settings.translation_prompt));
+                let subscriptions = vec![
+                    cx.subscribe(&proxy, |this, _, event: &InputEvent, cx| {
+                        if *event == InputEvent::Changed { this.save_proxy(cx) }
+                    }),
+                    cx.subscribe(&translation_prompt, |this, input, event: &InputEvent, cx| {
+                        if *event == InputEvent::Changed {
+                            this.settings.translation_prompt = input.read(cx).text().trim().to_string();
+                            this.save_settings(cx);
+                            cx.notify();
+                        }
+                    }),
+                ];
+                // A model that cannot answer yet opens with its fields showing.
+                let expanded = profile.missing().is_some();
+                self.settings_view = Some(SettingsView { page, scroll: ScrollHandle::new(), editing, expanded, protocol: profile.protocol, effort: profile.effort, fields, proxy, translation_prompt, recording: None, shortcut_error: None, _subscriptions: subscriptions });
             }
         }
         window.focus(&self.focus);
@@ -436,12 +475,63 @@ impl Workspace {
             Protocol::Anthropic => (ai::ANTHROPIC_BASE, ai::DEFAULT_MODEL),
             Protocol::OpenAI | Protocol::Responses => ("https://api.openai.com/v1", ""),
         };
-        view.base_url.update(cx, |input, cx| input.set_text(url, cx));
-        view.model.update(cx, |input, cx| input.set_text(model, cx));
+        view.fields.base_url.update(cx, |input, cx| input.set_text(url, cx));
+        view.fields.model.update(cx, |input, cx| input.set_text(model, cx));
         self.save_profile(cx);
     }
 
-    /// Keep what the AI page shows as the profile questions go to.
+    pub fn set_effort(&mut self, effort: String, cx: &mut Context<Self>) {
+        let Some(view) = self.settings_view.as_mut() else { return };
+        view.effort = effort;
+        self.save_profile(cx);
+    }
+
+    /// Show a model service's fields under its row; a click on the one
+    /// already open folds it up again.
+    pub fn select_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(view) = self.settings_view.as_mut() else { return };
+        if index >= self.settings.profiles.len().max(1) { return }
+        if view.editing == index {
+            view.expanded = !view.expanded;
+            return cx.notify();
+        }
+        self.show_profile(index, cx);
+    }
+
+    fn show_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        let profile = self.settings.profiles.get(index).cloned().unwrap_or_default();
+        let fields = ProfileFields::new(&profile, cx);
+        if let Some(view) = self.settings_view.as_mut() { (view.editing, view.expanded, view.protocol, view.effort, view.fields) = (index, true, profile.protocol, profile.effort, fields) }
+        cx.notify();
+    }
+
+    /// One more model service, starting from the defaults, and its fields on show.
+    pub fn add_profile(&mut self, cx: &mut Context<Self>) {
+        // The built-in default becomes a saved one first, so that it stays beside the new one.
+        if self.settings.profiles.is_empty() { self.settings.add_profile(Profile::default()); }
+        let name = format!("模型 {}", self.settings.profiles.len() + 1);
+        let index = self.settings.add_profile(Profile { name, ..Default::default() });
+        self.save_settings(cx);
+        self.show_profile(index, cx);
+    }
+
+    pub fn remove_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        // The last one stays: something has to answer.
+        if index >= self.settings.profiles.len() || self.settings.profiles.len() < 2 { return }
+        self.settings.remove_profile(index);
+        self.save_settings(cx);
+        let editing = self.settings_view.as_ref().map_or(0, |view| view.editing);
+        self.show_profile(if editing > index { editing - 1 } else { editing.min(self.settings.profiles.len() - 1) }, cx);
+        if let Some(view) = self.settings_view.as_mut() { view.expanded = false }
+    }
+
+    pub fn reset_translation_prompt(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = &self.settings_view { view.translation_prompt.update(cx, |input, cx| input.set_text("", cx)) }
+        self.settings.translation_prompt.clear();
+        self.save_settings(cx);
+        cx.notify();
+    }
+
     /// Keep the global proxy as typed, and put it to use once it is an
     /// address that can work; until then the last good one stays in force.
     fn save_proxy(&mut self, cx: &mut Context<Self>) {
@@ -454,13 +544,22 @@ impl Workspace {
         self.save_settings(cx);
     }
 
+    /// Keep what the AI page shows as the model service on show.
     fn save_profile(&mut self, cx: &mut Context<Self>) {
         let Some(view) = &self.settings_view else { return };
         let text = |input: &Entity<TextInput>| input.read(cx).text().trim().to_string();
-        let profile = Profile { name: self.settings.profile().map_or("默认".into(), |p| p.name.clone()), protocol: view.protocol, base_url: text(&view.base_url), api_key: text(&view.api_key), model: text(&view.model), proxy: text(&view.profile_proxy) };
-        if self.settings.profile() == Some(&profile) { return }
-        self.settings.profiles = vec![profile];
-        self.settings.active_profile = 0;
+        let (fields, editing) = (&view.fields, view.editing);
+        let id = self.settings.profiles.get(editing).map(|p| p.id.clone()).unwrap_or_default();
+        let profile = Profile { id, name: text(&fields.name), protocol: view.protocol, base_url: text(&fields.base_url), api_key: text(&fields.api_key), model: text(&fields.model), effort: view.effort.clone(), proxy: text(&fields.proxy) };
+        match self.settings.profiles.get_mut(editing) {
+            Some(saved) if *saved == profile => return,
+            Some(saved) => *saved = profile,
+            // The first change to the built-in default makes it a saved profile.
+            None if profile == Profile::default() => return,
+            None => {
+                self.settings.add_profile(profile);
+            }
+        }
         self.save_settings(cx);
         cx.notify();
     }
@@ -637,42 +736,118 @@ impl Workspace {
 
     fn ai_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(view) = &self.settings_view else { return div().into_any_element() };
-        let profile = self.settings.profile_or_default();
+        let settings = &self.settings;
+        // Before anything is saved, the built-in default is the one model there is.
+        let builtin = [Profile::default()];
+        let profiles: &[Profile] = if settings.profiles.is_empty() { &builtin } else { &settings.profiles };
+        let saved = !settings.profiles.is_empty();
+        let editing = view.editing.min(profiles.len() - 1);
+        let protocol_name = |protocol: Protocol| match protocol {
+            Protocol::Anthropic => "Claude API",
+            Protocol::OpenAI => "OpenAI 兼容",
+            Protocol::Responses => "OpenAI Responses",
+        };
+        let warn = theme::status_colors("uncertain");
+
+        // The fields of the model that is open, drawn under its row.
         let (variable, privacy) = match view.protocol {
-            Protocol::Anthropic => ("ANTHROPIC_API_KEY", "提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
-            Protocol::Responses => ("OPENAI_API_KEY", "OpenAI 的 Responses 接口（/responses），地址写到 /v1。对话不会保存在服务端：每次请求带上完整的对话，模型的推理内容以加密形式随之传回。提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
-            Protocol::OpenAI => ("OPENAI_API_KEY", "适用于任何兼容 chat/completions 的服务，地址写到 /v1。提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
+            Protocol::Anthropic => ("ANTHROPIC_API_KEY", "用到这个模型时，问题和相关文献的记录、笔记、全文页面（筛选时是待判断的文献，翻译时是题目和摘要）会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
+            Protocol::Responses => ("OPENAI_API_KEY", "OpenAI 的 Responses 接口（/responses），地址写到 /v1。对话不会保存在服务端：每次请求带上完整的对话，模型的推理内容以加密形式随之传回。用到这个模型时，问题和相关文献的内容会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
+            Protocol::OpenAI => ("OPENAI_API_KEY", "适用于任何兼容 chat/completions 的服务，地址写到 /v1。用到这个模型时，问题和相关文献的内容会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
         };
-        let (state, colors) = if profile.key().is_empty() {
-            ("还缺 API Key", theme::status_colors("uncertain"))
-        } else if profile.model.trim().is_empty() {
-            ("还缺模型名称", theme::status_colors("uncertain"))
-        } else {
-            ("可以提问", theme::status_colors("included"))
+        let thinking = match view.protocol {
+            Protocol::Anthropic => "思考：「默认」不发送思考参数，由模型自己决定；其余各档按 effort 发送。「关闭」让模型不思考，适合翻译这样的任务；Claude Opus 5.5 和 Fable 不能关闭思考，对它们改用最低一档。",
+            Protocol::OpenAI => "思考：「默认」不发送思考参数。各档按 reasoning_effort 发送，「极高」「最高」按「高」。「关闭」因服务而异：OpenAI 是 reasoning_effort: none，百炼和硅基流动是 enable_thinking: false，DeepSeek、火山方舟、智谱、Kimi 等是 thinking: disabled。模型不认这个参数时服务会报错，改回「默认」即可。",
+            Protocol::Responses => "思考：「默认」不发送推理参数。各档按 reasoning.effort 发送，「极高」「最高」按「高」，「关闭」是 none。模型不认这个参数时服务会报错，改回「默认」即可。",
         };
+        let fields = &view.fields;
         let field = |input: &Entity<TextInput>| div().w(px(INPUT_W)).child(ui::field(input, window, cx));
-        let (base_url, model, api_key, profile_proxy) = (field(&view.base_url), field(&view.model), field(&view.api_key), field(&view.profile_proxy));
+        let (name, base_url, model, api_key, profile_proxy) = (field(&fields.name), field(&fields.base_url), field(&fields.model), field(&fields.api_key), field(&fields.proxy));
         // A bad address is said where it is typed; the request would only fail later.
-        let proxy_detail = wisp_core::settings::proxy_problem(view.profile_proxy.read(cx).text(), true).unwrap_or_else(|| "只用于这个模型服务。留空则使用「网络」页的全局代理；填 direct 表示不走代理。".to_string());
+        let proxy_detail = wisp_core::settings::proxy_problem(fields.proxy.read(cx).text(), true).unwrap_or_else(|| "只用于这个模型服务。留空则使用「网络」页的全局代理；填 direct 表示不走代理。".to_string());
+        let efforts: Vec<(&'static str, Cmd)> = ai::EFFORTS.iter().map(|(key, name)| (*name, Cmd::SetEffort(key.to_string()))).collect();
+        let effort = ai::EFFORTS.iter().position(|(key, _)| *key == view.effort).unwrap_or(0);
+        let mut service = vec![
+            row("名称", None, name),
+            row("接口", None, segmented("protocol", vec![("Claude API", Cmd::PickProtocol(Protocol::Anthropic)), ("OpenAI 兼容", Cmd::PickProtocol(Protocol::OpenAI)), ("OpenAI Responses", Cmd::PickProtocol(Protocol::Responses))], match view.protocol { Protocol::Anthropic => 0, Protocol::OpenAI => 1, Protocol::Responses => 2 }, self, cx)),
+            row("服务地址", None, base_url),
+            row("模型", None, model),
+            row("API Key", Some(format!("留空则读取环境变量 {variable}。").into()), api_key),
+            row("思考", None, segmented("effort", efforts, effort, self, cx)),
+            row("代理", Some(proxy_detail.into()), profile_proxy),
+        ];
+        if profiles.len() > 1 {
+            service.push(row("删除这个模型", Some("用到它的任务改用默认的模型。".into()), button("model-remove", "删除…").text_color(Theme::danger()).on_click(self.on(Cmd::AskRemoveProfile(editing), cx))));
+        }
+        let small = |text: &'static str| div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_tertiary()).child(text);
+        let mut open = Some(div().flex().flex_col().w_full().bg(Theme::bg_sunken()).children(service.into_iter().map(|row| row.border_t_1().border_color(Theme::line()))).child(div().flex().flex_col().gap(px(6.)).px(px(16.)).py(px(12.)).border_t_1().border_color(Theme::line()).child(small(thinking)).child(small(privacy))));
+
+        // The models, each with the tasks it does; the open one with its fields below.
+        let mut models: Vec<AnyElement> = profiles
+            .iter()
+            .enumerate()
+            .map(|(i, profile)| {
+                let shown = i == editing && view.expanded;
+                let serves = Task::ALL.into_iter().filter(|task| settings.profile_for(*task).is_none_or(|used| used.id == profile.id));
+                let effort = ai::EFFORTS.iter().find(|(key, _)| *key == profile.effort).map_or("默认", |(_, name)| *name);
+                let about = format!("{} · {} · 思考：{effort}", if profile.model.trim().is_empty() { "未填模型" } else { profile.model.trim() }, protocol_name(profile.protocol));
+                let head = div()
+                    .id(("model", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .w_full()
+                    .min_h(px(52.))
+                    .px(px(16.))
+                    .py(px(9.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(Theme::hover()))
+                    .on_click(self.on(Cmd::SelectProfile(i), cx))
+                    .child(div().flex().flex_col().flex_1().min_w_0().gap(px(2.)).child(div().truncate().font_weight(FontWeight::MEDIUM).child(profile.title())).child(div().truncate().text_size(px(12.)).text_color(Theme::text_tertiary()).child(about)))
+                    .children(serves.map(|task| ui::chip(task.label(), Theme::accent(), Theme::accent_soft())))
+                    .children(profile.missing().map(|what| ui::chip(what, warn.0, warn.1)))
+                    .child(ui::icon(if shown { "chevron-up" } else { "chevron-down" }, 14., Theme::text_tertiary()));
+                div().flex().flex_col().w_full().child(head).children(open.take_if(|_| shown)).into_any_element()
+            })
+            .collect();
+        models.push(div().flex().items_center().w_full().px(px(16.)).py(px(10.)).child(button("model-add", "添加模型").on_click(self.on(Cmd::AddProfile, cx))).into_any_element());
+
+        // Which model does what.
+        let pick = |n: usize, task: Task, this: &Self, cx: &mut Context<Self>| {
+            let used = settings.profile_for_or_default(task).title();
+            let text = if task != Task::Chat && settings.tasks.get(task).is_empty() { format!("与提问相同（{used}）") } else { used };
+            let shell = div().id(("task-model", n)).flex().flex_none().items_center().gap(px(6.)).h(px(28.)).max_w(px(300.)).px(px(10.)).rounded(px(7.)).child(div().truncate().child(text));
+            // With only the built-in default there is nothing to choose from.
+            if saved { shell.bg(Theme::hover()).hover(|s| s.bg(Theme::pressed())).cursor_pointer().child(ui::icon("chevron-down", 12., Theme::text_secondary())).on_click(this.on_menu(MenuKind::TaskModel(task), cx)) } else { shell.text_color(Theme::text_secondary()) }
+        };
+        const WORKERS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+        let workers: Vec<(&'static str, Cmd)> = ["1", "2", "3", "4", "6", "8"].into_iter().zip(WORKERS).map(|(name, count)| (name, Cmd::SetScreenWorkers(count))).collect();
+        let tasks = vec![
+            row(Task::Chat.label(), Some("向文献库或单篇文献提问，以及向导里编写检索式。".into()), pick(0, Task::Chat, self, cx)).into_any_element(),
+            row(Task::Screen.label(), Some("筛选页里替你逐篇阅读待判断文献的助手。文献多的时候，可以给它一个更快、更便宜的模型。".into()), pick(1, Task::Screen, self, cx)).into_any_element(),
+            row("同时阅读的篇数", Some("批量筛选时同时发出的请求数。服务限速时调小。".into()), segmented("workers", workers, WORKERS.iter().position(|count| *count == settings.screen_workers).unwrap_or(usize::MAX), self, cx)).into_any_element(),
+            row(Task::Translate.label(), Some("翻译题目和摘要。翻译用不着思考：可以给它一个把「思考」设为关闭的小模型。".into()), pick(2, Task::Translate, self, cx)).into_any_element(),
+        ];
+        // The column's width in pixels, less the card's border and padding: a
+        // wrapping text field needs to be told its width here, where every
+        // width above it is a share of its parent's.
+        let wide = (f32::from(window.viewport_size().width) - SIDEBAR_W - 65.).min(COLUMN_W) - 34.;
+        let translation = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .px(px(16.))
+            .py(px(12.))
+            .child(div().flex().items_center().justify_between().w(px(wide)).min_h(px(26.)).child("翻译要求").when(!settings.translation_prompt.is_empty(), |d| d.child(link_button("translation-reset", "恢复默认").on_click(self.on(Cmd::ResetTranslationPrompt, cx)))))
+            .child(div().w(px(wide)).child(ui::field(&view.translation_prompt, window, cx)));
         div()
             .flex()
             .flex_col()
             .w_full()
             .gap(px(24.))
-            .child(group(None, vec![row("文献库提问", Some("向文献库或单篇文献提问时使用下面的模型服务。修改会自动保存。".into()), ui::chip(state, colors.0, colors.1)).into_any_element()]))
-            .child(
-                group(
-                    Some("模型服务"),
-                    vec![
-                        row("接口", None, segmented("protocol", vec![("Claude API", Cmd::PickProtocol(Protocol::Anthropic)), ("OpenAI 兼容", Cmd::PickProtocol(Protocol::OpenAI)), ("OpenAI Responses", Cmd::PickProtocol(Protocol::Responses))], match view.protocol { Protocol::Anthropic => 0, Protocol::OpenAI => 1, Protocol::Responses => 2 }, self, cx)).into_any_element(),
-                        row("服务地址", None, base_url).into_any_element(),
-                        row("模型", None, model).into_any_element(),
-                        row("API Key", Some(format!("留空则读取环境变量 {variable}。").into()), api_key).into_any_element(),
-                        row("代理", Some(proxy_detail.into()), profile_proxy).into_any_element(),
-                    ],
-                )
-                .child(note(privacy)),
-            )
+            .child(group(Some("模型"), models).child(note("可以放进多个模型，各做各的事：点一个模型展开它的设置，修改会自动保存。下面的「任务」决定谁做什么。")))
+            .child(group(Some("任务"), tasks).child(note("没有单独指定模型的任务，使用提问的模型。")))
+            .child(group(Some("翻译"), vec![translation.into_any_element()]).child(note("可以在这里指定别的目标语言、术语的译法或输出的格式。要求改了以后，同一段文字会按新的要求重新翻译；译过的文字保存在文献库里，不会再次请求。")))
             .into_any_element()
     }
 

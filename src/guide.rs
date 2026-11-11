@@ -57,7 +57,7 @@ impl Workspace {
                 .into_any_element();
         }
 
-        let configured = !self.settings.profile_or_default().key().is_empty();
+        let configured = !self.settings.profile_for_or_default(wisp_core::settings::Task::Chat).key().is_empty();
         let chosen = guide.ideas.iter().filter(|entry| entry.chosen).count();
         let cards: Vec<AnyElement> = guide.ideas.iter().enumerate().map(|(i, entry)| self.render_idea(i, entry, cx)).collect();
         let sources_row = div().flex().items_center().gap(px(6.)).children(sources::KINDS.iter().map(|(key, name)| {

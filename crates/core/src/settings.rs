@@ -12,9 +12,14 @@ use std::path::{Path, PathBuf};
 pub struct Settings {
     /// The folder holding every library; empty means the default.
     pub data_dir: String,
+    /// The model services this person can reach.
     pub profiles: Vec<Profile>,
-    /// Index into `profiles` of the one questions go to.
-    pub active_profile: usize,
+    /// Which of them each task uses.
+    pub tasks: Tasks,
+    /// How many papers the screening assistant reads at the same time, 1 to `MAX_SCREEN_WORKERS`.
+    pub screen_workers: usize,
+    /// The instructions translations are made with; empty means `ai::TRANSLATION_PROMPT`.
+    pub translation_prompt: String,
     /// Look for a newer release after launch and twice a day.
     pub auto_update: bool,
     /// "light" or "dark"; empty follows the system.
@@ -30,7 +35,62 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { data_dir: String::new(), profiles: vec![], active_profile: 0, auto_update: true, appearance: String::new(), density: String::new(), proxy: String::new(), shortcuts: BTreeMap::new() }
+        Settings { data_dir: String::new(), profiles: vec![], tasks: Tasks::default(), screen_workers: 3, translation_prompt: String::new(), auto_update: true, appearance: String::new(), density: String::new(), proxy: String::new(), shortcuts: BTreeMap::new() }
+    }
+}
+
+pub const MAX_SCREEN_WORKERS: usize = 8;
+
+/// What a model is used for. Each task can have a model of its own, so a
+/// cheap one that does not think can translate while a stronger one answers
+/// questions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Task {
+    /// Questions to the library or a paper, and the guide's search queries.
+    Chat,
+    /// The assistant that reads the papers waiting for a decision, several at a time.
+    Screen,
+    Translate,
+}
+
+impl Task {
+    pub const ALL: [Task; 3] = [Task::Chat, Task::Screen, Task::Translate];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Task::Chat => "提问",
+            Task::Screen => "批量筛选",
+            Task::Translate => "翻译",
+        }
+    }
+}
+
+/// The profile id each task is bound to. An empty one follows the model
+/// for questions, and that one the first profile, so a single model works
+/// everywhere until the person decides otherwise.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tasks {
+    pub chat: String,
+    pub screen: String,
+    pub translate: String,
+}
+
+impl Tasks {
+    pub fn get(&self, task: Task) -> &str {
+        match task {
+            Task::Chat => &self.chat,
+            Task::Screen => &self.screen,
+            Task::Translate => &self.translate,
+        }
+    }
+
+    pub fn set(&mut self, task: Task, id: &str) {
+        *match task {
+            Task::Chat => &mut self.chat,
+            Task::Screen => &mut self.screen,
+            Task::Translate => &mut self.translate,
+        } = id.to_string();
     }
 }
 
@@ -74,7 +134,15 @@ impl Settings {
     /// never silently overwritten with defaults.
     pub fn load(path: &Path) -> Result<Settings> {
         match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).with_context(|| format!("设置文件格式不正确：{}", path.display())),
+            Ok(text) => {
+                let value: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("设置文件格式不正确：{}", path.display()))?;
+                // Before tasks had models of their own, one index said which profile questions go to.
+                let active = value["activeProfile"].as_u64().map(|index| index as usize);
+                let mut settings: Settings = serde_json::from_value(value).with_context(|| format!("设置文件格式不正确：{}", path.display()))?;
+                settings.tidy();
+                if let Some(profile) = active.filter(|_| settings.tasks.chat.is_empty()).and_then(|index| settings.profiles.get(index)) { settings.tasks.chat = profile.id.clone() }
+                Ok(settings)
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
             Err(err) => Err(err).with_context(|| format!("无法读取设置文件 {}", path.display())),
         }
@@ -88,14 +156,48 @@ impl Settings {
         Ok(())
     }
 
-    pub fn profile(&self) -> Option<&Profile> {
-        self.profiles.get(self.active_profile).or(self.profiles.first())
+    /// Make what was read usable: every profile gets an id, a task bound to
+    /// a profile that is gone follows the default again, and the number of
+    /// screening workers stays in range.
+    fn tidy(&mut self) {
+        for index in 0..self.profiles.len() {
+            if self.profiles[index].id.trim().is_empty() { self.profiles[index].id = self.free_id() }
+        }
+        for task in Task::ALL {
+            if !self.profiles.iter().any(|p| p.id == self.tasks.get(task)) { self.tasks.set(task, "") }
+        }
+        self.screen_workers = self.screen_workers.clamp(1, MAX_SCREEN_WORKERS);
     }
 
-    /// The profile questions go to; before one is saved, the default one,
+    /// The first of `m1`, `m2`, … no profile has yet.
+    fn free_id(&self) -> String {
+        (1..).map(|n| format!("m{n}")).find(|id| !self.profiles.iter().any(|p| p.id == *id)).unwrap_or_default()
+    }
+
+    /// The profile a task uses: its own, else the one for questions, else the first.
+    pub fn profile_for(&self, task: Task) -> Option<&Profile> {
+        let bound = |id: &str| self.profiles.iter().find(|p| !id.is_empty() && p.id == id);
+        bound(self.tasks.get(task)).or_else(|| bound(&self.tasks.chat)).or(self.profiles.first())
+    }
+
+    /// The profile a task uses; before one is saved, the default one,
     /// which works as soon as its API key is in the environment.
-    pub fn profile_or_default(&self) -> Profile {
-        self.profile().cloned().unwrap_or_default()
+    pub fn profile_for_or_default(&self, task: Task) -> Profile {
+        self.profile_for(task).cloned().unwrap_or_default()
+    }
+
+    /// Add a model service and return its place in `profiles`.
+    pub fn add_profile(&mut self, mut profile: Profile) -> usize {
+        profile.id = self.free_id();
+        self.profiles.push(profile);
+        self.profiles.len() - 1
+    }
+
+    /// Take a model service away; the tasks it served follow the default again.
+    pub fn remove_profile(&mut self, index: usize) {
+        if index >= self.profiles.len() { return }
+        self.profiles.remove(index);
+        self.tidy();
     }
 
     /// The folder holding the libraries: the configured one, else `default`.
@@ -114,8 +216,7 @@ mod tests {
         let path = dir.join("settings.json");
         assert_eq!(Settings::load(&path).unwrap(), Settings::default());
         let mut s = Settings::default();
-        s.profiles.push(Profile::default());
-        s.active_profile = 0;
+        s.add_profile(Profile::default());
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), s);
         std::fs::write(&path, "{broken").unwrap();
@@ -131,6 +232,46 @@ mod tests {
         std::fs::write(&path, r#"{"proxy":"socks5://127.0.0.1:1080","profiles":[{"name":"x","protocol":"openai","baseUrl":"http://h/v1","apiKey":"","model":"m"}]}"#).unwrap();
         let with = Settings::load(&path).unwrap();
         assert_eq!((with.proxy.as_str(), with.profiles[0].proxy.as_str()), ("socks5://127.0.0.1:1080", ""));
+        // Nor an id, a thinking setting or a task: it is given an id and serves everything.
+        assert_eq!((with.profiles[0].id.as_str(), with.profiles[0].effort.as_str(), with.screen_workers), ("m1", "", 3));
+        assert_eq!(with.profile_for(Task::Translate).map(|p| p.name.as_str()), Some("x"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn models_per_task() {
+        let mut s = Settings::default();
+        assert_eq!(s.profile_for(Task::Chat), None);
+        assert_eq!(s.profile_for_or_default(Task::Screen), Profile::default());
+        let named = |name: &str| Profile { name: name.into(), ..Default::default() };
+        let (strong, cheap) = (s.add_profile(named("strong")), s.add_profile(named("cheap")));
+        assert_eq!((s.profiles[strong].id.as_str(), s.profiles[cheap].id.as_str()), ("m1", "m2"));
+        let uses = |s: &Settings, task: Task| s.profile_for(task).unwrap().name.clone();
+        // Unbound, everything is the first profile; screening and translation follow the one for questions.
+        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["strong", "strong", "strong"]);
+        s.tasks.set(Task::Chat, "m2");
+        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["cheap", "cheap", "cheap"]);
+        s.tasks.set(Task::Chat, "");
+        s.tasks.set(Task::Translate, "m2");
+        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["strong", "strong", "cheap"]);
+        // A removed profile takes its bindings along, and its id is not handed out twice while others keep theirs.
+        s.remove_profile(strong);
+        assert_eq!((s.profiles.len(), s.tasks.translate.as_str(), uses(&s, Task::Chat).as_str()), (1, "m2", "cheap"));
+        assert_eq!(s.add_profile(named("third")), 1);
+        assert_eq!(s.profiles[1].id, "m1");
+        s.remove_profile(0);
+        assert_eq!((s.tasks.translate.as_str(), uses(&s, Task::Translate).as_str()), ("", "third"));
+
+        // An older file's `activeProfile` becomes the model for questions; a binding to nothing is dropped.
+        let dir = std::env::temp_dir().join(format!("wisp-settings-{}", crate::model::new_id("T")));
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"activeProfile":1,"screenWorkers":40,"tasks":{"screen":"gone"},"profiles":[{"name":"a"},{"name":"b","effort":"off"}]}"#).unwrap();
+        let old = Settings::load(&path).unwrap();
+        assert_eq!((old.tasks.chat.as_str(), old.tasks.screen.as_str(), old.screen_workers), ("m2", "", MAX_SCREEN_WORKERS));
+        assert_eq!(old.profile_for(Task::Screen).map(|p| (p.name.as_str(), p.effort.as_str())), Some(("b", "off")));
+        old.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), old);
         std::fs::remove_dir_all(dir).ok();
     }
 
