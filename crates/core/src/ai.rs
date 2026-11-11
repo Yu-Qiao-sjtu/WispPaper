@@ -24,6 +24,8 @@ pub enum Protocol {
     Anthropic,
     /// Any service speaking OpenAI's chat completions.
     OpenAI,
+    /// OpenAI's Responses API (`/responses`).
+    Responses,
 }
 
 /// One model configuration from the settings.
@@ -53,7 +55,7 @@ impl Profile {
         if !self.api_key.trim().is_empty() { return self.api_key.trim().to_string() }
         std::env::var(match self.protocol {
             Protocol::Anthropic => "ANTHROPIC_API_KEY",
-            Protocol::OpenAI => "OPENAI_API_KEY",
+            Protocol::OpenAI | Protocol::Responses => "OPENAI_API_KEY",
         })
         .unwrap_or_default()
     }
@@ -423,6 +425,22 @@ pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[T
             }
             Ok(HttpRequest { url: format!("{base}/chat/completions"), headers: vec![("authorization".to_string(), format!("Bearer {key}")), ("content-type".to_string(), "application/json".to_string())], body })
         }
+        Protocol::Responses => {
+            let mut body = json!({
+                "model": profile.model.trim(),
+                "stream": true,
+                "instructions": format!("{}\n\n{}", ctx.instructions, ctx.documents),
+                "input": wire,
+                // Nothing is kept on the service: the conversation is sent whole each time, and the
+                // model's reasoning comes back encrypted so that it can be handed in again with it.
+                "store": false,
+                "include": ["reasoning.encrypted_content"],
+            });
+            if !tools.is_empty() {
+                body["tools"] = tools.iter().map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.input_schema})).collect();
+            }
+            Ok(HttpRequest { url: format!("{base}/responses"), headers: vec![("authorization".to_string(), format!("Bearer {key}")), ("content-type".to_string(), "application/json".to_string())], body })
+        }
     }
 }
 
@@ -440,7 +458,9 @@ pub struct ToolCall {
 /// One turn of the model, read to its end.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Turn {
-    /// The turn as it goes back on the wire; `Null` when the model sent nothing.
+    /// The turn as it goes back on the wire; `Null` when the model sent
+    /// nothing. One message for Claude and chat completions; for the
+    /// Responses API an array of output items (see `wire`).
     pub message: Value,
     pub calls: Vec<ToolCall>,
     /// The protocol's stop reason; "end" when the stream gave none.
@@ -448,6 +468,15 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// What the turn adds to the conversation on the wire.
+    pub fn wire(&self) -> Vec<Value> {
+        match &self.message {
+            Value::Null => vec![],
+            Value::Array(items) => items.clone(),
+            message => vec![message.clone()],
+        }
+    }
+
     /// Whether the calls may run: not when the turn was cut off or declined,
     /// since a call's arguments may then be half written.
     pub fn runnable(&self) -> bool {
@@ -529,6 +558,28 @@ impl TurnReader {
                     _ => {}
                 }
             }
+            Protocol::Responses => match value["type"].as_str() {
+                Some("response.output_text.delta") => {
+                    if let Some(text) = value["delta"].as_str() && !text.is_empty() { return Ok(Some(text.to_string())) }
+                }
+                // Each finished item whole: a message, a function call with its arguments, a reasoning item.
+                Some("response.output_item.done") => {
+                    let index = value["output_index"].as_u64().unwrap_or(self.blocks.len() as u64) as usize;
+                    while self.blocks.len() <= index { self.blocks.push(Value::Null) }
+                    self.blocks[index] = value["item"].clone();
+                }
+                Some("response.completed") => self.stop = "stop".into(),
+                Some("response.incomplete") => {
+                    self.stop = match value["response"]["incomplete_details"]["reason"].as_str() {
+                        Some("content_filter") => "content_filter",
+                        _ => "length",
+                    }
+                    .into();
+                }
+                Some("response.failed") => return Err(value["response"]["error"]["message"].as_str().unwrap_or("模型服务没有完成这次回答。").to_string()),
+                Some("error") => return Err(value["message"].as_str().unwrap_or("模型服务返回了错误。").to_string()),
+                _ => {}
+            },
             Protocol::OpenAI => {
                 let choice = &value["choices"][0];
                 if let Some(reason) = choice["finish_reason"].as_str() { self.stop = reason.to_string() }
@@ -586,6 +637,17 @@ impl TurnReader {
                 let message = if kept.is_empty() { Value::Null } else { json!({"role": "assistant", "content": kept}) };
                 Turn { message, calls, stop }
             }
+            Protocol::Responses => {
+                // The output items go back as they came, reasoning included: the service
+                // wants a function call handed in again together with the reasoning before it.
+                let items: Vec<Value> = self.blocks.into_iter().filter(|item| !item.is_null()).collect();
+                for item in items.iter().filter(|item| item["type"] == "function_call") {
+                    calls.push(ToolCall { id: item["call_id"].as_str().unwrap_or("").to_string(), name: item["name"].as_str().unwrap_or("").to_string(), args: parse(item["arguments"].as_str().unwrap_or("")) });
+                }
+                // The stream names no reason for stopping to call tools; the calls themselves say it.
+                let stop = if stop == "stop" && !calls.is_empty() { "tool_calls".to_string() } else { stop };
+                Turn { message: if items.is_empty() { Value::Null } else { Value::Array(items) }, calls, stop }
+            }
             Protocol::OpenAI => {
                 let mut wire_calls = vec![];
                 for (n, (id, name, arguments)) in self.calls.into_iter().enumerate() {
@@ -615,6 +677,7 @@ pub fn tool_results(protocol: Protocol, results: &[(String, String, bool)]) -> V
     match protocol {
         Protocol::Anthropic => vec![json!({"role": "user", "content": results.iter().map(|(id, output, failed)| json!({"type": "tool_result", "tool_use_id": id, "content": output, "is_error": failed})).collect::<Vec<_>>()})],
         Protocol::OpenAI => results.iter().map(|(id, output, _)| json!({"role": "tool", "tool_call_id": id, "content": output})).collect(),
+        Protocol::Responses => results.iter().map(|(id, output, _)| json!({"type": "function_call_output", "call_id": id, "output": output})).collect(),
     }
 }
 
@@ -687,6 +750,7 @@ pub fn plain_request(profile: &Profile, system: &str, prompt: &str) -> Result<Ht
             if let Some(body) = request.body.as_object_mut() { body.remove("cache_control"); }
         }
         Protocol::OpenAI => request.body["messages"][0]["content"] = json!(system),
+        Protocol::Responses => request.body["instructions"] = json!(system),
     }
     Ok(request)
 }
@@ -1084,6 +1148,63 @@ mod tests {
         assert_eq!(bad.message["tool_calls"][0]["function"]["arguments"], "{}");
         assert!(stop_note("refusal").is_some() && stop_note("end_turn").is_none() && stop_note("tool_use").is_none());
         assert_eq!(error_message(401, r#"{"error":{"message":"bad key"}}"#), "API Key 无效或没有权限（HTTP 401）：bad key");
+    }
+
+    #[test]
+    fn responses_turn_with_tools() {
+        let profile = Profile { protocol: Protocol::Responses, base_url: "https://api.openai.com/v1/".into(), api_key: "k".into(), model: "gpt-x".into(), ..Default::default() };
+        let ctx = Context { instructions: "I".into(), documents: "D".into(), ..Default::default() };
+        let mut wire = vec![user_message("哪篇提到 Chromium？")];
+        let r = chat_request(&profile, &ctx, &wire, &crate::tools::library_catalog()).unwrap();
+        assert_eq!(r.url, "https://api.openai.com/v1/responses");
+        assert!(r.headers.iter().any(|(k, v)| k == "authorization" && v == "Bearer k"));
+        assert_eq!((r.body["instructions"].as_str(), r.body["store"].as_bool(), r.body["include"][0].as_str(), r.body["stream"].as_bool()), (Some("I\n\nD"), Some(false), Some("reasoning.encrypted_content"), Some(true)));
+        assert_eq!(r.body["input"], json!([{"role": "user", "content": "哪篇提到 Chromium？"}]));
+        // A function tool is flat here: no `function` wrapper as in chat completions.
+        let tool = r.body["tools"].as_array().unwrap().iter().find(|t| t["name"] == "search_fulltext").unwrap();
+        assert_eq!((tool["type"].as_str(), tool["parameters"]["type"].as_str(), tool.get("function")), (Some("function"), Some("object"), None));
+        assert!(r.body.get("messages").is_none() && chat_request(&profile, &ctx, &wire, &[]).unwrap().body.get("tools").is_none());
+
+        let (text, turn) = read(
+            Protocol::Responses,
+            &[
+                "event: response.created",
+                r#"data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#,
+                r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"gAAA"}}"#,
+                r#"data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"先查"}"#,
+                r#"data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"全文。"}"#,
+                r#"data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"先查全文。","annotations":[]}]}}"#,
+                r#"data: {"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"query\":"}"#,
+                r#"data: {"type":"response.output_item.done","output_index":2,"item":{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"search_fulltext","arguments":"{\"query\":\"chromium\"}"}}"#,
+                r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#,
+            ],
+        );
+        assert_eq!((text.as_str(), turn.stop.as_str(), turn.runnable()), ("先查全文。", "tool_calls", true));
+        assert_eq!(turn.calls, [ToolCall { id: "call_1".into(), name: "search_fulltext".into(), args: Ok(json!({"query": "chromium"})) }]);
+        // Every item goes back as it came, the encrypted reasoning first, then the result by call id.
+        let items = turn.wire();
+        assert_eq!(items.iter().map(|item| item["type"].as_str().unwrap()).collect::<Vec<_>>(), ["reasoning", "message", "function_call"]);
+        assert_eq!(items[0]["encrypted_content"], "gAAA");
+        wire.extend(items);
+        wire.extend(tool_results(Protocol::Responses, &[("call_1".into(), "{\"total\":1}".into(), false)]));
+        let next = chat_request(&profile, &ctx, &wire, &[]).unwrap();
+        assert_eq!(next.body["input"].as_array().unwrap().len(), 5);
+        assert_eq!(next.body["input"][4], json!({"type": "function_call_output", "call_id": "call_1", "output": "{\"total\":1}"}));
+
+        // A plain answer, a cut-off one, and the two ways a failure is reported.
+        let (text, plain) = read(Protocol::Responses, &[r#"data: {"type":"response.output_text.delta","delta":"Hi"}"#, r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}}"#, r#"data: {"type":"response.completed","response":{}}"#]);
+        assert_eq!((text.as_str(), plain.stop.as_str(), plain.calls.len(), plain.wire().len()), ("Hi", "stop", 0, 1));
+        let (_, cut) = read(Protocol::Responses, &[r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c","name":"get_paper","arguments":"{\"id\":"}}"#, r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#]);
+        assert!(!cut.runnable() && cut.calls[0].args.is_err() && stop_note(&cut.stop).is_some());
+        assert_eq!(TurnReader::new(Protocol::Responses).line(r#"data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}"#), Err("boom".into()));
+        assert_eq!(TurnReader::new(Protocol::Responses).line(r#"data: {"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#), Err("slow down".into()));
+        let (_, nothing) = read(Protocol::Responses, &[]);
+        assert_eq!((nothing.message.clone(), nothing.wire().len(), nothing.stop.as_str()), (Value::Null, 0, "end"));
+
+        let plain = plain_request(&profile, "S", "Q").unwrap();
+        assert_eq!((plain.body["instructions"].clone(), plain.body["input"].clone()), (json!("S"), json!([{"role": "user", "content": "Q"}])));
+        // One turn of the other protocols is one message.
+        assert_eq!(Turn { message: json!({"role": "assistant", "content": "x"}), calls: vec![], stop: "stop".into() }.wire().len(), 1);
     }
 
     #[test]

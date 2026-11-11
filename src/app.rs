@@ -1516,7 +1516,7 @@ impl Workspace {
                             false
                         }
                         ChatEvent::Done(turn) => {
-                            if !turn.message.is_null() { chat.wire.push(turn.message.clone()) }
+                            chat.wire.extend(turn.wire());
                             if turn.calls.is_empty() {
                                 chat.note = ai::stop_note(&turn.stop).unwrap_or_default().to_string();
                                 chat.end_run();

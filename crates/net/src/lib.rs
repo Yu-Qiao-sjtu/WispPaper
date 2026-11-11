@@ -297,6 +297,23 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
+    fn responses_stream() {
+        let (base, server) = serve(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"根尖 [P1]\"}\n\n\
+event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"根尖 [P1]\"}]}}\n\n\
+event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        );
+        let (events, request) = ask(format!("{base}/v1"), Protocol::Responses);
+        assert_eq!(events[0], ChatEvent::Text("根尖 [P1]".into()));
+        assert!(matches!(&events[1], ChatEvent::Done(turn) if turn.stop == "stop" && turn.wire()[0]["id"] == "msg_1"));
+        let received = server.join().unwrap();
+        assert!(received.starts_with("POST /v1/responses "), "{received}");
+        assert!(received.to_lowercase().contains("authorization: bearer test-key"));
+        assert_eq!((request.body["store"].as_bool(), request.body["input"][0]["content"].as_str()), (Some(false), Some("你好")));
+    }
+
+    #[test]
     fn openai_stream_and_errors() {
         let (base, server) = serve("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
         let (events, _) = ask(format!("{base}/v1"), Protocol::OpenAI);
