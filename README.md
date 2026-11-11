@@ -17,6 +17,7 @@
 </p>
 
 <p align="center">
+  <a href="https://xuzhougeng.github.io/WispPaper/"><b>主页</b></a> ·
   <a href="#安装"><b>安装</b></a> ·
   <a href="#功能">功能</a> ·
   <a href="docs/TUTORIAL.md">教程</a> ·

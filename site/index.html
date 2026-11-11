@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wisp Paper：本地优先的文献库</title>
+<meta name="description" content="本地优先的文献库。按检索式成批导入，让助手逐篇读过、给出带原文依据的建议，每一篇收不收由你确认；回答带出处，出处能点开。">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F5F4F1" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1A1B1D" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Wisp Paper：文献是你的，判断也是你的">
+<meta property="og:description" content="本地优先的文献库：成批导入，助手逐篇给出带原文依据的建议，由你确认；回答带出处，出处能点开。">
+<meta property="og:url" content="https://xuzhougeng.github.io/WispPaper/">
+<meta property="og:image" content="https://xuzhougeng.github.io/WispPaper/img/library.png">
+<link rel="icon" href="app-icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="app-icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">跳到正文</a>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="#top"><img src="app-icon.svg" width="26" height="26" alt=""><span>Wisp Paper</span></a>
+    <nav aria-label="本页的章节">
+      <a href="#case">案例</a>
+      <a href="#ideas">理念</a>
+      <a href="#tools">工具</a>
+      <a href="#download">下载</a>
+    </nav>
+    <a class="gh" href="https://github.com/xuzhougeng/WispPaper">GitHub<span aria-hidden="true"> ↗</span></a>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero wrap" id="top">
+  <svg class="wisp" viewBox="168 222 184 146" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="wisp-ink" x1="0" y1="1" x2="1" y2="0">
+        <stop offset="0" stop-color="#5B4BC4"/>
+        <stop offset="1" stop-color="#A78BFA"/>
+      </linearGradient>
+    </defs>
+    <path class="wisp-thin" pathLength="1" d="M200 262c18-30 38-36 54-16s34 12 46-18"/>
+    <path class="wisp-thick" pathLength="1" d="M186 348c22-66 56-84 80-48s50 18 66-52"/>
+  </svg>
+
+  <p class="kicker">本地优先的文献库<span class="kicker-version" data-version hidden></span></p>
+  <h1>文献是你的，<br>判断也是你的。</h1>
+
+  <div class="hero-cols">
+    <div class="hero-pitch">
+      <p class="lead">Wisp Paper 把文献和 PDF 留在你的电脑上。按检索式成批导入，让助手逐篇读过，给出带原文依据的建议；每一篇收不收，由你确认。之后向文献库提问，回答里的出处点开就是那一页。</p>
+      <div class="cta">
+        <a class="btn primary" id="hero-download" href="#download">下载</a>
+        <a class="btn" href="#case">看一次完整的运行</a>
+      </div>
+      <p class="fine">macOS、Windows、Linux　·　MIT 许可　·　不需要账号</p>
+    </div>
+
+    <aside class="abstract" aria-label="摘要">
+      <p><b>摘要</b>　我们从一个空的 Wisp Paper 开始，围绕「植物单细胞转录组」建了一个文献库：助手拟出 6 条检索式 <a class="cite" href="#step-c" data-step="c">图 3c</a>，选用 2 条，从 PubMed 和 Europe PMC 导入 355 篇 <a class="cite" href="#step-d" data-step="d">图 3d</a>；助手用 4 分 40 秒读完全部摘要并给出建议 <a class="cite" href="#fig2">图 2</a>；确认之后留下 313 篇，就它们提了一个问题 <a class="cite" href="#step-h" data-step="h">图 3h</a>。全程约 15 分钟。这一页记下这次运行，以及这个工具为什么这样设计。</p>
+      <p class="keywords"><b>关键词</b>　本地优先　鲸吞法　带出处的回答　Rust + GPUI</p>
+    </aside>
+  </div>
+
+  <figure class="shot" id="fig1">
+    <img src="img/library.png" width="2720" height="1720" alt="Wisp Paper 的文献库页面：左侧是视图和标签，中间是文献列表，右侧是所选文献的详情和笔记。" fetchpriority="high">
+    <figcaption><b>图 1</b>　文献库页面。左侧是视图和标签，中间是文献列表，右侧是所选文献的详情和笔记。</figcaption>
+  </figure>
+</section>
+
+<!-- §1 -->
+<section class="sec wrap" id="case">
+  <div class="rail" aria-hidden="true"><span class="no">§1</span><span class="v">案例</span></div>
+  <div class="sec-main">
+    <h2><span class="nb">一次真实的运行：</span><span class="nb">十五分钟，</span><span class="nb">从空白到 313 篇</span></h2>
+    <p class="sec-lead">下面的数字和截图来自 2026 年 11 月 10 日在 macOS 上的一次运行，主题是植物单细胞与单核转录组测序。数据库每天在变，模型每次的回答也不一样，你照做时数字会有出入，步骤是一样的。</p>
+
+    <figure class="flow" id="fig2">
+      <ol class="ledger">
+        <li><b>6</b><span>条检索式<small>助手拟的，逐条试检索</small></span></li>
+        <li><b>2</b><span>条选用<small>PubMed 和 Europe PMC 各一条</small></span></li>
+        <li><b>400</b><span>篇取回<small>每条取最新的 200 篇</small></span></li>
+        <li><b>45</b><span>篇重复<small>按 DOI、PMID、题目跳过</small></span></li>
+        <li class="sum"><b>355</b><span>篇待判断<small>交给助手先读一遍</small></span></li>
+      </ol>
+      <div class="bar" role="img" aria-label="助手对 355 篇的建议：已纳入 257 篇，相关 52 篇，证据不足 4 篇，不相关 42 篇">
+        <span class="seg ok" style="flex-grow:257"><b>257</b><i>已纳入</i></span>
+        <span class="seg info" style="flex-grow:52"><b>52</b><i>相关</i></span>
+        <span class="seg warn" style="flex-grow:4"></span>
+        <span class="seg bad" style="flex-grow:42"><b>42</b><i>不相关</i></span>
+      </div>
+      <ul class="legend">
+        <li><span class="chip ok">已纳入 257</span>符合筛选标准</li>
+        <li><span class="chip info">相关 52</span>和主题有关，但不满足收录条件，留作参考</li>
+        <li><span class="chip warn">证据不足 4</span>摘要里看不出来，其中 2 篇没有摘要可读</li>
+        <li><span class="chip bad">不相关 42</span>不属于这个主题</li>
+      </ul>
+      <p class="after">确认时，257 篇已纳入和 42 篇不相关按建议整组采纳，剩下的 56 篇留着自己看：这些正是值得看一眼的。不相关的不再列出，列表里是 <b>313</b> 篇。</p>
+      <figcaption><b>图 2</b>　355 篇的去向。色条是助手 4 分 40 秒里给出的建议；它们只是建议，收录判断是之后由人确认的。</figcaption>
+    </figure>
+
+    <div class="steps" id="fig3">
+      <div class="steps-list" role="tablist" aria-label="这次运行的八个步骤">
+        <button role="tab" id="tab-a" aria-controls="step-a"><i>a</i><span>配置模型</span><time>1 分钟</time></button>
+        <button role="tab" id="tab-b" aria-controls="step-b"><i>b</i><span>新建文献库</span><time>1 分钟</time></button>
+        <button role="tab" id="tab-c" aria-controls="step-c"><i>c</i><span>让助手拟检索式</span><time>约 1 分钟</time></button>
+        <button role="tab" id="tab-d" aria-controls="step-d"><i>d</i><span>保存并导入</span><time>约 40 秒</time></button>
+        <button role="tab" id="tab-e" aria-controls="step-e"><i>e</i><span>让助手筛选</span><time>4 分 40 秒</time></button>
+        <button role="tab" id="tab-f" aria-controls="step-f"><i>f</i><span>确认收录判断</span><time>看你读多细</time></button>
+        <button role="tab" id="tab-g" aria-controls="step-g"><i>g</i><span>读翻译的摘要</span><time>每篇几秒</time></button>
+        <button role="tab" id="tab-h" aria-controls="step-h"><i>h</i><span>向文献库提问</span><time>约 1 分半</time></button>
+      </div>
+
+      <div class="steps-panels">
+        <article role="tabpanel" id="step-a" aria-labelledby="tab-a">
+          <h3><i>a</i>配置模型</h3>
+          <p>Wisp Paper 不自带模型。在「设置 › AI」里填一个你自己的模型服务：Claude API、OpenAI 兼容的 chat/completions，或 OpenAI 的 Responses。没有保存按钮，改了就存。提问、批量筛选、翻译可以各用一个模型，这次把翻译交给了一个不怎么思考的小模型。</p>
+          <figure class="shot">
+            <img src="img/02-settings-model.jpg" width="1372" height="870" loading="lazy" alt="设置里展开的模型条目：名称、接口、服务地址、模型、API Key、思考、代理。">
+            <figcaption><b>图 3a</b>　一个模型条目。右上角的「还缺 API Key」消失，说明可以用了。</figcaption>
+          </figure>
+        </article>
+
+        <article role="tabpanel" id="step-b" aria-labelledby="tab-b">
+          <h3><i>b</i>新建文献库</h3>
+          <p>名称之外，写下主题：这个库收什么、关心什么问题。它不只是备注，助手拟检索式、判断收录、回答问题时都会读到，所以值得写具体。选一个标识色，之后这个库的强调色都是它。</p>
+          <figure class="shot">
+            <img src="img/04-new-library.jpg" width="1372" height="870" loading="lazy" alt="新建文献库对话框：名称、主题和标识色。">
+            <figcaption><b>图 3b</b>　名称「植物单细胞转录组」，主题写了物种、器官、发育轨迹、胁迫响应和方法学问题。</figcaption>
+          </figure>
+        </article>
+
+        <article role="tabpanel" id="step-c" aria-labelledby="tab-c">
+          <h3><i>c</i>让助手拟检索式</h3>
+          <p>助手为 PubMed 和 Europe PMC 各拟了三条取向不同的检索式，并立刻逐条试检索：数据库里命中多少篇，最新的几篇是什么。宽的那条命中上千篇，最新的结果里混着骨折愈合；方法学那条命中的几乎都是植物单细胞研究。看标题，不看检索式写得漂不漂亮。</p>
+          <figure class="shot">
+            <img src="img/07-guide-queries.jpg" width="1098" height="696" loading="lazy" alt="助手拟出的检索式，每条带一句说明、检索式全文和试检索到的最新文献。">
+            <figcaption><b>图 3c</b>　6 条检索式，命中从 205 篇到 1212 篇。试检索不往文献库里写任何东西。</figcaption>
+          </figure>
+        </article>
+
+        <article role="tabpanel" id="step-d" aria-labelledby="tab-d">
+          <h3><i>d</i>保存并导入</h3>
+          <p>选用 2 条，每条取回最新的 200 篇。两个数据库有 45 篇重叠，按 DOI、PMID、题目去重后是 355 篇，全部是「待判断」。这是有意的：先宽一些地导入，再逐篇判断。导错了，每一批都可以整批撤销。</p>
+          <figure class="shot">
+            <img src="img/09-searches-imported.jpg" width="1372" height="870" loading="lazy" alt="检索与导入页：两条保存的检索式，各自的上次运行结果，以及下面的导入记录。">
+            <figcaption><b>图 3d</b>　PubMed 新增 200 篇；Europe PMC 新增 155 篇，跳过已有的 45 篇。</figcaption>
+          </figure>
+        </article>
+
+        <article role="tabpanel" id="step-e" aria-labelledby="tab-e">
+          <h3><i>e</i>让助手筛选</h3>
+          <p>写下筛选标准：什么样的文献应当收进这个库，什么样的不收。助手 8 篇同时读，有 PDF 读全文，这里都只有摘要。每一篇给出建议、理由，和一句逐字引自原文的依据。中途可以停，没读的留到下一轮。</p>
+          <figure class="shot">
+            <img src="img/11-screen-running.jpg" width="1098" height="696" loading="lazy" alt="筛选进行到 118 / 355：进度条、正在阅读的 8 篇，下面是已有建议的文献。">
+            <figcaption><b>图 3e</b>　进行到 118 / 355。进度条下面是正在读的 8 篇，读完的带着建议排进队列。</figcaption>
+          </figure>
+        </article>
+
+        <article role="tabpanel" id="step-f" aria-labelledby="tab-f">
+          <h3><i>f</i>确认收录判断</h3>
+          <p>助手不会改任何一篇文献的收录判断，改的人只有你。点开一篇，看它的理由和依据，采纳或者另选。一组看过几篇、觉得靠谱之后，可以整组采纳，会先问一遍。</p>
+          <figure class="shot">
+            <img src="img/13-screen-reason.jpg" width="1372" height="870" loading="lazy" alt="点开的一篇：助手认为单细胞蛋白质组研究不满足收录条件，建议「相关」，下面是引自摘要的原句和四个判断按钮。">
+            <figcaption><b>图 3f</b>　一篇单细胞蛋白质组研究：没有转录组数据，助手建议「相关」而不是「已纳入」。</figcaption>
+          </figure>
+        </article>
+
+        <article role="tabpanel" id="step-g" aria-labelledby="tab-g">
+          <h3><i>g</i>读翻译的摘要</h3>
+          <p>摘要旁边的「翻译」把题目和摘要译成中文，原文留在下面对照。打开之后，切到别的文献也会自动翻译。译过的保存在文献库里，同一段文字只请求一次。</p>
+          <figure class="shot">
+            <img src="img/16-translate.jpg" width="1372" height="870" loading="lazy" alt="文献详情：摘要上方是译文，题目译为「玉米根尖铁缺乏响应的单细胞转录解码」。">
+            <figcaption><b>图 3g</b>　译文在上，原文在下。目标语言和术语译法可以在设置里写。</figcaption>
+          </figure>
+        </article>
+
+        <article role="tabpanel" id="step-h" aria-labelledby="tab-h">
+          <h3><i>h</i>向文献库提问</h3>
+          <p>范围是当前列表的 313 篇：181 篇给了完整记录，放不下的 132 篇只给题目。助手先自己调用工具读了 5 篇直接比较两条技术路线的文献，再作答。它也写明了这几篇没有保存 PDF，所以这次不引页码：它只读了摘要。</p>
+          <figure class="shot">
+            <img src="img/17-ask.jpg" width="1372" height="870" loading="lazy" alt="助手的回答：一段总述，接着是物种和器官覆盖的表格，每格后面是 P 开头的出处；回答下面是出处列表。">
+            <figcaption><b>图 3h</b>　回答按 Markdown 排版，每个结论后面跟着出处；下面先列 8 个，其余的折起来。</figcaption>
+          </figure>
+        </article>
+      </div>
+    </div>
+
+    <div class="try">
+      <div class="try-text">
+        <h3>这一篇，你怎么判断？</h3>
+        <p>右边是那次运行里的一条真实建议。筛选标准写的是：收录实际产生或分析了单细胞、单核<strong>转录组</strong>数据的植物研究。这篇做的是单细胞<strong>蛋白质组</strong>。</p>
+        <p>助手建议的那个按钮是实心的，点它就是采纳；你也可以另选。</p>
+      </div>
+      <figure class="demo" id="fig4">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <strong lang="en">Single-cell proteomics of Arabidopsis leaf mesophyll reveals dynamic protein responses to water-deficit stress</strong>
+              <span class="byline" lang="en">Fulcher, James M 等　·　2026　·　Genome biology</span>
+            </div>
+            <span class="chip info" id="screen-chip">建议：相关 · 把握 99%</span>
+          </div>
+          <p class="reason">研究以拟南芥叶肉细胞为对象，建立单细胞蛋白质组学流程，并分析水分亏缺胁迫下 117 个原生质体的蛋白丰度变化。摘要未报告实际产生或分析 scRNA-seq 或 snRNA-seq 数据，因此不满足收录条件，但其原生质体制备与植物单细胞胁迫响应研究具有参考价值。</p>
+          <blockquote lang="en">“Here, we present a single-cell proteomics workflow for plant cells …”<cite>摘要</cite></blockquote>
+          <p class="card-meta">只读了摘要</p>
+          <div class="choices" role="group" aria-label="你的判断">
+            <button type="button" data-value="included" data-label="已纳入" data-tone="ok">已纳入</button>
+            <button type="button" data-value="excluded" data-label="相关" data-tone="info" class="suggested">采纳：相关</button>
+            <button type="button" data-value="uncertain" data-label="证据不足" data-tone="warn">证据不足</button>
+            <button type="button" data-value="irrelevant" data-label="不相关" data-tone="bad">不相关</button>
+          </div>
+          <p class="verdict" aria-live="polite"><span id="screen-verdict">还没有判断。在你点之前，这篇文献一直是「待判断」。</span></p>
+        </div>
+        <figcaption><b>图 4</b>　一条建议和四个按钮。理由后面那句原文是逐字引的，引不出原文的理由不会被当作依据。</figcaption>
+      </figure>
+    </div>
+
+    <p class="more"><a href="https://github.com/xuzhougeng/WispPaper/blob/main/docs/TUTORIAL.md">完整的教程：每一步的截图、实际填的内容和数字<span aria-hidden="true"> →</span></a></p>
+  </div>
+</section>
+
+<!-- §2 -->
+<section class="sec wrap" id="ideas">
+  <div class="rail" aria-hidden="true"><span class="no">§2</span><span class="v">理念</span></div>
+  <div class="sec-main">
+    <h2>为什么这样设计</h2>
+    <p class="sec-lead">七条我们自己照着做的规则。每一条后面写着它在产品里落在哪儿，可以去核对。</p>
+
+    <ol class="theses">
+      <li class="thesis">
+        <span class="num">01</span>
+        <div>
+          <h3>文献是你的</h3>
+          <p>不需要账号，没有云端。每个文献库是「文档/WispPaper」下的一个文件夹，数据库、PDF 和自定义词条都在里面，可以单独备份，也可以整个拷到别处继续用。</p>
+        </div>
+        <p class="proof"><b>在产品里</b>附件记的是相对于文献库文件夹的路径。哪些内容会离开本机、发给谁，在<a href="https://github.com/xuzhougeng/WispPaper/blob/main/docs/DATA.md">数据与隐私</a>里逐条列出。</p>
+      </li>
+
+      <li class="thesis">
+        <span class="num">02</span>
+        <div>
+          <h3>助手提议，人来决定</h3>
+          <p>助手读得快，但收不收是你的判断。它给出建议、理由和把握，不改任何一篇文献的收录状态；整组采纳之前也会先问一遍。</p>
+        </div>
+        <p class="proof"><b>在产品里</b>从命令行或 MCP 接进来的外部 agent 只能提建议（<code>suggest_screening</code>），没有一个工具能改写收录判断。</p>
+      </li>
+
+      <li class="thesis">
+        <span class="num">03</span>
+        <div>
+          <h3>说话要有出处，出处要能点开</h3>
+          <p>筛选的理由必须带一句逐字引自摘要或全文的原文，引不出来的不算依据。回答里的 <code>[P3 p.5]</code> 点开就是那篇文献的 PDF，跳到那一页，所引的句子在页面上高亮；找不到的时候会明说。</p>
+        </div>
+        <p class="proof"><b>在产品里</b>没有 PDF 时助手只读得到摘要，它会说自己只读了摘要，不编页码。</p>
+
+        <figure class="demo cite-demo" id="fig5">
+          <div class="cite-cols">
+            <div class="chat">
+              <p class="q">移除的文献库去了哪里？换一台电脑还能接着用吗？</p>
+              <div class="a">
+                <p>没有被删除。移除文献库或附件，只是把它移到同一目录下的 <code>removed/</code> <button type="button" class="cite" data-quote="q1">P1 p.1 “只移动，不删除”</button>。换电脑也可以：附件记的是相对路径，整个文件夹拷过去就能接着用 <button type="button" class="cite" data-quote="q2">P1 p.1 “整个文件夹可以拷到别处继续用”</button>。</p>
+                <p class="sources"><span>P1　·　数据与隐私</span></p>
+              </div>
+            </div>
+            <div class="sheet" role="group" aria-label="《数据与隐私》第 1 页">
+              <h4>数据与隐私</h4>
+              <p>文献库在「文档/WispPaper」下，每个文献库一个文件夹，内含 library.json、wisp-paper.sqlite 和 papers/。</p>
+              <p>被移除的文献库、附件，放在同目录下的 removed/（<mark id="q1">只移动，不删除</mark>）。</p>
+              <p>附件在数据库里记的是相对于文献库文件夹的路径，所以<mark id="q2">整个文件夹可以拷到别处继续用</mark>。</p>
+              <p>API Key 以明文保存在 settings.json。留空则读取环境变量。</p>
+              <span class="pageno">1</span>
+            </div>
+          </div>
+          <figcaption><b>图 5</b>　点一下回答里的出处。这里右边是本项目的《数据与隐私》；在应用里，它是你存的 PDF。</figcaption>
+        </figure>
+      </li>
+
+      <li class="thesis">
+        <span class="num">04</span>
+        <div>
+          <h3>先鲸吞，再细读</h3>
+          <p>与其一开始就把检索式写得很窄、担心漏掉什么，不如先宽一些地成批导入，去重，让助手逐篇过一遍，把值得自己看的那几十篇留给你。我们管这个叫鲸吞法。</p>
+        </div>
+        <p class="proof"><b>在产品里</b>每次导入是一个批次，可以整批撤销，处理过的文献会保留。保存的检索式可以每 6 小时、每天或每周自己运行。</p>
+      </li>
+
+      <li class="thesis">
+        <span class="num">05</span>
+        <div>
+          <h3>什么都不会真的丢</h3>
+          <p>移除一个文献库或附件，只是把它移到 <code>removed/</code>。删掉的文献进回收站，可以恢复。</p>
+        </div>
+        <p class="proof"><b>在产品里</b>回收站里的文献还留在库里，继续挡住同一篇被再次导入：你判断过不要的，不会下次同步又回来。</p>
+      </li>
+
+      <li class="thesis">
+        <span class="num">06</span>
+        <div>
+          <h3>原生，不是网页</h3>
+          <p>整个界面由 Rust 和 GPUI 在 GPU 上绘制，没有 WebView，没有 Electron。PDF 用纯 Rust 的 hayro 渲染，不依赖系统的 PDF 库。</p>
+        </div>
+        <p class="proof"><b>在产品里</b>浅色和深色两套界面，每个文献库有自己的标识色，快捷键都可以改。</p>
+      </li>
+
+      <li class="thesis">
+        <span class="num">07</span>
+        <div>
+          <h3>一张工具表，三个入口</h3>
+          <p>窗口里的助手、命令行、MCP 用的是同一张工具表。一条规则只写在一处，所以无论从哪里进来，能做的和不能做的是一样的。</p>
+        </div>
+        <p class="proof"><b>在产品里</b>见下一节。</p>
+      </li>
+    </ol>
+
+    <div class="limits">
+      <h3>目前的边界</h3>
+      <ul>
+        <li>还在早期，变化很快。</li>
+        <li>界面只有中文。</li>
+        <li>助手的部分需要你自己的模型服务；API Key 以明文保存在本机的 <code>settings.json</code>。</li>
+        <li>每次运行一条检索式，最多取回最新的 200 篇。</li>
+        <li>对话不保存，关闭文献库即清空。</li>
+        <li>应用不会自己更新，只提示有新版本。</li>
+        <li>Linux 版没有签名，也没有在真机上测试过。</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- §3 -->
+<section class="sec wrap" id="tools">
+  <div class="rail" aria-hidden="true"><span class="no">§3</span><span class="v">工具</span></div>
+  <div class="sec-main">
+    <h2><span class="nb">窗口之外：</span><span class="nb"><span lang="en">wisp</span> 与 MCP</span></h2>
+    <p class="sec-lead"><code>wisp</code> 是不开窗口的入口，随安装包附带。它读写和应用同一个数据目录，应用开着时也能用。每个工具既是一个子命令，也是一个 MCP 工具，输出是 JSON。</p>
+
+    <div class="code-cols">
+      <figure class="code">
+        <figcaption>命令行</figcaption>
+<pre><code><span class="p">$</span> wisp list_libraries
+<span class="p">$</span> wisp list_papers -l 植物单细胞转录组 --query protoplast --limit 10
+<span class="p">$</span> wisp search_fulltext "10x Genomics Chromium"
+<span class="p">$</span> wisp read_fulltext &lt;文献 ID&gt; --page 3
+<span class="p">$</span> wisp sync_searches   <span class="c"># 交给 cron、launchd 或任务计划程序</span>
+<span class="p">$</span> wisp help            <span class="c"># 命令一览</span></code></pre>
+      </figure>
+      <figure class="code">
+        <figcaption>交给支持 MCP 的 AI 客户端</figcaption>
+<pre><code>{
+  "mcpServers": {
+    "wisp-paper": {
+      "command": "/path/to/wisp",
+      "args": ["mcp"]
+    }
+  }
+}</code></pre>
+      </figure>
+    </div>
+
+    <table class="tool-table">
+      <caption><b>表 1</b>　工具一览。带<span class="w">写</span>的会改动文献库，<code>wisp mcp --read-only</code> 不提供它们。</caption>
+      <tbody>
+        <tr><th scope="row"><code>list_libraries</code></th><td>所有文献库的 ID、名称、主题和文献数量</td></tr>
+        <tr><th scope="row"><code>library_status</code></th><td>一个库的概况：各状态的数量、自定义词条</td></tr>
+        <tr><th scope="row"><code>list_papers</code></th><td>搜索、筛选、翻页，规则与界面上的列表相同</td></tr>
+        <tr><th scope="row"><code>get_paper</code></th><td>一篇文献的完整记录、词条和附件</td></tr>
+        <tr><th scope="row"><code>search_fulltext</code></th><td>在已保存的全文里找短语，返回页码和逐字片段</td></tr>
+        <tr><th scope="row"><code>read_fulltext</code></th><td>按页读取全文，一次最多 8 页</td></tr>
+        <tr><th scope="row"><code>find_citations</code></th><td>为一段文字逐句找出库里可能支持它的文献</td></tr>
+        <tr><th scope="row"><code>search_online</code></th><td>在 PubMed、Europe PMC、Crossref 或 arXiv 试运行一个检索式，不写入</td></tr>
+        <tr><th scope="row"><code>list_searches</code></th><td>保存的检索式</td></tr>
+        <tr><th scope="row"><code>save_search</code><span class="w">写</span></th><td>保存一个检索式</td></tr>
+        <tr><th scope="row"><code>remove_search</code><span class="w">写</span></th><td>删除一个检索式</td></tr>
+        <tr><th scope="row"><code>run_search</code><span class="w">写</span></th><td>运行并导入，已有的文献跳过，返回批次号</td></tr>
+        <tr><th scope="row"><code>list_imports</code></th><td>导入记录</td></tr>
+        <tr><th scope="row"><code>undo_import</code><span class="w">写</span></th><td>整批撤销一次导入，处理过的文献保留</td></tr>
+        <tr><th scope="row"><code>sync_searches</code><span class="w">写</span></th><td>运行到期的检索式</td></tr>
+        <tr><th scope="row"><code>suggest_screening</code><span class="w">写</span></th><td>为一篇文献提出收录建议；不改变收录判断，由你在筛选页确认</td></tr>
+      </tbody>
+    </table>
+
+    <p class="more"><a href="https://github.com/xuzhougeng/WispPaper/blob/main/docs/CLI.md">命令行与 MCP 的完整说明<span aria-hidden="true"> →</span></a></p>
+  </div>
+</section>
+
+<!-- §4 -->
+<section class="sec wrap" id="download">
+  <div class="rail" aria-hidden="true"><span class="no">§4</span><span class="v">下载</span></div>
+  <div class="sec-main">
+    <h2>下载 Wisp Paper</h2>
+    <p class="sec-lead" id="release-line">最新版本在<a href="https://github.com/xuzhougeng/WispPaper/releases/latest">发布页</a>。</p>
+
+    <div class="dl-grid">
+      <article class="dl" data-os="mac">
+        <h3>macOS</h3>
+        <p class="dl-req">Apple 芯片与 Intel 通用</p>
+        <a class="btn primary" data-asset="mac" href="https://github.com/xuzhougeng/WispPaper/releases/latest">去发布页下载</a>
+        <p class="dl-file" data-file="mac">WispPaper-v<i>版本</i>-macos-universal.dmg</p>
+        <p class="dl-note">Developer ID 签名并经 Apple 公证。打开后把 Wisp Paper 拖进「应用程序」，直接运行。</p>
+      </article>
+      <article class="dl" data-os="win">
+        <h3>Windows</h3>
+        <p class="dl-req">Windows 10 / 11，x64</p>
+        <a class="btn primary" data-asset="win" href="https://github.com/xuzhougeng/WispPaper/releases/latest">去发布页下载</a>
+        <p class="dl-file" data-file="win">WispPaper-v<i>版本</i>-windows-x64.zip</p>
+        <p class="dl-note">解压后运行 <code>WispPaper.exe</code>。两个 exe 都带 Authenticode 签名。</p>
+      </article>
+      <article class="dl" data-os="linux">
+        <h3>Linux</h3>
+        <p class="dl-req">x64</p>
+        <a class="btn primary" data-asset="linux" href="https://github.com/xuzhougeng/WispPaper/releases/latest">去发布页下载</a>
+        <p class="dl-file" data-file="linux">WispPaper-v<i>版本</i>-linux-x64.tar.gz</p>
+        <p class="dl-note">解压后运行 <code>wisp-paper</code>。没有签名，也没有在真机上测试过。</p>
+      </article>
+    </div>
+
+    <div class="dl-foot">
+      <div>
+        <h3>装好之后</h3>
+        <ul>
+          <li>命令行工具 <code>wisp</code> 随包附带：Windows 和 Linux 在主程序旁边，macOS 在 <code>Wisp Paper.app/Contents/MacOS/wisp</code>。</li>
+          <li>收集、整理、PDF 和导出不需要模型。提问、建库向导、筛选和翻译需要在「设置 › AI」里配置你自己的模型服务。</li>
+          <li>发布页里的 <code>SHA256SUMS</code> 是各个文件的校验和。</li>
+        </ul>
+      </div>
+      <figure class="code">
+        <figcaption>从源码构建（需要 Rust；Windows 上还需要 MSVC 构建工具）</figcaption>
+<pre><code><span class="p">$</span> git clone https://github.com/xuzhougeng/WispPaper
+<span class="p">$</span> cd WispPaper
+<span class="p">$</span> cargo run --release</code></pre>
+      </figure>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-in">
+    <div class="refs">
+      <h2>参考</h2>
+      <ol>
+        <li><a href="https://github.com/xuzhougeng/WispPaper/blob/main/docs/TUTORIAL.md">教程：从零建一个「植物单细胞转录组」文献库</a></li>
+        <li><a href="https://github.com/xuzhougeng/WispPaper/blob/main/docs/FEATURES.md">功能详解：每个页面能做什么</a></li>
+        <li><a href="https://github.com/xuzhougeng/WispPaper/blob/main/docs/DATA.md">数据与隐私：文件放在哪里，哪些数据会离开本机</a></li>
+        <li><a href="https://github.com/xuzhougeng/WispPaper/blob/main/docs/CLI.md">命令行与 MCP</a></li>
+        <li><a href="https://github.com/xuzhougeng/WispPaper/blob/main/docs/DEVELOPMENT.md">开发：构建、测试、代码结构</a></li>
+        <li><a href="https://github.com/xuzhougeng/WispPaper/issues">问题与想法：Issues</a></li>
+      </ol>
+    </div>
+    <div class="colophon">
+      <p><b>致谢</b>　文献部分移植自 <a href="https://github.com/xuzhougeng/BiblioCell">BiblioCell</a>，应用结构和回答里的 Markdown 读法参考 <a href="https://github.com/s1dashu/quiet-md">quiet-md</a>。界面由 <a href="https://www.gpui.rs/">GPUI</a> 绘制，PDF 由 <a href="https://github.com/LaurenzV/hayro">hayro</a> 渲染。</p>
+      <p><b>许可</b>　代码以 <a href="https://github.com/xuzhougeng/WispPaper/blob/main/LICENSE">MIT</a> 许可发布。</p>
+      <p><b>关于这一页</b>　几个静态文件，没有统计脚本，不加载任何第三方资源。</p>
+    </div>
+  </div>
+</footer>
+
+<script src="site.js" defer></script>
+</body>
+</html>
