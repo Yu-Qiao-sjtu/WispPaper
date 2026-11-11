@@ -26,6 +26,8 @@ pub struct LibraryInfo {
     /// What a paper must be about to be included, in the owner's words: the
     /// assistant screens against it. Empty means the topic alone.
     pub criteria: String,
+    /// Run the enabled saved searches on their own every this many hours; 0 is never.
+    pub auto_sync_hours: u32,
     pub created_at: String,
     /// Last time the library was opened: the home page lists the latest first.
     pub opened_at: String,
