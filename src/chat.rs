@@ -10,6 +10,14 @@ use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
 use wisp_core::ai;
 
+/// The sources shown under an answer before the rest is asked for.
+const SOURCES_SHOWN: usize = 8;
+
+/// The shell of a chip under an answer: a source, or the one that shows the rest.
+fn source_chip(id: SharedString, max_width: f32) -> Stateful<Div> {
+    div().id(id).flex().items_center().gap(px(4.)).max_w(px(max_width)).h(px(24.)).px(px(8.)).rounded(px(6.)).border_1().border_color(Theme::line()).text_size(px(12.)).cursor_pointer().hover(|s| s.bg(Theme::hover()).border_color(Theme::accent()))
+}
+
 impl Workspace {
     pub fn render_chat(&mut self, about_paper: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let lib = self.lib.as_ref().unwrap();
@@ -75,10 +83,13 @@ impl Workspace {
             };
             let waiting = content.is_empty();
             // Each cited label, once, in the order the answer uses it.
-            let chips: Vec<AnyElement> = chat
-                .ctx
-                .iter()
-                .flat_map(|ctx| ai::citations(content).into_iter().filter_map(move |cited| ctx.sources.iter().find(|s| s.label == cited.label).map(|s| (s.clone(), cited.page, cited.quote))))
+            let cited: Vec<(ai::Source, Option<usize>, String)> = chat.ctx.iter().flat_map(|ctx| ai::citations(content).into_iter().filter_map(move |cited| ctx.sources.iter().find(|s| s.label == cited.label).map(|s| (s.clone(), cited.page, cited.quote)))).collect();
+            // An answer that surveys the library cites dozens of papers: the first few are shown, the rest on request.
+            let (total, open) = (cited.len(), chat.sources_open.contains(&i));
+            let shown = if open || total <= SOURCES_SHOWN + 2 { total } else { SOURCES_SHOWN };
+            let mut chips: Vec<AnyElement> = cited
+                .into_iter()
+                .take(shown)
                 .enumerate()
                 .map(|(n, (source, page, quote))| {
                     let text = match page {
@@ -87,33 +98,24 @@ impl Workspace {
                         Some(page) => format!("{} p.{page} · {}", source.label, source.title),
                         None => format!("{} · {}", source.label, source.title),
                     };
-                    div()
-                        .id(SharedString::from(format!("cite-{i}-{n}")))
-                        .flex()
-                        .items_center()
-                        .gap(px(4.))
-                        .max_w(px(if quote.is_empty() { 300. } else { 440. }))
-                        .h(px(24.))
-                        .px(px(8.))
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(Theme::line())
-                        .text_size(px(12.))
+                    source_chip(SharedString::from(format!("cite-{about_paper}-{i}-{n}")), if quote.is_empty() { 300. } else { 440. })
                         .text_color(Theme::text_secondary())
-                        .cursor_pointer()
-                        .hover(|s| s.bg(Theme::hover()).border_color(Theme::accent()))
                         .on_click(self.on(Cmd::GotoSource(source.paper_id.clone(), page, quote), cx))
                         .child(ui::icon("file-text", 12., Theme::accent()))
                         .child(div().min_w_0().truncate().child(text))
                         .into_any_element()
                 })
                 .collect();
+            if shown < total || open {
+                let label = if open { "收起".to_string() } else { format!("另外 {} 个出处", total - shown) };
+                chips.push(source_chip(SharedString::from(format!("cite-more-{about_paper}-{i}")), 300.).text_color(Theme::accent()).on_click(self.on(Cmd::ToggleSources(about_paper, i), cx)).child(label).into_any_element());
+            }
             items.push(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
-                    .child(div().line_height(px(22.)).text_color(if waiting { Theme::text_tertiary() } else { Theme::text() }).child(if waiting { "正在阅读文献并思考…".to_string() } else { content.clone() }))
+                    .gap(px(10.))
+                    .child(if waiting { div().line_height(px(22.)).text_color(Theme::text_tertiary()).child("正在阅读文献并思考…") } else { crate::markdown::render(&format!("answer-{about_paper}-{i}"), content) })
                     .when(!chips.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(6.)).children(chips)))
                     .into_any_element(),
             );

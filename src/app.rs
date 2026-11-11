@@ -156,6 +156,8 @@ pub enum Cmd {
     /// Ask one of the suggested questions.
     Suggest(bool, String),
     NewChat(bool),
+    /// Show every source of an answer (by its place in the conversation), or the first few again.
+    ToggleSources(bool, usize),
     /// Open a paper; with a page, its PDF there; with a quoted sentence too, that sentence highlighted.
     GotoSource(String, Option<usize>, String),
     // Searches and imports
@@ -329,6 +331,8 @@ pub struct Chat {
     /// Why the last answer ended early, if it did.
     pub note: String,
     pub scroll: ScrollHandle,
+    /// The answers (by their place in `messages`) whose sources are all on show.
+    pub sources_open: std::collections::HashSet<usize>,
     /// Bumped by 新对话, so a stream still arriving for the old one is dropped.
     pub generation: u64,
 }
@@ -432,7 +436,7 @@ impl Chat {
             input.submit_on_enter = true;
             input
         });
-        Chat { input, messages: vec![], wire: vec![], protocol: None, steps: 0, ctx: None, busy: false, error: String::new(), note: String::new(), scroll: ScrollHandle::new(), generation: 0 }
+        Chat { input, messages: vec![], wire: vec![], protocol: None, steps: 0, ctx: None, busy: false, error: String::new(), note: String::new(), scroll: ScrollHandle::new(), sources_open: Default::default(), generation: 0 }
     }
 
     /// An answer piece that never got any text leaves no empty bubble behind.
@@ -456,6 +460,7 @@ impl Chat {
         self.busy = false;
         self.error.clear();
         self.note.clear();
+        self.sources_open.clear();
         self.generation += 1;
         self.input.update(cx, |input, cx| input.set_text("", cx));
     }
@@ -941,6 +946,12 @@ impl Workspace {
                     let chat = if paper { &mut lib.paper_chat } else { &mut lib.library_chat };
                     chat.reset(cx);
                     chat.input.read(cx).focus(window);
+                }
+            }
+            Cmd::ToggleSources(paper, at) => {
+                if let Some(lib) = self.lib.as_mut() {
+                    let chat = if paper { &mut lib.paper_chat } else { &mut lib.library_chat };
+                    if !chat.sources_open.remove(&at) { chat.sources_open.insert(at); }
                 }
             }
             Cmd::GotoSource(id, page, quote) => {

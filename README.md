@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#安装"><b>安装</b></a> ·
   <a href="#功能">功能</a> ·
+  <a href="docs/TUTORIAL.md">教程</a> ·
   <a href="docs/CLI.md">命令行与 MCP</a> ·
   <a href="docs/DATA.md">数据与隐私</a> ·
   <a href="docs/DEVELOPMENT.md">开发</a>
@@ -29,7 +30,7 @@
 </p>
 
 > [!NOTE]
-> Wisp Paper 还在早期，变化很快，目前没有安装包，需要从源码构建。界面只有中文。遇到问题或有想法，欢迎[提 issue](https://github.com/xuzhougeng/WispPaper/issues)，更欢迎直接发 pull request。
+> Wisp Paper 还在早期，变化很快。界面只有中文。第一次用，可以跟着[教程](docs/TUTORIAL.md)从零建一个文献库。遇到问题或有想法，欢迎[提 issue](https://github.com/xuzhougeng/WispPaper/issues)，更欢迎直接发 pull request。
 
 ## 为什么是 Wisp Paper
 
@@ -43,19 +44,23 @@
 
 ## 安装
 
-目前没有发布安装包。需要 Rust（版本见 `rust-toolchain.toml`，rustup 会自动安装）；Windows 上还需要 MSVC 构建工具。
+从[发布页](https://github.com/xuzhougeng/WispPaper/releases/latest)下载：
+
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| **macOS** | `WispPaper-v<版本>-macos-universal.dmg` | Apple 芯片与 Intel 通用，Developer ID 签名并经 Apple 公证。打开后把 Wisp Paper 拖进「应用程序」 |
+| **Windows** 10 / 11（x64） | `WispPaper-v<版本>-windows-x64.zip` | 解压后运行 `WispPaper.exe`，带 Authenticode 签名 |
+| **Linux**（x64） | `WispPaper-v<版本>-linux-x64.tar.gz` | 解压后运行 `wisp-paper`；没有签名，也没有在真机上测试过 |
+
+命令行工具 `wisp` 随包附带：Windows 和 Linux 在主程序旁边，macOS 在 `Wisp Paper.app/Contents/MacOS/wisp`。
+
+从源码构建需要 Rust（版本见 `rust-toolchain.toml`，rustup 会自动安装）；Windows 上还需要 MSVC 构建工具。
 
 ```sh
 git clone https://github.com/xuzhougeng/WispPaper
 cd WispPaper
 cargo run --release
 ```
-
-| 平台 | 状态 |
-|---|---|
-| **Windows** | 支持 |
-| **macOS** | 支持 |
-| **Linux** | 可以编译，未测试 |
 
 想先看看效果，可以生成一个带示例数据的目录，不碰你真正的文献库：
 
@@ -75,7 +80,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 - **建库向导**：写下主题，助手为各个数据库拟几条检索式并逐条试检索，你挑靠谱的。
 - **筛选**：助手几篇同时读，给出收录建议和原文依据，你来确认；也可以按建议整组采纳。
 - **翻译**：题目和摘要一键译成中文，译过的保存在文献库里。
-- **提问**：对文献库或单篇文献提问，出处可点击并在 PDF 里高亮；`/search` 检索全文，`/cite` 为一段文字找可引用的文献。
+- **提问**：对文献库或单篇文献提问，回答按 Markdown 排版，出处可点击并在 PDF 里高亮；`/search` 检索全文，`/cite` 为一段文字找可引用的文献。
 - **PDF 预览**：在详情面板里直接看，可展开成阅读宽度。
 - **命令行与 MCP**：`wisp` 不开窗口就能读写同一个数据目录，`wisp mcp` 把同一组工具交给外部的 AI 客户端。见 [docs/CLI.md](docs/CLI.md)。
 - **设置**：浅色 / 深色，可改键的快捷键，全局代理和每个模型服务单独的代理。改动即时保存。
@@ -86,6 +91,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 
 | | |
 |---|---|
+| [教程](docs/TUTORIAL.md) | 从零建一个「植物单细胞转录组」文献库的完整记录，带截图 |
 | [功能详解](docs/FEATURES.md) | 每个页面能做什么 |
 | [数据与隐私](docs/DATA.md) | 文件放在哪里，哪些数据会离开本机 |
 | [命令行与 MCP](docs/CLI.md) | `wisp` 的用法、工具一览、MCP 配置 |
@@ -93,7 +99,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 
 ## 致谢
 
-文献部分移植自 [BiblioCell](https://github.com/xuzhougeng/BiblioCell)（它的数据集和网页版没有移植），应用结构参考 [quiet-md](https://github.com/s1dashu/quiet-md)。
+文献部分移植自 [BiblioCell](https://github.com/xuzhougeng/BiblioCell)（它的数据集和网页版没有移植），应用结构和回答里的 Markdown 读法参考 [quiet-md](https://github.com/s1dashu/quiet-md)。
 
 ## 许可
 

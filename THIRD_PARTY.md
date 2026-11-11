@@ -17,6 +17,8 @@ Wisp Paper 本体以 MIT 协议发布（见 [LICENSE](LICENSE)）。下面是随
 - `src/input.rs` 的文本输入框参考了 gpui 的 `examples/input.rs`（Apache-2.0）和 quiet-md 的 `src/input.rs`（MIT）。
 - `build.rs`、`src/assets.rs` 的资源嵌入方式来自 quiet-md（MIT）。
 - `src/settings.rs` 设置页的布局和控件（分组卡片、开关、分段选择、快捷键录制）参照 quiet-md 的 `src/settings.rs`、`src/shortcuts.rs`（MIT）。
+- `crates/core/src/markdown.rs` 读 Markdown 的规则（块的划分、列表嵌套、表格、行内标记）移植自 quiet-md 的 `crates/core/src/paste.rs`（MIT）。
+- `scripts/sign-windows-esigner.ps1` 和发布工作流里的签名步骤来自 [BiblioCell](https://github.com/xuzhougeng/BiblioCell) 的 `scripts/` 和 `.github/workflows/release.yml`。
 - 文献模型、去重规则、BibTeX / CSV 导出、筛选排序移植自 [BiblioCell](https://github.com/xuzhougeng/BiblioCell)。
 
 ## 图标
