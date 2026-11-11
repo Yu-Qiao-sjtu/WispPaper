@@ -14,6 +14,8 @@ mod input;
 mod library;
 mod net;
 mod pdf;
+mod settings;
+mod shortcuts;
 mod theme;
 mod ui;
 
@@ -23,8 +25,6 @@ pub(crate) const APP_ID: &str = "com.wisp.paper";
 
 fn main() {
     Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
-        input::bind_keys(cx);
-        app::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
         cx.open_window(
             WindowOptions {

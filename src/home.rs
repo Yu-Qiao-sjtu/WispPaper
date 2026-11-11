@@ -2,6 +2,8 @@
 //! home page: one card per library.
 
 use crate::app::{Cmd, MenuKind, Workspace};
+use crate::settings::{SettingsPage, UpdateState};
+use crate::shortcuts::{AddPaper, AskLibrary, FocusSearch, ImportPdf, NewLibrary, ShowHome, ShowSettings, ToggleDetail};
 use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
@@ -9,7 +11,13 @@ use wisp_core::time;
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let page = if self.lib.is_some() { self.render_library(window, cx) } else { self.render_home(cx) };
+        let page = if self.settings_view.is_some() {
+            self.render_settings(window, cx)
+        } else if self.lib.is_some() {
+            self.render_library(window, cx)
+        } else {
+            self.render_home(cx)
+        };
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -21,8 +29,17 @@ impl Render for Workspace {
             .text_size(px(13.))
             .line_height(px(20.))
             .text_color(Theme::text())
+            // Only while 设置 › 快捷键 waits for a new key.
+            .on_key_down(cx.listener(Self::record_key))
             .on_action(cx.listener(Self::dismiss))
-            .on_action(cx.listener(Self::focus_search))
+            .on_action(cx.listener(|this, _: &ShowSettings, window, cx| this.shortcut("settings", window, cx)))
+            .on_action(cx.listener(|this, _: &ShowHome, window, cx| this.shortcut("home", window, cx)))
+            .on_action(cx.listener(|this, _: &NewLibrary, window, cx| this.shortcut("new-library", window, cx)))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| this.shortcut("search", window, cx)))
+            .on_action(cx.listener(|this, _: &AddPaper, window, cx| this.shortcut("add", window, cx)))
+            .on_action(cx.listener(|this, _: &ImportPdf, window, cx| this.shortcut("import-pdf", window, cx)))
+            .on_action(cx.listener(|this, _: &AskLibrary, window, cx| this.shortcut("ask", window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleDetail, window, cx| this.shortcut("detail", window, cx)))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.import_paths(paths.paths().to_vec(), cx)))
             .child(page)
             .children(self.render_modal(window, cx))
@@ -105,9 +122,9 @@ impl Workspace {
                     .shadow(theme::shadow_card())
                     .overflow_hidden()
                     .cursor_pointer()
-                    .hover(|s| s.border_color(theme::c(accent.strong)))
+                    .hover(|s| s.border_color(accent.strong()))
                     .on_click(self.on(Cmd::OpenLibrary(info.id.clone()), cx))
-                    .child(div().h(px(6.)).w_full().rounded_t(px(11.)).bg(theme::c(accent.strong)))
+                    .child(div().h(px(6.)).w_full().rounded_t(px(11.)).bg(accent.strong()))
                     .child(
                         div()
                             .flex()
@@ -121,7 +138,7 @@ impl Workspace {
                                     .flex()
                                     .items_center()
                                     .gap(px(8.))
-                                    .child(div().flex().flex_none().items_center().justify_center().size(px(28.)).rounded(px(8.)).bg(theme::c(accent.soft)).child(ui::icon("library", 16., theme::c(accent.strong))))
+                                    .child(div().flex().flex_none().items_center().justify_center().size(px(28.)).rounded(px(8.)).bg(accent.soft()).child(ui::icon("library", 16., accent.strong())))
                                     .child(div().flex_1().min_w_0().truncate().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(info.name.clone()))
                                     .child(ui::ghost_button(SharedString::from(format!("library-menu-{}", info.id)), Some("ellipsis"), None).on_click({
                                         let open = self.on_menu(MenuKind::LibraryCard(info.id.clone()), cx);
@@ -166,6 +183,10 @@ impl Workspace {
             .child(ui::icon("plus", 20., Theme::text_secondary()))
             .child("新建文献库");
         let empty = self.libraries.is_empty();
+        let new_version = match &self.update {
+            UpdateState::Available(release) => Some(release.version.clone()),
+            _ => None,
+        };
         let page = div()
             .id("home")
             .flex_1()
@@ -200,8 +221,10 @@ impl Workspace {
                                 div()
                                     .flex()
                                     .gap(px(4.))
+                                    // Only while a newer release is on offer.
+                                    .when_some(new_version, |d, version| d.child(ui::primary_button("home-update", format!("新版本 {version}")).h(px(28.)).px(px(10.)).rounded_full().text_size(px(12.)).on_click(self.on(Cmd::OpenSettings(SettingsPage::About), cx))))
                                     .child(ui::ghost_button("home-folder", Some("folder-open"), Some("数据目录".into())).on_click(self.on(Cmd::RevealFolder, cx)))
-                                    .child(ui::ghost_button("home-settings", Some("settings-gear"), Some("设置".into())).on_click(self.on(Cmd::OpenSettings, cx))),
+                                    .child(ui::ghost_button("home-settings", Some("settings-gear"), Some("设置".into())).on_click(self.on(Cmd::OpenSettings(SettingsPage::General), cx))),
                             ),
                     )
                     .when(empty, |d| {

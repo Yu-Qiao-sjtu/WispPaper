@@ -11,6 +11,7 @@
 //! - `fulltext` page text of a stored PDF
 //! - `ai`       context building, request bodies and stream parsing for 文献库提问
 //! - `settings` settings.json
+//! - `update`   which release is the newest, and whether it is newer than this build
 
 pub mod ai;
 pub mod export;
@@ -23,3 +24,4 @@ pub mod model;
 pub mod settings;
 pub mod store;
 pub mod time;
+pub mod update;

@@ -24,6 +24,12 @@
   - 就单篇文献提问：模型读到该文献的记录和全文。
   - 回答里的 `[P3 p.5]` 出处可点击，跳到对应文献或 PDF 页。
   - 支持 Claude API 和任何 OpenAI 兼容的服务。
+- **设置**：单独的设置页（首页或文献库侧栏的「设置」，默认 `Ctrl` / `⌘` + `,`），改动即时保存。
+  - 通用：数据目录、自动检查更新。
+  - 外观：跟随系统 / 浅色 / 深色，文献列表的行高。
+  - 快捷键：搜索、添加文献、导入 PDF、提问等都可以改键、移除或恢复默认。
+  - AI：提问使用的模型服务。
+  - 关于：版本、检查更新、项目主页。
 
 ## 数据在哪里
 
@@ -33,9 +39,9 @@
 | 被移除的文献库、附件 | 同目录下的 `removed/`（只移动，不删除） |
 | 设置 | 系统配置目录下的 `WispPaper/settings.json` |
 
-数据目录可以在设置里更改。环境变量 `WISP_PAPER_HOME` 可把数据和设置一起指到别处（测试用）。
+数据目录可以在「设置 › 通用」里更改。环境变量 `WISP_PAPER_HOME` 可把数据和设置一起指到别处（测试用）。
 
-**会离开本机的数据**：DOI / PMID 查询会把编号发给 Crossref 和 Europe PMC；提问会把问题和相关文献的记录、笔记、全文页面发给你配置的模型服务。API Key 以明文保存在 `settings.json`，留空则读取环境变量 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`。
+**会离开本机的数据**：DOI / PMID 查询会把编号发给 Crossref 和 Europe PMC；检查更新会向 GitHub 请求本项目的 `releases/latest`，只读取它跳转到的版本号，不下载、不上传任何内容（可在「设置 › 通用」关闭，新版本需要自己到发布页下载安装）；提问会把问题和相关文献的记录、笔记、全文页面发给你配置的模型服务。API Key 以明文保存在 `settings.json`，留空则读取环境变量 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`。
 
 ## 构建
 
@@ -72,6 +78,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
   | `fulltext` | PDF 逐页文字提取 |
   | `ai` | 提问的上下文组装、两种协议的请求体、流式返回的解析 |
   | `settings` | settings.json |
+  | `update` | 最新发布的版本号，是否比当前版本新 |
 
 - **根 crate（`wisp_paper`）**：GPUI 应用。
 
@@ -79,12 +86,14 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
   |---|---|
   | `app` | `Workspace`：全部状态；每次点击是一个 `Cmd`，由 `run` 处理 |
   | `home` / `library` / `detail` / `chat` / `dialogs` | 各部分界面的绘制 |
+  | `settings` | 设置页：通用、外观、快捷键、AI、关于；检查更新 |
+  | `shortcuts` | 快捷键的默认值、改键规则和显示 |
   | `input` | 文本输入框（单行 / 多行，支持输入法） |
   | `pdf` | PDF 预览：后台线程渲染，虚拟化列表显示 |
-  | `net` | 元数据查询和流式对话的 HTTP 请求 |
-  | `theme` / `ui` | 颜色与通用控件；窗口标题栏 |
+  | `net` | 元数据查询、流式对话和检查更新的 HTTP 请求 |
+  | `theme` / `ui` | 浅色 / 深色两套颜色与通用控件；窗口标题栏 |
 
-调试构建下，`WISP_PAPER_DEV=open:0,select:0,tab:pdf` 可以让窗口启动后直接进入某个状态（见 `app.rs` 末尾）。
+调试构建下，`WISP_PAPER_DEV=open:0,select:0,tab:pdf` 可以让窗口启动后直接进入某个状态（如 `settings:ai`、`theme:dark`，见 `app.rs` 末尾）。`WISP_PAPER_UPDATE_URL` 可把检查更新指向别的地址（测试用）。
 
 ## 第一版的范围
 

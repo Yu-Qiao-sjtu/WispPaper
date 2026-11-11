@@ -7,6 +7,7 @@ use std::time::Duration;
 use wisp_core::ai::{self, HttpRequest, Protocol, StreamEvent};
 use wisp_core::lookup::{self, Identifier};
 use wisp_core::model::Paper;
+use wisp_core::update::{self, Release};
 
 const USER_AGENT: &str = concat!("WispPaper/", env!("CARGO_PKG_VERSION"));
 
@@ -60,6 +61,20 @@ pub fn lookup_paper(id: &Identifier) -> Result<Paper, String> {
         Err(err) => notes.push(format!("Europe PMC：{err}")),
     }
     paper.ok_or_else(|| if notes.is_empty() { "没有找到这个编号对应的文献，请检查后重试，或改用手动录入。".to_string() } else { notes.join("；") })
+}
+
+/// The newest published release, read off the redirect `url` answers with
+/// (`update::latest_url()`); `None` when nothing has been published. Only
+/// the redirect is read: no page or package is fetched.
+pub fn latest_release(url: &str) -> Result<Option<Release>, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).timeout_global(Some(Duration::from_secs(20))).user_agent(USER_AGENT).build().into();
+    let response = agent.get(url).call().map_err(network_error)?;
+    let status = response.status().as_u16();
+    match status {
+        300..400 => Ok(response.headers().get("location").and_then(|v| v.to_str().ok()).and_then(update::release_from_location)),
+        200..300 | 404 => Ok(None),
+        _ => Err(format!("更新服务器返回 HTTP {status}")),
+    }
 }
 
 /// Send a chat request and forward the streamed answer. Returns when the
@@ -187,6 +202,25 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         // Nothing listening: a network error, not a hang.
         let (events, _) = ask("http://127.0.0.1:9".into(), Protocol::OpenAI);
         assert!(matches!(&events[..], [StreamEvent::Error(e)] if e.starts_with("网络请求失败")));
+    }
+
+    #[test]
+    fn latest_release_reads_the_redirect() {
+        let (base, server) = serve("HTTP/1.1 302 Found\r\nlocation: https://github.com/xuzhougeng/WispPaper/releases/tag/v9.8.7\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        let release = latest_release(&format!("{base}/releases/latest")).unwrap().unwrap();
+        assert_eq!((release.version.as_str(), release.url.as_str()), ("9.8.7", "https://github.com/xuzhougeng/WispPaper/releases/tag/v9.8.7"));
+        assert!(server.join().unwrap().starts_with("GET /releases/latest "));
+
+        // No release published: GitHub redirects to the list. Elsewhere: never offered.
+        for response in ["HTTP/1.1 302 Found\r\nlocation: https://github.com/xuzhougeng/WispPaper/releases\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", "HTTP/1.1 302 Found\r\nlocation: https://example.com/releases/tag/v9.9.9\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"] {
+            let (base, server) = serve(response);
+            assert_eq!(latest_release(&base), Ok(None));
+            server.join().unwrap();
+        }
+        let (base, server) = serve("HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        assert_eq!(latest_release(&base), Err("更新服务器返回 HTTP 503".into()));
+        server.join().unwrap();
+        assert!(latest_release("http://127.0.0.1:9").unwrap_err().starts_with("网络请求失败"));
     }
 
     /// Talks to Crossref and Europe PMC: `cargo test -- --ignored lookup`.

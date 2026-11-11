@@ -33,8 +33,8 @@ fn collect(root: &Path, dir: &Path, files: &mut Vec<(String, String)>) {
             collect(root, &path, files);
         } else {
             let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-            // The app icon goes into the executable as a resource, not into the asset table.
-            if rel.starts_with("branding/") || rel.starts_with("icons/LICENSE") { continue }
+            // The app icon goes into the executable as a resource; only the PNG is also an asset (设置 › 关于).
+            if (rel.starts_with("branding/") && rel != "branding/app-icon.png") || rel.starts_with("icons/LICENSE") { continue }
             files.push((rel, path.to_string_lossy().to_string()));
         }
     }

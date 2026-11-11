@@ -2,6 +2,7 @@
 //! its search and filters, and the trash.
 
 use crate::app::{Cmd, FilterKey, Library, MenuKind, Page, Tab, Workspace};
+use crate::settings::SettingsPage;
 use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
@@ -12,7 +13,6 @@ use wisp_core::time;
 
 const SIDEBAR_W: f32 = 224.;
 pub const DETAIL_W: f32 = 448.;
-const ROW_H: f32 = 56.;
 
 /// A column of the paper table: fixed width, or the flexible title column.
 struct Column {
@@ -169,7 +169,7 @@ impl Workspace {
                     .border_color(Theme::line())
                     .child(nav("manage-fields", "list", "自定义词条", Some(lib.fields.len()), false, Cmd::ManageFields, self, cx))
                     .child(nav("page-trash", "bin", "回收站", (trash_count > 0).then_some(trash_count), lib.page == Page::Trash, Cmd::SetPage(Page::Trash), self, cx))
-                    .child(nav("open-settings", "settings-gear", "设置", None, false, Cmd::OpenSettings, self, cx)),
+                    .child(nav("open-settings", "settings-gear", "设置", None, false, Cmd::OpenSettings(SettingsPage::General), self, cx)),
             )
             .into_any_element()
     }
@@ -346,6 +346,8 @@ impl Workspace {
     fn render_rows(&mut self, range: Range<usize>, width: f32, _: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(lib) = &self.lib else { return vec![] };
         let columns = Self::columns(lib, width);
+        // 设置 › 外观: the compact table still fits the title and its line of details.
+        let row_height = if self.settings.density == "compact" { 44. } else { 56. };
         let muted = |text: &str| div().text_color(Theme::text_placeholder()).child(text.to_string());
         range
             .filter_map(|row| {
@@ -432,7 +434,7 @@ impl Workspace {
                         .id(("row", row))
                         .flex()
                         .items_center()
-                        .h(px(ROW_H))
+                        .h(px(row_height))
                         .w(px(width))
                         .overflow_hidden()
                         .px(px(8.))

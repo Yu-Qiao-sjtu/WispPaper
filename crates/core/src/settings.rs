@@ -1,11 +1,13 @@
-//! settings.json: where the libraries live and the model profiles.
+//! settings.json: where the libraries live, the model profiles, and the
+//! choices made on the settings pages.
 
 use crate::ai::Profile;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     /// The folder holding every library; empty means the default.
@@ -13,6 +15,20 @@ pub struct Settings {
     pub profiles: Vec<Profile>,
     /// Index into `profiles` of the one questions go to.
     pub active_profile: usize,
+    /// Look for a newer release after launch and twice a day.
+    pub auto_update: bool,
+    /// "light" or "dark"; empty follows the system.
+    pub appearance: String,
+    /// "compact" tightens the paper table; empty is the standard rows.
+    pub density: String,
+    /// Changed shortcuts by id; an empty key means the shortcut is removed.
+    pub shortcuts: BTreeMap<String, String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { data_dir: String::new(), profiles: vec![], active_profile: 0, auto_update: true, appearance: String::new(), density: String::new(), shortcuts: BTreeMap::new() }
+    }
 }
 
 impl Settings {
@@ -38,6 +54,12 @@ impl Settings {
         self.profiles.get(self.active_profile).or(self.profiles.first())
     }
 
+    /// The profile questions go to; before one is saved, the default one,
+    /// which works as soon as its API key is in the environment.
+    pub fn profile_or_default(&self) -> Profile {
+        self.profile().cloned().unwrap_or_default()
+    }
+
     /// The folder holding the libraries: the configured one, else `default`.
     pub fn data_root(&self, default: &Path) -> PathBuf {
         if self.data_dir.trim().is_empty() { default.to_path_buf() } else { PathBuf::from(self.data_dir.trim()) }
@@ -60,6 +82,11 @@ mod tests {
         assert_eq!(Settings::load(&path).unwrap(), s);
         std::fs::write(&path, "{broken").unwrap();
         assert!(Settings::load(&path).is_err());
+        // A file from before a setting existed takes that setting's default.
+        std::fs::write(&path, r#"{"dataDir":"/x","shortcuts":{"search":""}}"#).unwrap();
+        let old = Settings::load(&path).unwrap();
+        assert!(old.auto_update && old.appearance.is_empty());
+        assert_eq!((old.data_dir.as_str(), old.shortcuts.get("search").map(String::as_str)), ("/x", Some("")));
         assert_eq!(s.data_root(Path::new("/d")), PathBuf::from("/d"));
         std::fs::remove_dir_all(dir).ok();
     }
