@@ -30,7 +30,7 @@ pub fn handle(root: &Path, message: &Value) -> Option<Value> {
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools::catalog().iter().map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.input_schema})).collect::<Vec<_>>()})),
+        "tools/list" => Ok(json!({"tools": tools::catalog().iter().map(|t| json!({"name": t.name, "title": t.title, "description": t.description, "inputSchema": t.input_schema})).collect::<Vec<_>>()})),
         "tools/call" => match params["name"].as_str() {
             None => Err((-32602, "tools/call needs the name of a tool".to_string())),
             Some(name) => {

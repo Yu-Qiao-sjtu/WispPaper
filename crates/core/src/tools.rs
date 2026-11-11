@@ -17,6 +17,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub struct ToolDef {
+    /// What the window calls it while it runs: 「检索全文」.
+    pub title: &'static str,
     pub name: &'static str,
     pub description: &'static str,
     /// JSON Schema of the arguments object.
@@ -24,9 +26,9 @@ pub struct ToolDef {
 }
 
 /// A tool that works inside one library: it also takes `library`.
-fn scoped(name: &'static str, description: &'static str, mut properties: Value, required: &[&str]) -> ToolDef {
+fn scoped(name: &'static str, title: &'static str, description: &'static str, mut properties: Value, required: &[&str]) -> ToolDef {
     properties["library"] = json!({"type": "string", "description": "文献库的 ID 或名称；只有一个文献库时可以省略。"});
-    ToolDef { name, description, input_schema: json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false}) }
+    ToolDef { name, title, description, input_schema: json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false}) }
 }
 
 /// The stored values of a status table, for a schema's `enum`.
@@ -38,12 +40,14 @@ pub fn catalog() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "list_libraries",
+            title: "列出文献库",
             description: "列出所有文献库：ID、名称、主题和文献数量。其他工具用 library 参数指定其中一个。",
             input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         },
-        scoped("library_status", "一个文献库的概况：主题、文献数量、收录判断和阅读状态的分布、自定义词条，以及各状态值在界面上的显示名称。", json!({}), &[]),
+        scoped("library_status", "文献库概况", "一个文献库的概况：主题、文献数量、收录判断和阅读状态的分布、自定义词条，以及各状态值在界面上的显示名称。", json!({}), &[]),
         scoped(
             "list_papers",
+            "查询文献",
             "查询文献库中的文献，返回简要记录和匹配总数。规则与界面上的列表相同：不指定 screening 时不包含判为「不相关」的文献，回收站中的文献不返回。",
             json!({
                 "query": {"type": "string", "description": "在题目、作者、DOI、期刊、摘要、标签、词条和笔记中搜索；空格分开的每个词都必须出现。"},
@@ -58,9 +62,10 @@ pub fn catalog() -> Vec<ToolDef> {
             }),
             &[],
         ),
-        scoped("get_paper", "按 ID 读取一篇文献的完整记录：书目信息、摘要、笔记、标签、自定义词条和附件。", json!({"id": {"type": "string", "description": "文献 ID，例如 list_papers 返回的 id。"}}), &["id"]),
+        scoped("get_paper", "读取文献", "按 ID 读取一篇文献的完整记录：书目信息、摘要、笔记、标签、自定义词条和附件。", json!({"id": {"type": "string", "description": "文献 ID，例如 list_papers 返回的 id。"}}), &["id"]),
         scoped(
             "search_fulltext",
+            "检索全文",
             "在已保存的全文中检索短语或关键词，返回命中的文献、页码和逐字片段。不区分大小写和空白；整句命中排在各词分散命中之前。没有保存全文的文献不在检索范围内。",
             json!({
                 "query": {"type": "string", "description": "要找的短语或关键词。"},
@@ -71,6 +76,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ),
         scoped(
             "read_fulltext",
+            "阅读全文",
             "按页读取一篇文献的全文，用于核对上下文和逐字引用。一次最多 8 页。",
             json!({
                 "paperId": {"type": "string", "description": "文献 ID。"},
@@ -79,12 +85,31 @@ pub fn catalog() -> Vec<ToolDef> {
             }),
             &["paperId"],
         ),
+        scoped(
+            "find_citations",
+            "查找可引用的文献",
+            "为一段文字逐句找出文献库中可能支持它的文献：按词语在题目、摘要、笔记和已保存的全文里匹配，返回每句的候选文献，全文命中的附页码和原文片段。只是按词语匹配的候选，是否真的支持这句话需要读原文判断。",
+            json!({
+                "text": {"type": "string", "description": "要配引用的文字，可以是一句或一段。"},
+                "perSentence": {"type": "integer", "description": "每句最多几篇候选，默认 3，最大 10。"},
+            }),
+            &["text"],
+        ),
     ]
 }
 
-/// Run a tool against the data folder `root`. The error is a sentence for
-/// whoever called: a person at a terminal or a model.
-pub fn call(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
+/// The tools of the assistant inside an open library: no choosing a library.
+pub fn library_catalog() -> Vec<ToolDef> {
+    let mut tools = catalog();
+    tools.retain(|t| t.name != "list_libraries");
+    for tool in &mut tools {
+        if let Some(properties) = tool.input_schema["properties"].as_object_mut() { properties.remove("library"); }
+    }
+    tools
+}
+
+/// The tool `name` and whether `args` fit its schema's names.
+fn checked(name: &str, args: &Value) -> Result<ToolDef, String> {
     let Some(tool) = catalog().into_iter().find(|t| t.name == name) else { return Err(format!("没有这个工具：{name}")) };
     let Some(given) = args.as_object() else { return Err("参数应为一个 JSON 对象。".into()) };
     if let Some(unknown) = given.keys().find(|key| tool.input_schema["properties"].get(key.as_str()).is_none()) {
@@ -93,6 +118,63 @@ pub fn call(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
     if let Some(missing) = tool.input_schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str).find(|key| args[*key].is_null()) {
         return Err(format!("{name} 需要参数 {missing}。"));
     }
+    Ok(tool)
+}
+
+/// What a tool result may add to a model's context; a longer one is cut and says so.
+pub const MAX_OUTPUT_BYTES: usize = 60_000;
+
+/// A tool result as the text a model reads.
+pub fn output_text(value: &Value) -> String {
+    let text = value.to_string();
+    if text.len() <= MAX_OUTPUT_BYTES { return text }
+    let cut = text.floor_char_boundary(MAX_OUTPUT_BYTES);
+    format!("{}\n…[结果过长，只显示了 {} 字节中的前 {cut} 字节；请缩小范围后重试]", &text[..cut], text.len())
+}
+
+/// One line for the window about a call: 「检索全文：chromium」.
+pub fn describe_call(name: &str, args: &Value) -> String {
+    let title = catalog().into_iter().find(|t| t.name == name).map_or(name.to_string(), |t| t.title.to_string());
+    // Words first, then numbers, each group by name: the order a JSON object
+    // keeps its keys in depends on how serde_json was built.
+    let (mut words, mut numbers) = (vec![], vec![]);
+    for (key, value) in args.as_object().into_iter().flatten().filter(|(key, _)| key.as_str() != "library") {
+        match (key.as_str(), value) {
+            ("page", Value::Number(n)) => numbers.push((key, format!("第 {n} 页起"))),
+            (_, Value::String(text)) if !text.trim().is_empty() => words.push((key, text.split_whitespace().collect::<Vec<_>>().join(" "))),
+            (_, Value::Number(n)) => numbers.push((key, format!("{key} {n}"))),
+            _ => {}
+        }
+    }
+    words.sort();
+    numbers.sort();
+    let detail: String = words.into_iter().chain(numbers).map(|(_, part)| part).collect::<Vec<_>>().join(" · ");
+    if detail.is_empty() { return title }
+    if detail.chars().count() > 80 { format!("{title}：{}…", detail.chars().take(80).collect::<String>()) } else { format!("{title}：{detail}") }
+}
+
+/// One line for the window about what came back.
+pub fn describe_result(result: &Result<Value, String>) -> String {
+    match result {
+        Err(error) => error.clone(),
+        Ok(value) => {
+            if let Some(total) = value["total"].as_u64() {
+                format!("{total} 条结果")
+            } else if let Some(pages) = value["pages"].as_array() {
+                format!("读了 {} 页", pages.len())
+            } else if let Some(sentences) = value["sentences"].as_array() {
+                format!("{} 句", sentences.len())
+            } else {
+                "完成".into()
+            }
+        }
+    }
+}
+
+/// Run a tool against the data folder `root`. The error is a sentence for
+/// whoever called: a person at a terminal or a model.
+pub fn call(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
+    checked(name, args)?;
     if name == "list_libraries" {
         let all: Vec<Value> = libraries::list(root).iter().map(|l| json!({"id": l.id, "name": l.name, "topic": l.topic, "papers": l.paper_count})).collect();
         return Ok(json!({"libraries": all}));
@@ -104,7 +186,9 @@ pub fn call(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
 
 /// Run a library tool on a library that is already open.
 pub fn call_in(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value) -> Result<Value, String> {
+    checked(name, args)?;
     match name {
+        "find_citations" => find_citations(store, args),
         "library_status" => library_status(store, info),
         "list_papers" => list_papers(store, info, args),
         "get_paper" => get_paper(store, args),
@@ -337,6 +421,78 @@ fn read_fulltext(store: &mut Store, args: &Value) -> Result<Value> {
     Ok(json!({"paperId": paper.id, "title": paper.title, "pageCount": pages.len(), "pages": read}))
 }
 
+/// The sentences of a text: full stops of either script, question and
+/// exclamation marks, semicolons and line breaks end one. A Latin full stop
+/// only does when a space follows, so "0.05" and "e.g.x" stay whole.
+fn sentences(text: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let ends = match c {
+            '。' | '！' | '？' | '!' | '?' | '；' | ';' | '\n' => true,
+            '.' => chars.peek().is_none_or(|next| next.is_whitespace()),
+            _ => false,
+        };
+        if c != '\n' { current.push(c) }
+        if ends {
+            if !current.trim().is_empty() { out.push(current.trim().to_string()) }
+            current.clear();
+        }
+    }
+    if !current.trim().is_empty() { out.push(current.trim().to_string()) }
+    out
+}
+
+const MAX_SENTENCES: usize = 40;
+
+fn find_citations(store: &mut Store, args: &Value) -> Result<Value> {
+    let text = text(args, "text")?;
+    if text.is_empty() { bail!("请提供要配引用的文字。") }
+    let per_sentence = number(args, "perSentence", 3, 10)?.max(1);
+    extract_missing(store, None)?;
+    let papers: Vec<Paper> = store.list_papers()?.into_iter().filter(|p| p.screening != "irrelevant").collect();
+    let texts = store.all_fulltext()?;
+    // Lowercased once: every sentence is matched against every record and page.
+    let records: Vec<String> = papers.iter().map(|p| searchable(&format!("{} {} {} {}", p.title, p.abstract_text, p.tags.join(" "), p.notes))).collect();
+    let pages: Vec<Vec<String>> = papers.iter().map(|p| texts.get(&p.id).map(|(_, pages)| pages.iter().map(|page| searchable(page)).collect()).unwrap_or_default()).collect();
+    let all = sentences(text);
+    let mut out = vec![];
+    for sentence in all.iter().take(MAX_SENTENCES) {
+        let words = terms(sentence);
+        let mut candidates = vec![];
+        // A sentence of one or two words says too little to match on.
+        if words.len() >= 3 {
+            for (i, paper) in papers.iter().enumerate() {
+                let in_record = words.iter().filter(|word| records[i].contains(word.as_str())).count();
+                // The page holding the most of the sentence's words, and where its first one stands.
+                let best = pages[i].iter().enumerate().map(|(n, page)| (words.iter().filter(|word| page.contains(word.as_str())).count(), n)).max_by_key(|&(count, n)| (count, std::cmp::Reverse(n)));
+                let (count, page) = match best {
+                    Some((count, n)) if count > in_record => (count, Some(n)),
+                    _ => (in_record, None),
+                };
+                if count * 2 < words.len() { continue }
+                let mut candidate = json!({"paperId": paper.id, "title": paper.title, "year": paper.year, "matched": count, "of": words.len(), "in": if page.is_some() { "fulltext" } else { "record" }});
+                if let Some(n) = page {
+                    let original = &texts[&paper.id].1[n];
+                    let at = words.iter().filter_map(|word| pages[i][n].find(word.as_str())).min().unwrap_or(0);
+                    candidate["page"] = json!(n + 1);
+                    candidate["snippet"] = json!(snippet(original, at));
+                }
+                candidates.push((count, candidate));
+            }
+        }
+        candidates.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
+        out.push(json!({"sentence": sentence, "candidates": candidates.into_iter().take(per_sentence).map(|(_, c)| c).collect::<Vec<_>>()}));
+    }
+    Ok(json!({
+        "sentences": out,
+        "sentencesSkipped": all.len().saturating_sub(MAX_SENTENCES),
+        "papersSearched": papers.len(),
+        "papersWithoutText": papers.iter().filter(|p| !texts.contains_key(&p.id)).count(),
+    }))
+}
+
 // ---- the command line
 
 /// `paperId` as a flag: `paper-id`.
@@ -502,6 +658,42 @@ pub(crate) mod tests {
         let leaf = call(&root, "list_papers", &json!({"screening": "irrelevant"})).unwrap()["papers"][0]["id"].as_str().unwrap().to_string();
         assert!(call(&root, "read_fulltext", &json!({"paperId": leaf})).unwrap_err().contains("没有保存全文"));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn citations_for_a_text() {
+        let (root, id) = sample();
+        assert_eq!(sentences("Roots grow (p < 0.05). 根尖有干细胞。WOX5 is key;\nDone"), ["Roots grow (p < 0.05).", "根尖有干细胞。", "WOX5 is key;", "Done"]);
+        let found = call(&root, "find_citations", &json!({"text": "Libraries were prepared with the Chromium platform. WOX5 maintains the quiescent centre of the root. Too short."})).unwrap();
+        let sentence = |n: usize| &found["sentences"][n];
+        assert_eq!(found["sentences"].as_array().unwrap().len(), 3);
+        // The methods sentence is only in the full text, on page 2; the second is the abstract.
+        assert_eq!((sentence(0)["candidates"][0]["paperId"].as_str(), sentence(0)["candidates"][0]["in"].as_str(), sentence(0)["candidates"][0]["page"].as_u64()), (Some(id.as_str()), Some("fulltext"), Some(2)));
+        assert!(sentence(0)["candidates"][0]["snippet"].as_str().unwrap().contains("Libraries were prepared"));
+        assert_eq!((sentence(1)["candidates"][0]["in"].as_str(), sentence(1)["candidates"][0]["page"].as_u64()), (Some("record"), None));
+        assert_eq!(sentence(2)["candidates"], json!([]));
+        // The paper marked irrelevant is never a candidate.
+        assert_eq!((found["papersSearched"].as_u64(), found["papersWithoutText"].as_u64()), (Some(1), Some(0)));
+        assert_eq!(call(&root, "find_citations", &json!({"text": "Unrelated sentence about volcanic eruptions in Iceland."})).unwrap()["sentences"][0]["candidates"], json!([]));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn what_the_window_shows() {
+        assert_eq!(describe_call("search_fulltext", &json!({"query": "10x  Genomics", "limit": 5})), "检索全文：10x Genomics · limit 5");
+        assert_eq!(describe_call("read_fulltext", &json!({"paperId": "P-1", "page": 3})), "阅读全文：P-1 · 第 3 页起");
+        assert_eq!(describe_call("library_status", &json!({})), "文献库概况");
+        assert_eq!(describe_result(&Ok(json!({"total": 3}))), "3 条结果");
+        assert_eq!(describe_result(&Ok(json!({"pages": [1, 2]}))), "读了 2 页");
+        assert_eq!(describe_result(&Err("没有".into())), "没有");
+        let long = json!({"text": "页".repeat(MAX_OUTPUT_BYTES)});
+        let shown = output_text(&long);
+        assert!(shown.len() < MAX_OUTPUT_BYTES + 200 && shown.contains("结果过长"));
+        assert_eq!(output_text(&json!({"a": 1})), r#"{"a":1}"#);
+        // Inside a library there is no library to choose.
+        let inside = library_catalog();
+        assert!(inside.iter().all(|t| t.name != "list_libraries" && t.input_schema["properties"].get("library").is_none()));
+        assert_eq!(inside.len(), catalog().len() - 1);
     }
 
     #[test]

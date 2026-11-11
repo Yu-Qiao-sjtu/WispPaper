@@ -4,7 +4,7 @@
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
-use wisp_core::ai::{self, HttpRequest, Protocol, StreamEvent};
+use wisp_core::ai::{self, ChatEvent, HttpRequest, Protocol, TurnReader};
 use wisp_core::lookup::{self, Identifier};
 use wisp_core::model::Paper;
 use wisp_core::update::{self, Release};
@@ -77,9 +77,10 @@ pub fn latest_release(url: &str) -> Result<Option<Release>, String> {
     }
 }
 
-/// Send a chat request and forward the streamed answer. Returns when the
-/// stream ends or the receiver is gone (the conversation was reset).
-pub fn stream_chat(request: HttpRequest, protocol: Protocol, events: async_channel::Sender<StreamEvent>) {
+/// Send a chat request and forward the model's turn: its text as it
+/// arrives, then the whole turn with any tool calls. Returns when the stream
+/// ends or the receiver is gone (the conversation was reset).
+pub fn stream_chat(request: HttpRequest, protocol: Protocol, events: async_channel::Sender<ChatEvent>) {
     let send = |event| events.send_blocking(event).is_ok();
     let mut call = agent(None).post(&request.url);
     for (name, value) in &request.headers {
@@ -89,40 +90,44 @@ pub fn stream_chat(request: HttpRequest, protocol: Protocol, events: async_chann
     let mut response = match call.send(request.body.to_string()) {
         Ok(response) => response,
         Err(err) => {
-            send(StreamEvent::Error(network_error(err)));
+            send(ChatEvent::Error(network_error(err)));
             return;
         }
     };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let body = response.body_mut().read_to_string().unwrap_or_default();
-        send(StreamEvent::Error(ai::error_message(status, &body)));
+        send(ChatEvent::Error(ai::error_message(status, &body)));
         return;
     }
-    let mut stopped = false;
+    let mut reader = TurnReader::new(protocol);
     for line in BufReader::new(response.body_mut().as_reader()).lines() {
         let line = match line {
             Ok(line) => line,
             Err(err) => {
-                send(StreamEvent::Error(format!("连接中断：{err}")));
+                send(ChatEvent::Error(format!("连接中断：{err}")));
                 return;
             }
         };
-        for event in ai::stream_line(protocol, &line) {
-            stopped |= matches!(event, StreamEvent::Stop(_) | StreamEvent::Error(_));
-            if !send(event) { return }
+        match reader.line(&line) {
+            Ok(Some(text)) => {
+                if !send(ChatEvent::Text(text)) { return }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                send(ChatEvent::Error(error));
+                return;
+            }
         }
     }
-    if !stopped {
-        send(StreamEvent::Stop("end".into()));
-    }
+    send(ChatEvent::Done(reader.finish()));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use wisp_core::ai::{ChatMessage, Context, Profile, chat_request};
+    use wisp_core::ai::{Context, Profile, chat_request, user_message};
 
     /// Serve one canned HTTP response on a local port; returns the base URL and the request it received.
     fn serve(response: &'static str) -> (String, std::thread::JoinHandle<String>) {
@@ -153,10 +158,11 @@ mod tests {
         (base, handle)
     }
 
-    fn ask(base: String, protocol: Protocol) -> (Vec<StreamEvent>, HttpRequest) {
+    /// Send the conversation `wire` to the server at `base` and collect what comes back.
+    fn step(base: String, protocol: Protocol, wire: &[Value]) -> (Vec<ChatEvent>, HttpRequest) {
         let profile = Profile { protocol, base_url: base, api_key: "test-key".into(), model: "m".into(), ..Default::default() };
         let ctx = Context { instructions: "I".into(), documents: "D".into(), ..Default::default() };
-        let request = chat_request(&profile, &ctx, &[ChatMessage { from_user: true, content: "你好".into() }]).unwrap();
+        let request = chat_request(&profile, &ctx, wire, &wisp_core::tools::library_catalog()).unwrap();
         let (sender, events) = async_channel::unbounded();
         stream_chat(request.clone(), protocol, sender);
         let mut seen = vec![];
@@ -166,23 +172,70 @@ mod tests {
         (seen, request)
     }
 
+    fn ask(base: String, protocol: Protocol) -> (Vec<ChatEvent>, HttpRequest) {
+        step(base, protocol, &[user_message("你好")])
+    }
+
+    /// One question answered in two steps: the model calls a tool, gets the
+    /// result, and answers. What matters is what the second request carries.
+    #[test]
+    fn tool_round_trip() {
+        let (base, server) = serve(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"c2ln\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"search_fulltext\",\"input\":{}}}\n\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\": \\\"chromium\\\"}\"}}\n\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        );
+        let mut wire = vec![user_message("哪篇文献提到 Chromium？")];
+        let (events, _) = step(base, Protocol::Anthropic, &wire);
+        server.join().unwrap();
+        let [ChatEvent::Done(turn)] = &events[..] else { panic!("{events:?}") };
+        assert_eq!((turn.calls[0].name.as_str(), turn.calls[0].args.clone()), ("search_fulltext", Ok(serde_json::json!({"query": "chromium"}))));
+        assert!(turn.runnable());
+
+        wire.push(turn.message.clone());
+        wire.extend(ai::tool_results(Protocol::Anthropic, &[(turn.calls[0].id.clone(), "{\"total\":1}".into(), false)]));
+        let (base, server) = serve(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"[P1 p.2] 提到了。\"}}\n\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        );
+        let (events, request) = step(base, Protocol::Anthropic, &wire);
+        server.join().unwrap();
+        assert_eq!(events[0], ChatEvent::Text("[P1 p.2] 提到了。".into()));
+        assert!(matches!(&events[1], ChatEvent::Done(turn) if turn.calls.is_empty() && turn.stop == "end_turn"));
+        // The model's turn went back whole, followed by the result of its call.
+        let sent = &request.body["messages"];
+        assert_eq!(sent[1]["content"][0], serde_json::json!({"type": "thinking", "thinking": "", "signature": "c2ln"}));
+        assert_eq!(sent[1]["content"][1]["input"]["query"], "chromium");
+        assert_eq!(sent[2]["content"][0], serde_json::json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": "{\"total\":1}", "is_error": false}));
+    }
+
     #[test]
     fn anthropic_stream() {
         let (base, server) = serve(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
 event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n\
-event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\"}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"c2ln\"}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"根尖 \"}}\n\n\
 event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"[P1]\"}}\n\n\
 event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
 event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let (events, _) = ask(base, Protocol::Anthropic);
-        assert_eq!(events, [StreamEvent::Text("根尖 ".into()), StreamEvent::Text("[P1]".into()), StreamEvent::Stop("end_turn".into())]);
+        assert_eq!(events[..2], [ChatEvent::Text("根尖 ".into()), ChatEvent::Text("[P1]".into())]);
+        let ChatEvent::Done(turn) = &events[2] else { panic!("{events:?}") };
+        // The turn goes back to the model as it came, the signed thinking block included.
+        assert_eq!((turn.stop.as_str(), turn.calls.len(), turn.message["content"][0]["signature"].as_str(), turn.message["content"][1]["text"].as_str()), ("end_turn", 0, Some("c2ln"), Some("根尖 [P1]")));
         let received = server.join().unwrap();
         assert!(received.starts_with("POST /v1/messages "), "{received}");
         assert!(received.to_lowercase().contains("x-api-key: test-key"));
-        assert!(received.contains("\"stream\":true") && received.contains("你好"), "{received}");
+        assert!(received.contains("\"stream\":true") && received.contains("你好") && received.contains("\"search_fulltext\""), "{received}");
         // A local address is not Anthropic's API: no beta parameters.
         assert!(!received.contains("fallbacks"));
     }
@@ -191,17 +244,18 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     fn openai_stream_and_errors() {
         let (base, server) = serve("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
         let (events, _) = ask(format!("{base}/v1"), Protocol::OpenAI);
-        assert_eq!(events[..2], [StreamEvent::Text("Hi".into()), StreamEvent::Stop("stop".into())]);
+        assert_eq!(events[0], ChatEvent::Text("Hi".into()));
+        assert!(matches!(&events[1], ChatEvent::Done(turn) if turn.stop == "stop" && turn.message["content"] == "Hi"));
         assert!(server.join().unwrap().starts_with("POST /v1/chat/completions "));
 
         let (base, server) = serve("HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 41\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"invalid x-api-key\"}}");
         let (events, _) = ask(base, Protocol::Anthropic);
-        assert_eq!(events, [StreamEvent::Error("API Key 无效或没有权限（HTTP 401）：invalid x-api-key".into())]);
+        assert_eq!(events, [ChatEvent::Error("API Key 无效或没有权限（HTTP 401）：invalid x-api-key".into())]);
         server.join().unwrap();
 
         // Nothing listening: a network error, not a hang.
         let (events, _) = ask("http://127.0.0.1:9".into(), Protocol::OpenAI);
-        assert!(matches!(&events[..], [StreamEvent::Error(e)] if e.starts_with("网络请求失败")));
+        assert!(matches!(&events[..], [ChatEvent::Error(e)] if e.starts_with("网络请求失败")));
     }
 
     #[test]
