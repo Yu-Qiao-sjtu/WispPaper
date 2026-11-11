@@ -140,7 +140,8 @@ pub enum Cmd {
     /// Ask one of the suggested questions.
     Suggest(bool, String),
     NewChat(bool),
-    GotoSource(String, Option<usize>),
+    /// Open a paper; with a page, its PDF there; with a quoted sentence too, that sentence highlighted.
+    GotoSource(String, Option<usize>, String),
     // Searches and imports
     NewSearch,
     EditSearch(String),
@@ -847,13 +848,13 @@ impl Workspace {
                     chat.input.read(cx).focus(window);
                 }
             }
-            Cmd::GotoSource(id, page) => {
+            Cmd::GotoSource(id, page, quote) => {
                 self.select(Some(id), window, cx);
                 if let Some(page) = page && let Some(lib) = self.lib.as_mut() {
                     lib.tab = Tab::Pdf;
                     self.ensure_pdf(cx);
                     if let Some(pdf) = self.lib.as_ref().and_then(|l| l.pdf.clone()) {
-                        pdf.update(cx, |pdf, cx| pdf.go_to(page, cx));
+                        pdf.update(cx, |pdf, cx| if quote.is_empty() { pdf.go_to(page, cx) } else { pdf.find(page, &quote, cx) });
                     }
                 }
             }
@@ -2067,6 +2068,8 @@ impl Workspace {
                     self.run(Cmd::OpenGuide(arg == "new"), window, cx);
                     (arg == "go").then_some(Cmd::GuideGenerate)
                 }
+                // `quote:3|a sentence` opens the selected paper's PDF at page 3 with that sentence highlighted.
+                "quote" => self.lib.as_ref().and_then(|l| l.selected.clone()).zip(arg.split_once('|')).map(|(id, (page, quote))| Cmd::GotoSource(id, page.parse().ok(), quote.to_string())),
                 // `try:0` runs the first saved search as a trial.
                 "try" => self.lib.as_ref().and_then(|l| l.searches.get(arg.parse::<usize>().unwrap_or(0)).map(|s| Cmd::TrySearch(s.id.clone()))),
                 "wide" => Some(Cmd::ToggleWide),

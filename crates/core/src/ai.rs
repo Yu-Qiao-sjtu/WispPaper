@@ -9,7 +9,7 @@
 //! itself; a turn that ends in tool calls is answered with their results
 //! and the conversation goes on.
 
-use crate::fulltext::{score, terms};
+use crate::fulltext::{bare, score, terms};
 use crate::model::{FieldDef, PUBLICATION_STATUSES, Paper, PaperFile, READINGS, SCREENINGS, label};
 use crate::tools::ToolDef;
 use serde::{Deserialize, Serialize};
@@ -270,6 +270,7 @@ pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields:
 回答时遵循：\n\
 - 依据提供的文献材料作答。材料里没有的内容，明确说明文献库中没有相关信息，不要凭印象补充文献细节；需要用到常识性背景时，说明它不出自文献库。\n\
 - 引用文献时使用材料中的标签，例如 [P3]；引用全文某一页时写 [P3 p.5]。标签要紧跟在它支持的那句话后面。\n\
+- 依据的是全文某一页里的一句话时，把这句原文放进标签：[P3 p.5 \"原文中的一句\"]。原文必须逐字出自那一页，一句即可，不翻译、不改写、不拼接；界面会打开 PDF 并高亮它。拿不准原文时只写页码。\n\
 - 「我的笔记」是用户自己写的，可以引用，但要与论文本身的结论区分开。\n\
 - 只列出题目的文献没有摘要，对它们的内容不要下结论。\n\
 - 上面的材料不够时使用工具：search_fulltext 在已保存的全文里找短语或关键词，read_fulltext 按页读原文核对上下文，list_papers 和 get_paper 查文献记录。工具查的是整个文献库，不限于上面列出的文献。\n\
@@ -281,31 +282,70 @@ pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields:
     ctx
 }
 
-/// The labels an answer cites, in order of first appearance: (label, page).
-pub fn citations(answer: &str) -> Vec<(String, Option<usize>)> {
-    let mut found: Vec<(String, Option<usize>)> = vec![];
+/// Something an answer cites: a paper by its label, perhaps a page of its
+/// full text, perhaps a sentence quoted from that page.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Citation {
+    pub label: String,
+    pub page: Option<usize>,
+    /// The quoted sentence; empty when the answer gave none.
+    pub quote: String,
+}
+
+/// What an answer cites, in order of first appearance.
+pub fn citations(answer: &str) -> Vec<Citation> {
+    let mut found: Vec<Citation> = vec![];
     let mut rest = answer;
     while let Some(open) = rest.find('[') {
         rest = &rest[open + 1..];
-        let Some(close) = rest.find(']') else { break };
+        // `[P3 p.5 "a sentence"]`: the quotation may hold brackets of its own, so the
+        // label ends at the `]` right after the closing quotation mark.
+        let quoted = rest.find(['"', '“', '「']).filter(|at| !rest[..*at].contains(']')).and_then(|at| {
+            let mark = rest[at..].chars().next()?;
+            let closing = match mark {
+                '“' => '”',
+                '「' => '」',
+                _ => '"',
+            };
+            let start = at + mark.len_utf8();
+            let end = start + rest[start..].find(closing)?;
+            let tail = &rest[end + closing.len_utf8()..];
+            let close = tail.find(']').filter(|close| tail[..*close].trim().is_empty())?;
+            Some((&rest[..at], rest[start..end].trim(), end + closing.len_utf8() + close))
+        });
+        let (head, quote, close) = match quoted {
+            Some(parts) => parts,
+            None => {
+                let Some(close) = rest.find(']') else { break };
+                (&rest[..close], "", close)
+            }
+        };
         // "[P3]", "[P3 p.5]", "[P3, p.5]", "[P1, P2]"
-        for part in rest[..close].split([',', '，', ';', '、']) {
+        let before = found.len();
+        let mut last_in_bracket: Option<usize> = None;
+        for part in head.split([',', '，', ';', '、']) {
             let part = part.trim();
             let mut words = part.split_whitespace();
             let Some(first) = words.next() else { continue };
             let page = |word: &str| word.trim_start_matches("p.").trim_start_matches('p').parse::<usize>().ok();
             if first.starts_with('P') && first.len() > 1 && first[1..].bytes().all(|b| b.is_ascii_digit()) {
-                let entry = (first.to_string(), words.next().and_then(page));
-                if !found.contains(&entry) { found.push(entry) }
-            } else if first.starts_with("p.") && words.next().is_none() && let (Some(page), Some(last)) = (page(first), found.last().cloned()) {
+                found.push(Citation { label: first.to_string(), page: words.next().and_then(page), quote: String::new() });
+                last_in_bracket = Some(found.len() - 1);
+            } else if first.starts_with("p.") && words.next().is_none() && let (Some(page), Some(at)) = (page(first), last_in_bracket) {
                 // "[P3, p.5]": the page belongs to the label before the comma.
-                if last.1.is_none() {
-                    found.pop();
-                    let entry = (last.0, Some(page));
-                    if !found.contains(&entry) { found.push(entry) }
-                }
+                if found[at].page.is_none() { found[at].page = Some(page) }
             }
         }
+        // The quotation belongs to the last paper named in its brackets.
+        if let Some(at) = last_in_bracket { found[at].quote = quote.to_string() }
+        // The same thing cited again is listed once.
+        let mut kept = before;
+        for index in before..found.len() {
+            if found[..kept].contains(&found[index]) { continue }
+            found.swap(kept, index);
+            kept += 1;
+        }
+        found.truncate(kept);
         rest = &rest[close + 1..];
     }
     found
@@ -755,7 +795,6 @@ pub fn screen_prompt(topic: &str, criteria: &str, paper: &Paper, pages: Option<&
 /// Only letters and digits are compared, so the spacing, line breaks and
 /// hyphenation of PDF text do not hide a quotation that is really there.
 pub fn locate_quote(quote: &str, paper: &Paper, pages: Option<&[String]>) -> Option<Option<usize>> {
-    let bare = |text: &str| text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>();
     let wanted = bare(quote);
     // A few characters would be found anywhere.
     if wanted.chars().count() < 8 { return None }
@@ -878,10 +917,16 @@ mod tests {
 
     #[test]
     fn cited_labels() {
+        let cite = |label: &str, page: Option<usize>, quote: &str| Citation { label: label.into(), page, quote: quote.into() };
+        assert_eq!(citations("根尖 [P3] 与 [P1 p.5]；另见 [P2, p.7] 和 [P4、P3]，[1] 不是标签。"), [cite("P3", None, ""), cite("P1", Some(5), ""), cite("P2", Some(7), ""), cite("P4", None, "")]);
+        // A quoted sentence, with a comma and brackets of its own, in either kind of quotation mark.
         assert_eq!(
-            citations("根尖 [P3] 与 [P1 p.5]；另见 [P2, p.7] 和 [P4、P3]，[1] 不是标签。"),
-            [("P3".to_string(), None), ("P1".to_string(), Some(5)), ("P2".to_string(), Some(7)), ("P4".to_string(), None)]
+            citations("用了 10x 平台 [P1 p.2 \"Libraries were prepared, as described [12], with Chromium.\"]，另见 [P2 p.3 “第二句”] 和 [P1 p.2]。"),
+            [cite("P1", Some(2), "Libraries were prepared, as described [12], with Chromium."), cite("P2", Some(3), "第二句"), cite("P1", Some(2), "")]
         );
+        // The same quotation twice is one; an unclosed one is no quotation, and what follows is still read.
+        assert_eq!(citations("[P1 p.2 \"a b c\"] [P1 p.2 \"a b c\"] [P5 p.1 \"open] [P6]"), [cite("P1", Some(2), "a b c"), cite("P5", Some(1), ""), cite("P6", None, "")]);
+        assert_eq!(citations("说了 \"引号\" 的话 [P2]"), [cite("P2", None, "")]);
     }
 
     #[test]

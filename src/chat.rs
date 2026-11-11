@@ -78,10 +78,12 @@ impl Workspace {
             let chips: Vec<AnyElement> = chat
                 .ctx
                 .iter()
-                .flat_map(|ctx| ai::citations(content).into_iter().filter_map(move |(label, page)| ctx.sources.iter().find(|s| s.label == label).map(|s| (s.clone(), page))))
+                .flat_map(|ctx| ai::citations(content).into_iter().filter_map(move |cited| ctx.sources.iter().find(|s| s.label == cited.label).map(|s| (s.clone(), cited.page, cited.quote))))
                 .enumerate()
-                .map(|(n, (source, page))| {
+                .map(|(n, (source, page, quote))| {
                     let text = match page {
+                        // A quoted sentence is what the click will look for in the PDF.
+                        Some(page) if !quote.is_empty() => format!("{} p.{page} · “{quote}”", source.label),
                         Some(page) => format!("{} p.{page} · {}", source.label, source.title),
                         None => format!("{} · {}", source.label, source.title),
                     };
@@ -90,7 +92,7 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap(px(4.))
-                        .max_w(px(300.))
+                        .max_w(px(if quote.is_empty() { 300. } else { 440. }))
                         .h(px(24.))
                         .px(px(8.))
                         .rounded(px(6.))
@@ -100,7 +102,7 @@ impl Workspace {
                         .text_color(Theme::text_secondary())
                         .cursor_pointer()
                         .hover(|s| s.bg(Theme::hover()).border_color(Theme::accent()))
-                        .on_click(self.on(Cmd::GotoSource(source.paper_id.clone(), page), cx))
+                        .on_click(self.on(Cmd::GotoSource(source.paper_id.clone(), page, quote), cx))
                         .child(ui::icon("file-text", 12., Theme::accent()))
                         .child(div().min_w_0().truncate().child(text))
                         .into_any_element()
