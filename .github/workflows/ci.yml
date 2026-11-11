@@ -13,8 +13,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The whole workspace, window included, on the two systems the app targets.
-  app:
+  # The whole workspace, window included, on every system a package is built for.
+  check:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -23,8 +23,12 @@ jobs:
         include:
           - { name: Windows, os: windows-latest }
           - { name: macOS, os: macos-latest }
+          - { name: Linux, os: ubuntu-22.04 }
     steps:
       - uses: actions/checkout@v4
+      - name: Libraries GPUI builds against (Linux)
+        if: runner.os == 'Linux'
+        run: scripts/linux-build-deps.sh
       # rust-toolchain.toml names the toolchain; rustup installs it on first use.
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -32,16 +36,3 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Tests
         run: cargo test
-
-  # The engine, the network layer and the command line have no window: they must also hold on Linux.
-  engine:
-    name: Linux (engine and wisp)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy
-        run: cargo clippy -p wisp_core -p wisp_net -p wisp_cli --all-targets -- -D warnings
-      - name: Tests
-        run: cargo test -p wisp_core -p wisp_net -p wisp_cli
