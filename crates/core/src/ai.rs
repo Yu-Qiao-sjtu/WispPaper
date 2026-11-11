@@ -414,6 +414,14 @@ pub fn citation_spans(answer: &str) -> Vec<(std::ops::Range<usize>, Vec<Citation
     spans
 }
 
+/// A passage of a paper as a question hands it to the model: written the
+/// way answers cite, so that an answer can point back at it. The marks a
+/// quotation is closed by are taken out of the passage.
+pub fn quoted_passage(label: &str, page: usize, text: &str) -> String {
+    let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().map(|c| if matches!(c, '"' | '“' | '”') { '\'' } else { c }).collect();
+    format!("[{label} p.{page} \"{text}\"]")
+}
+
 /// How a quotation in an answer stands against the text of the paper it names.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Quoted {

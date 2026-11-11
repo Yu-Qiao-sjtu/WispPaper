@@ -60,16 +60,18 @@ impl Workspace {
                     .pt(px(6.))
                     .child(tab_button("tab-info", "信息", Tab::Info, self, cx))
                     .child(tab_button("tab-pdf", if has_pdf { "PDF" } else { "PDF（无）" }, Tab::Pdf, self, cx))
-                    .child(tab_button("tab-ask", "提问", Tab::Ask, self, cx)),
+                    .child(tab_button("tab-ask", "提问", Tab::Ask, self, cx))
+                    // Asking with the PDF put away, or in a panel too narrow for both: one click brings it beside the conversation.
+                    .when(tab == Tab::Ask && has_pdf && !(lib.split && width >= SPLIT_MIN), |d| d.child(div().flex_1()).child(ui::ghost_button("beside-pdf", Some("file-text"), Some("对照 PDF".into())).h(px(26.)).text_size(px(12.)).on_click(self.on(Cmd::BesidePdf(true), cx)))),
             );
-        // A citation followed from the paper's conversation: its PDF to the left, the conversation staying where it is.
+        // Asking about a paper: the conversation, and the paper's PDF to its right where the panel has room for both.
         let split = lib.split && tab == Tab::Ask && has_pdf && width >= SPLIT_MIN;
         let body = match tab {
             Tab::Ask if split => {
-                let chat_width = (width * 0.42).clamp(340., 480.);
-                let pdf = self.render_pdf_tab(width - chat_width, cx);
+                let chat_width = (width * 0.45).clamp(360., 520.);
                 let chat = self.render_chat(true, window, cx);
-                div().flex().size_full().child(div().flex_1().min_w_0().h_full().border_r_1().border_color(Theme::line()).child(pdf)).child(div().flex_none().w(px(chat_width)).h_full().child(chat)).into_any_element()
+                let pdf = self.render_pdf_tab(width - chat_width, cx);
+                div().flex().size_full().child(div().flex_none().w(px(chat_width)).h_full().border_r_1().border_color(Theme::line()).child(chat)).child(div().flex_1().min_w_0().h_full().child(pdf)).into_any_element()
             }
             Tab::Info => self.render_info(window, cx),
             Tab::Pdf => self.render_pdf_tab(width, cx),
@@ -345,10 +347,15 @@ impl Workspace {
         let Some(pdf) = lib.pdf.clone() else { return div().into_any_element() };
         let (file_id, file_title) = (file.id.clone(), file.title.clone());
         let beside = lib.split && lib.tab == Tab::Ask;
-        pdf.update(cx, |pdf, _| pdf.set_width(width));
-        let (page, count, percent, zoom) = {
+        // With the library's conversation on show as well, a selection can go to either.
+        let library_chat = lib.page == crate::app::Page::Ask;
+        pdf.update(cx, |pdf, _| {
+            pdf.set_width(width);
+            pdf.library_chat = library_chat;
+        });
+        let (page, count, percent, zoom, cutting) = {
             let view = pdf.read(cx);
-            (view.current_page(), view.page_count(), view.percent(), view.zoom())
+            (view.current_page(), view.page_count(), view.percent(), view.zoom(), view.cutting())
         };
         // The size chosen here is the one the next paper opens at.
         if let Some(lib) = self.lib.as_mut() { lib.zoom = zoom }
@@ -388,9 +395,11 @@ impl Workspace {
                                 .child(tool("pdf-zoom-in", "plus").on_click(self.on(Cmd::PdfZoom(ZoomTo::In), cx))),
                         )
                     })
-                    .child(ui::ghost_button("pdf-open", Some("link"), (width >= 620.).then(|| "用系统应用打开".into())).h(px(24.)).on_click(self.on(Cmd::OpenFile(file_id), cx)))
+                    // Cut a piece out of a page (a figure, a table) as a picture for the next question.
+                    .when(count > 0, |d| d.child(ui::ghost_button("pdf-cut", None, Some(if cutting { "取消截图".into() } else { "截图提问".into() })).h(px(24.)).px(px(6.)).text_size(px(12.)).when(cutting, |d| d.text_color(Theme::accent())).on_click(self.on(Cmd::PdfCut, cx))))
+                    .child(ui::ghost_button("pdf-open", Some("link"), (width >= 700.).then(|| "用系统应用打开".into())).h(px(24.)).on_click(self.on(Cmd::OpenFile(file_id), cx)))
                     // Beside the conversation: put the PDF away again.
-                    .when(beside, |d| d.child(tool("pdf-beside-close", "x").on_click(self.on(Cmd::SetTab(Tab::Ask), cx)))),
+                    .when(beside, |d| d.child(tool("pdf-beside-close", "x").on_click(self.on(Cmd::BesidePdf(false), cx)))),
             )
             .child(div().flex_1().min_h_0().child(pdf))
             .into_any_element()

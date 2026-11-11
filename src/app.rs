@@ -3,7 +3,7 @@
 //! by `run`, and the other modules render parts of it.
 
 use crate::input::{InputEvent, TextInput};
-use crate::pdf::{PdfView, Zoom, ZoomTo};
+use crate::pdf::{PdfEvent, PdfView, Zoom, ZoomTo};
 use crate::settings::{SettingsPage, SettingsView, UpdateState};
 use crate::shortcuts::{self, Dismiss};
 use crate::theme;
@@ -165,6 +165,10 @@ pub enum Cmd {
     ToggleWide,
     /// Draw the pages of the PDF on show larger, smaller, or at a given size.
     PdfZoom(ZoomTo),
+    /// Cut a piece out of a page as a picture for a question, or stop doing so.
+    PdfCut,
+    /// Show the paper's PDF to the right of its conversation, or put it away.
+    BesidePdf(bool),
     /// Show the selected paper's title and abstract translated, or stop showing it.
     ToggleTranslation,
     RetryTranslation,
@@ -193,11 +197,18 @@ pub enum Cmd {
     /// Choose pictures to go with the next question.
     AttachImages(bool),
     RemoveAttachment(bool, usize),
+    /// Take a passage quoted for the next question away again.
+    RemoveQuote(bool, usize),
     /// The person's answer to the assistant wanting to change the library.
     AnswerTools(bool, Consent),
     /// Unfold or fold the tool calls that start at this place in the conversation.
     ToggleTools(bool, usize),
     CopyText(String),
+    /// The pointer over the text of an answer (by its place in the conversation): selecting it.
+    PickText(bool, usize, crate::markdown::Pointer, crate::markdown::Place),
+    /// Copy what is selected in an answer; or put it into the question box as a quotation.
+    CopyPicked(bool),
+    QuotePicked(bool),
     /// Make a note of the selected paper out of an answer about it: the question, and the answer.
     AnswerToNote(String, String),
     /// Unfold or fold the list of the papers the library's questions are put to.
@@ -415,6 +426,8 @@ const MAX_CHAT_STEPS: usize = 24;
 
 /// The pictures one question may carry.
 pub const MAX_ATTACHMENTS: usize = 8;
+/// Passages of a PDF a question may carry.
+pub const MAX_QUOTES: usize = 6;
 
 /// A picture in a conversation: as it is drawn and sent, and the id it is kept under.
 #[derive(Clone)]
@@ -585,6 +598,15 @@ impl FetchRun {
 /// The papers asked about at the same time.
 const FETCH_WORKERS: usize = 2;
 
+/// A passage selected in a paper's PDF, to go with the next question.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatQuote {
+    pub paper_id: String,
+    /// The 1-based page it stands on.
+    pub page: usize,
+    pub text: String,
+}
+
 /// One conversation: with the library (the current list) or with one paper.
 pub struct Chat {
     pub input: Entity<TextInput>,
@@ -616,6 +638,8 @@ pub struct Chat {
     known: Vec<ai::Source>,
     /// The pictures already kept with the conversation.
     stored_images: HashSet<String>,
+    /// Passages selected in a PDF that go with the next question.
+    pub quotes: Vec<ChatQuote>,
     /// Pictures that go with the next question, and how many more are still being read.
     pub attachments: Vec<ChatImage>,
     pub attaching: usize,
@@ -635,6 +659,8 @@ pub struct Chat {
     pub tools_open: HashSet<usize>,
     /// The list of what the model was (or will be) given is unfolded.
     pub materials_open: bool,
+    /// What is selected in an answer: the answer's place among the messages, the two ends in order of selecting, and whether the pointer is still held.
+    pub picked: Option<(usize, crate::markdown::Place, crate::markdown::Place, bool)>,
     /// The quotations of the answers looked up in the papers they name, by label, page and quotation.
     pub checks: HashMap<(String, Option<usize>, String), ai::Quoted>,
     /// When the question being answered was asked.
@@ -690,10 +716,11 @@ pub struct Library {
     pub tab: Tab,
     /// The detail panel takes most of the window (reading a PDF).
     pub wide: bool,
-    /// The paper's PDF is shown beside its conversation.
+    /// The paper's PDF is shown to the right of its conversation, where the panel has room for both.
     pub split: bool,
     pub notes: Entity<TextInput>,
     pub pdf: Option<Entity<PdfView>>,
+    pdf_events: Option<Subscription>,
     /// How large PDF pages are drawn; it stays from paper to paper.
     pub zoom: Zoom,
     pub library_chat: Chat,
@@ -776,6 +803,7 @@ impl Chat {
             created_at: String::new(),
             known: vec![],
             stored_images: Default::default(),
+            quotes: vec![],
             attachments: vec![],
             attaching: 0,
             slash: 0,
@@ -786,6 +814,7 @@ impl Chat {
             running: vec![],
             tools_open: Default::default(),
             materials_open: false,
+            picked: None,
             checks: HashMap::new(),
             started: None,
         }
@@ -794,6 +823,20 @@ impl Chat {
     /// What the labels in the answers name.
     pub fn sources(&self) -> &[ai::Source] {
         self.ctx.as_ref().map_or(&self.known, |ctx| &ctx.sources)
+    }
+
+    /// The ends of what is selected in an answer, the earlier first.
+    pub fn picked_range(&self) -> Option<(usize, crate::markdown::Place, crate::markdown::Place)> {
+        let (at, from, to, _) = self.picked?;
+        Some(if to < from { (at, to, from) } else { (at, from, to) })
+    }
+
+    /// The text selected in an answer.
+    pub fn picked_text(&self) -> Option<String> {
+        let (at, from, to) = self.picked_range()?;
+        let ChatItem::Answer(answer) = self.messages.get(at)? else { return None };
+        let text = crate::markdown::text_between(answer, from, to);
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// The slash commands to offer for what is in the box right now.
@@ -863,6 +906,7 @@ impl Chat {
         self.created_at.clear();
         self.known.clear();
         self.stored_images.clear();
+        self.quotes.clear();
         self.attachments.clear();
         self.attaching = 0;
         self.slash = 0;
@@ -872,6 +916,7 @@ impl Chat {
         self.allow_changes = false;
         self.running.clear();
         self.tools_open.clear();
+        self.picked = None;
         self.checks.clear();
         self.started = None;
         self.input.update(cx, |input, cx| {
@@ -1440,13 +1485,21 @@ impl Workspace {
             Cmd::SetTab(tab) => {
                 if let Some(lib) = self.lib.as_mut() {
                     lib.tab = tab;
-                    lib.split = false;
                     if tab == Tab::Ask { lib.paper_chat.input.read(cx).focus(window) }
                 }
                 self.ensure_pdf(cx);
             }
             Cmd::ToggleWide => {
                 if let Some(lib) = self.lib.as_mut() { lib.wide = !lib.wide }
+            }
+            Cmd::PdfCut => {
+                if let Some(pdf) = self.lib.as_ref().and_then(|lib| lib.pdf.clone()) { pdf.update(cx, |pdf, cx| pdf.toggle_cutting(cx)) }
+            }
+            Cmd::BesidePdf(show) => {
+                if let Some(lib) = self.lib.as_mut() { lib.split = show }
+                // A panel too narrow for the two is widened; a window too small for that keeps the conversation.
+                if show && self.detail_width(window) < crate::detail::SPLIT_MIN && let Some(lib) = self.lib.as_mut() { lib.wide = true }
+                self.ensure_pdf(cx);
             }
             Cmd::PdfZoom(to) => {
                 if let Some(pdf) = self.lib.as_ref().filter(|lib| lib.tab == Tab::Pdf || lib.split).and_then(|lib| lib.pdf.clone()) { pdf.update(cx, |pdf, cx| pdf.zoom_to(to, cx)) }
@@ -1565,6 +1618,12 @@ impl Workspace {
                     if at < chat.attachments.len() { chat.attachments.remove(at); }
                 }
             }
+            Cmd::RemoveQuote(paper, at) => {
+                if let Some(lib) = self.lib.as_mut() {
+                    let chat = lib.chat_mut(paper);
+                    if at < chat.quotes.len() { chat.quotes.remove(at); }
+                }
+            }
             Cmd::AnswerTools(paper, consent) => {
                 let Some(pending) = self.lib.as_mut().and_then(|lib| {
                     let chat = lib.chat_mut(paper);
@@ -1595,6 +1654,44 @@ impl Workspace {
                 text.read(cx).focus(window);
                 self.modal = Some(Modal::Note { paper_id, text });
             }
+            Cmd::PickText(paper, at, pointer, place) => {
+                use crate::markdown::Pointer;
+                let Some(lib) = self.lib.as_mut() else { return };
+                // The keyboard goes to the window, so that copying finds the selection and not a text box.
+                if pointer == Pointer::Down { window.focus(&self.focus) }
+                // One selection at a time: starting one in a conversation ends the other's.
+                if pointer == Pointer::Down { lib.chat_mut(!paper).picked = None }
+                let chat = lib.chat_mut(paper);
+                match (pointer, chat.picked.as_mut()) {
+                    (Pointer::Down, _) => chat.picked = Some((at, place, place, true)),
+                    (Pointer::Drag, Some((answer, _, to, true))) if *answer == at => *to = place,
+                    (Pointer::Up, Some((_, from, to, held))) if *held => {
+                        *held = false;
+                        // A click selects nothing.
+                        if from == to { chat.picked = None }
+                    }
+                    _ => {}
+                }
+            }
+            Cmd::CopyPicked(paper) => {
+                if let Some(text) = self.lib.as_ref().and_then(|lib| lib.chat(paper).picked_text()) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.say("已复制", cx);
+                }
+            }
+            Cmd::QuotePicked(paper) => {
+                let Some(lib) = self.lib.as_mut() else { return };
+                let chat = lib.chat_mut(paper);
+                let Some(text) = chat.picked_text() else { return };
+                chat.picked = None;
+                // What the assistant said, as a quotation in the box: its words, marked as such, before the reader's own.
+                let quoted: String = text.lines().map(|line| format!("> {line}\n")).collect();
+                chat.input.update(cx, |input, cx| {
+                    let before = input.text().trim_end().to_string();
+                    input.set_text(&if before.is_empty() { format!("{quoted}\n") } else { format!("{before}\n\n{quoted}\n") }, cx);
+                });
+                chat.input.read(cx).focus(window);
+            }
             Cmd::ToggleMaterials => {
                 if let Some(lib) = self.lib.as_mut() { lib.library_chat.materials_open = !lib.library_chat.materials_open }
             }
@@ -1616,16 +1713,14 @@ impl Workspace {
                 self.run(Cmd::GotoSource(id, page, quote), window, cx);
             }
             Cmd::GotoSource(id, page, quote) => {
-                // Cited from the paper's own conversation: the PDF opens beside it, where the window has room.
-                let beside = self.lib.as_ref().is_some_and(|lib| lib.tab == Tab::Ask && lib.selected.as_deref() == Some(id.as_str()) && lib.pdf_file(&id).is_some()) && page.is_some();
+                // Cited from the paper's own conversation: the PDF opens to its right, where the window has room.
+                let mut beside = self.lib.as_ref().is_some_and(|lib| lib.tab == Tab::Ask && lib.selected.as_deref() == Some(id.as_str()) && lib.pdf_file(&id).is_some()) && page.is_some();
                 self.select(Some(id), window, cx);
-                if beside && let Some(lib) = self.lib.as_mut() {
-                    lib.split = true;
-                    if self.detail_width(window) < crate::detail::SPLIT_MIN { self.lib.as_mut().unwrap().wide = true }
-                    // A window too small for the two side by side shows the PDF in the chat's place, as before.
-                    if self.detail_width(window) < crate::detail::SPLIT_MIN && let Some(lib) = self.lib.as_mut() { lib.split = false }
+                if beside {
+                    self.run(Cmd::BesidePdf(true), window, cx);
+                    // A window too small for the two side by side shows the PDF in the conversation's place.
+                    beside = self.detail_width(window) >= crate::detail::SPLIT_MIN;
                 }
-                let beside = self.lib.as_ref().is_some_and(|lib| lib.split);
                 if let Some(page) = page && let Some(lib) = self.lib.as_mut() {
                     if !beside { lib.tab = Tab::Pdf }
                     self.ensure_pdf(cx);
@@ -1875,6 +1970,12 @@ impl Workspace {
             "zoom-in" => Cmd::PdfZoom(ZoomTo::In),
             "zoom-out" => Cmd::PdfZoom(ZoomTo::Out),
             "zoom-fit" => Cmd::PdfZoom(ZoomTo::Set(Zoom::FitWidth)),
+            // What is selected in an answer: the paper's conversation first, when both have something.
+            "copy-picked" => match self.lib.as_ref().map(|lib| (lib.paper_chat.picked.is_some(), lib.library_chat.picked.is_some())) {
+                Some((true, _)) => Cmd::CopyPicked(true),
+                Some((false, true)) => Cmd::CopyPicked(false),
+                _ => return,
+            },
             _ => return,
         };
         self.run(cmd, window, cx);
@@ -1948,9 +2049,10 @@ impl Workspace {
             selected: None,
             tab: Tab::Info,
             wide: false,
-            split: false,
+            split: true,
             notes,
             pdf: None,
+            pdf_events: None,
             zoom: Zoom::FitWidth,
             library_chat,
             paper_chat,
@@ -1990,7 +2092,6 @@ impl Workspace {
         let Some(lib) = self.lib.as_mut() else { return };
         lib.selected = id;
         lib.pdf = None;
-        lib.split = false;
         lib.paper_chat.reset(cx);
         lib.detail_scroll = ScrollHandle::new();
         match lib.selected_paper() {
@@ -2066,10 +2167,53 @@ impl Workspace {
     /// Open the PDF viewer when its tab is showing and the paper has a PDF.
     fn ensure_pdf(&mut self, cx: &mut Context<Self>) {
         let Some(lib) = self.lib.as_mut() else { return };
-        if !(lib.tab == Tab::Pdf || lib.split) || lib.pdf.is_some() { return }
+        if !(lib.tab == Tab::Pdf || (lib.tab == Tab::Ask && lib.split)) || lib.pdf.is_some() { return }
         let Some(path) = lib.selected.as_deref().and_then(|id| lib.pdf_file(id)).map(|f| lib.store.file_path(f)) else { return };
         let zoom = lib.zoom;
-        lib.pdf = Some(cx.new(|cx| PdfView::new(&path, zoom, cx)));
+        let pdf = cx.new(|cx| PdfView::new(&path, zoom, cx));
+        lib.pdf_events = Some(cx.subscribe(&pdf, |this, _, event: &PdfEvent, cx| this.pdf_event(event, cx)));
+        lib.pdf = Some(pdf);
+    }
+
+    /// What the PDF viewer reports: its selection copied, or handed to a conversation.
+    fn pdf_event(&mut self, event: &PdfEvent, cx: &mut Context<Self>) {
+        match event {
+            PdfEvent::Copied => self.say("已复制", cx),
+            PdfEvent::Picture(png, to_library) => {
+                self.attach_images(!*to_library, vec![Picture::Bytes(png.clone())], cx);
+                if *to_library { self.say("截图已加到文献库对话的输入框上方。", cx) } else { self.show_paper_chat(cx) }
+            }
+            PdfEvent::Quote(page, text, to_library) => {
+                let Some(lib) = self.lib.as_mut() else { return };
+                let Some(paper_id) = lib.selected.clone() else { return };
+                let quote = ChatQuote { paper_id, page: *page, text: text.clone() };
+                let chat = lib.chat_mut(!*to_library);
+                if chat.quotes.len() >= MAX_QUOTES { return self.fail(format!("一个问题最多带 {MAX_QUOTES} 段原文。先发出去，或者去掉一段。"), cx) }
+                if !chat.quotes.contains(&quote) { chat.quotes.push(quote) }
+                chat.history = None;
+                if *to_library {
+                    self.say("已加到文献库对话的输入框上方。", cx);
+                } else {
+                    self.show_paper_chat(cx);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Something from the PDF went to the paper's own conversation: the
+    /// conversation comes up with the PDF to its right. The panel is
+    /// widened for the two; a window too small for both shows the
+    /// conversation, with what was added over its box.
+    fn show_paper_chat(&mut self, cx: &mut Context<Self>) {
+        let narrow = self.settings.detail_width < crate::detail::SPLIT_MIN;
+        let Some(lib) = self.lib.as_mut() else { return };
+        if !(lib.split && lib.tab == Tab::Ask) {
+            (lib.split, lib.tab) = (true, Tab::Ask);
+            if narrow { lib.wide = true }
+            self.say("已加到这篇文献的提问里。", cx);
+        }
+        cx.notify();
     }
 
     /// Change one paper and save it.
@@ -2460,7 +2604,7 @@ impl Workspace {
         let paper_id = lib.selected.clone();
         let chat = if about_paper { &mut lib.paper_chat } else { &mut lib.library_chat };
         let question = chat.input.read(cx).text().trim().to_string();
-        if (question.is_empty() && chat.attachments.is_empty()) || chat.busy { return }
+        if (question.is_empty() && chat.attachments.is_empty() && chat.quotes.is_empty()) || chat.busy { return }
         chat.error.clear();
         chat.note.clear();
         if chat.attaching > 0 {
@@ -2468,7 +2612,7 @@ impl Workspace {
             return cx.notify();
         }
         // `/search …` and the like stand for a longer request; the bubble shows what was typed.
-        let prompt = match ai::read_input(&question) {
+        let prompt = match ai::read_input(if question.is_empty() && !chat.quotes.is_empty() { "这段原文说了什么？在这篇文献里起什么作用？" } else { &question }) {
             Ok(ai::Input::Ask(prompt)) => prompt,
             Ok(ai::Input::NewChat) => {
                 chat.reset(cx);
@@ -2533,6 +2677,14 @@ impl Workspace {
             chat.wire = wire;
             chat.protocol = Some(profile.protocol);
         }
+        // The passages selected in a PDF go first, written as the answers cite: the labels are known by now.
+        let quotes = std::mem::take(&mut chat.quotes);
+        let quoted: Vec<String> = quotes.iter().filter_map(|quote| Some(ai::quoted_passage(&chat.sources().iter().find(|source| source.paper_id == quote.paper_id)?.label, quote.page, &quote.text))).collect();
+        let (prompt, question) = if quoted.is_empty() {
+            (prompt, question)
+        } else {
+            (format!("我在文献的 PDF 里选中了下面的原文，问题是就它提的；引用它时沿用这里的出处写法。\n{}\n\n{prompt}", quoted.join("\n")), [quoted.join("\n"), question].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n"))
+        };
         let images = std::mem::take(&mut chat.attachments);
         chat.wire.push(ai::user_message_with(profile.protocol, &prompt, &wire_images(&images)));
         chat.messages.push(ChatItem::User { text: question, images });
@@ -2547,6 +2699,7 @@ impl Workspace {
                 // Nothing was sent: the question stays in the box, its pictures beside it, to be asked again.
                 chat.wire.pop();
                 if let Some(ChatItem::User { images, .. }) = chat.messages.pop() { chat.attachments = images }
+                chat.quotes = quotes;
                 if chat.messages.is_empty() { chat.ctx = None }
             }
         }
@@ -3690,6 +3843,8 @@ impl Workspace {
                 // `try:0` runs the first saved search as a trial.
                 "try" => self.lib.as_ref().and_then(|l| l.searches.get(arg.parse::<usize>().unwrap_or(0)).map(|s| Cmd::TrySearch(s.id.clone()))),
                 "wide" => Some(Cmd::ToggleWide),
+                "cut" => Some(Cmd::PdfCut),
+                "beside" => Some(Cmd::BesidePdf(arg != "off")),
                 // `zoom:150`, `zoom:page`, `zoom:width`, `zoom:in`, `zoom:out`
                 "zoom" => Some(Cmd::PdfZoom(match arg {
                     "in" => ZoomTo::In,

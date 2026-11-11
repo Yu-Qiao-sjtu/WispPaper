@@ -675,7 +675,7 @@ fn find_pdf(store: &mut Store, args: &Value, fetch: Fetch, download: Download) -
     let (todo, remaining, nameless) = if only.is_empty() {
         let lacking: Vec<Paper> = store.list_papers()?.into_iter().filter(|p| matches!(p.fulltext.as_str(), "missing" | "linked")).collect();
         let nameless = lacking.iter().filter(|p| !known(p)).count();
-        let mut todo: Vec<Paper> = lacking.into_iter().filter(|p| known(p)).collect();
+        let mut todo: Vec<Paper> = lacking.into_iter().filter(known).collect();
         let remaining = todo.len().saturating_sub(limit);
         todo.truncate(limit);
         (todo, remaining, nameless)

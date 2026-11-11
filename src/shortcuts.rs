@@ -5,7 +5,7 @@
 use gpui::*;
 use std::collections::BTreeMap;
 
-actions!(workspace, [Dismiss, FocusSearch, AddPaper, ImportPdf, AskLibrary, ToggleDetail, ShowSettings, ShowHome, NewLibrary, ZoomIn, ZoomOut, ZoomFit]);
+actions!(workspace, [Dismiss, FocusSearch, AddPaper, ImportPdf, AskLibrary, ToggleDetail, ShowSettings, ShowHome, NewLibrary, ZoomIn, ZoomOut, ZoomFit, CopyPicked]);
 
 pub struct Shortcut {
     pub id: &'static str,
@@ -74,7 +74,8 @@ pub fn rebuild(custom: &BTreeMap<String, String>, cx: &mut App) {
     cx.clear_key_bindings();
     crate::input::bind_keys(cx);
     let context = Some("Workspace");
-    let mut bindings = vec![KeyBinding::new("escape", Dismiss, context)];
+    // Copying what is selected in a PDF or in an answer: the text fields have the same key for their own selection.
+    let mut bindings = vec![KeyBinding::new("escape", Dismiss, context), KeyBinding::new("secondary-c", crate::pdf::CopySelection, Some("PdfView")), KeyBinding::new("secondary-c", CopyPicked, context)];
     for shortcut in &SHORTCUTS {
         let key = key_of(shortcut.id, custom);
         // A key from a hand-edited settings.json may not parse; `KeyBinding::new` would panic on it.

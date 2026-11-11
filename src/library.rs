@@ -464,8 +464,9 @@ impl Workspace {
                     .border_color(Theme::line())
                     .text_size(px(12.))
                     .text_color(Theme::text_tertiary())
-                    .child(if filtered || shown != total { format!("显示 {shown} / {total} 篇") } else { format!("共 {total} 篇") })
-                    .child(status),
+                    .gap(px(12.))
+                    .child(div().flex_none().child(if filtered || shown != total { format!("显示 {shown} / {total} 篇") } else { format!("共 {total} 篇") }))
+                    .child(div().min_w_0().truncate().child(status)),
             )
             .into_any_element()
     }

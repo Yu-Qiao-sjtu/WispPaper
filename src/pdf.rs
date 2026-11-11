@@ -6,7 +6,28 @@
 
 use crate::theme::Theme;
 use crate::ui;
-use gpui::*;
+use gpui::{prelude::FluentBuilder, *};
+use wisp_core::pdftext::{self, Mark};
+
+actions!(pdf, [CopySelection]);
+
+/// What the viewer tells whoever shows it.
+pub enum PdfEvent {
+    /// The selected text went to the clipboard.
+    Copied,
+    /// Add what is selected to a conversation: the 1-based page, the text, and whether to the library's (else the paper's own).
+    Quote(usize, String, bool),
+    /// A piece of a page as a picture (PNG) for the next question, and whether for the library's conversation.
+    Picture(Vec<u8>, bool),
+}
+
+/// A stretch of one page's glyphs, from where the pointer went down to where it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Selection {
+    page: usize,
+    anchor: usize,
+    focus: usize,
+}
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +40,8 @@ const KEEP_BYTES: usize = 240 << 20;
 /// The pixels of one rendered page at most. Past this an enlarged page is
 /// drawn softer rather than larger.
 const MAX_PAGE_PIXELS: f32 = 24_000_000.;
+/// Device pixels per point of the first, quick picture of a page: a quarter of the work of one for a dense display.
+const PREVIEW_SCALE: f32 = 1.5;
 const PAGE_GAP: f32 = 12.;
 /// The room left at either side of a page.
 const MARGIN: f32 = 16.;
@@ -84,6 +107,8 @@ enum Request {
     Page(usize, f32),
     /// Look for a quoted sentence, starting at this 0-based page.
     Find(Option<usize>, String),
+    /// The glyphs of a page, for selecting text on it.
+    Marks(usize),
 }
 
 enum Reply {
@@ -97,6 +122,7 @@ enum Reply {
     /// Where the quotation is: the page, and one box per line in page points.
     Found(usize, Vec<[f32; 4]>),
     NotFound,
+    Marks(usize, Vec<Mark>),
 }
 
 /// Collects the glyphs of a page as it is interpreted: what each one says
@@ -197,7 +223,7 @@ fn worker(path: PathBuf, requests: mpsc::Receiver<Request>, replies: async_chann
         // Of several quotations asked for in a row, only the last still matters.
         let find = waiting.iter().rev().find_map(|request| match request {
             Request::Find(page, quote) => Some((*page, quote.clone())),
-            Request::Page(..) => None,
+            Request::Page(..) | Request::Marks(_) => None,
         });
         // Scrolling queues pages faster than they render: the latest few are drawn,
         // newest first, and the view is told about the rest so it can ask again.
@@ -250,6 +276,16 @@ fn worker(path: PathBuf, requests: mpsc::Receiver<Request>, replies: async_chann
             };
             if replies.send_blocking(reply).is_err() { return }
         }
+
+        // The glyphs of the pages asked for, once the pages themselves are drawn: a page is looked at before it is selected in.
+        let mut marked: Vec<usize> = vec![];
+        for request in &waiting {
+            if let Request::Marks(index) = request && !marked.contains(index) { marked.push(*index) }
+        }
+        for index in marked {
+            let Some(page) = pages.get(index) else { continue };
+            if replies.send_blocking(Reply::Marks(index, pdftext::page_marks(page, &text_cache))).is_err() { return }
+        }
     }
 }
 
@@ -281,7 +317,22 @@ pub struct PdfView {
     device_scale: f32,
     /// A page to jump to once the file has opened.
     goto: Option<usize>,
+    /// The glyphs of the pages seen lately, and the pages they were asked for.
+    marks: HashMap<usize, Arc<Vec<Mark>>>,
+    marks_pending: HashSet<usize>,
+    selection: Option<Selection>,
+    /// The pointer is held down and drawing the selection out.
+    selecting: bool,
+    /// Whether the library's conversation is on show beside the paper's, to offer both for a quotation.
+    pub library_chat: bool,
+    /// The pointer cuts a piece out of a page instead of selecting its text.
+    cutting: bool,
+    /// The piece being cut or cut out: its page, and two corners in the page's points.
+    cut: Option<(usize, [f32; 4])>,
+    focus: FocusHandle,
 }
+
+impl EventEmitter<PdfEvent> for PdfView {}
 
 impl PdfView {
     pub fn new(path: &Path, zoom: Zoom, cx: &mut Context<Self>) -> Self {
@@ -313,6 +364,14 @@ impl PdfView {
             goto: None,
             highlight: None,
             missing: false,
+            marks: HashMap::new(),
+            marks_pending: HashSet::new(),
+            selection: None,
+            selecting: false,
+            library_chat: false,
+            cutting: false,
+            cut: None,
+            focus: cx.focus_handle(),
         }
     }
 
@@ -452,6 +511,15 @@ impl PdfView {
                 self.highlight = Some((index, boxes));
             }
             Reply::NotFound => self.missing = true,
+            Reply::Marks(index, marks) => {
+                self.marks_pending.remove(&index);
+                // Of a long paper, the glyphs of the pages read last are enough.
+                if self.marks.len() > 40 {
+                    let keep = self.selection.map(|selection| selection.page);
+                    self.marks.retain(|page, _| Some(*page) == keep || page.abs_diff(index) <= 4);
+                }
+                self.marks.insert(index, Arc::new(marks));
+            }
             Reply::Page(index, scale, width, height, bytes) => {
                 self.pending.remove(&index);
                 match image::RgbaImage::from_raw(width, height, bytes).filter(|_| width > 0) {
@@ -490,8 +558,24 @@ impl PdfView {
         let stale = image.as_ref().is_none_or(|(_, at)| (at - wanted).abs() > 0.01);
         if image.is_some() { self.touch(index) }
         if stale && !self.broken.contains(&index) && self.pending.insert(index) {
-            let _ = self.requests.send(Request::Page(index, wanted));
+            // A page not drawn yet comes quickly and coarse first, then at the size it is shown at.
+            let _ = self.requests.send(Request::Page(index, if image.is_none() { wanted.min(PREVIEW_SCALE) } else { wanted }));
         }
+        if !self.marks.contains_key(&index) && self.marks_pending.insert(index) {
+            let _ = self.requests.send(Request::Marks(index));
+        }
+        // What is selected on this page, under the quotation's marker.
+        let selected: Vec<Div> = self
+            .selection
+            .filter(|selection| selection.page == index)
+            .and_then(|selection| Some(pdftext::mark_boxes(self.marks.get(&index)?.get(selection.anchor.min(selection.focus)..=selection.anchor.max(selection.focus))?)))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|line| div().absolute().left(px(line[0] * scale)).top(px(line[1] * scale)).w(px((line[2] - line[0]) * scale)).h(px((line[3] - line[1]) * scale)).bg(Theme::selection()))
+            .collect();
+        // The piece being cut out of this page.
+        let cut = self.cut.filter(|(page, _)| *page == index).map(|(_, [x0, y0, x1, y1])| div().absolute().left(px(x0.min(x1) * scale)).top(px(y0.min(y1) * scale)).w(px((x1 - x0).abs() * scale)).h(px((y1 - y0).abs() * scale)).border_2().border_color(Theme::accent()).bg(Theme::selection()));
+        let cutting = self.cutting;
         // The quotation on this page: a translucent marker over each of its lines.
         let marks: Vec<Div> = self
             .highlight
@@ -502,10 +586,176 @@ impl PdfView {
             .collect();
         let sheet = div().relative().flex_none().ml(px(self.sheet_left(width))).w(px(width)).h(px(height)).bg(gpui::white()).border_1().border_color(Theme::line()).overflow_hidden();
         let sheet = match image {
-            Some((image, _)) => sheet.child(img(image).w(px(width)).h(px(height))).children(marks),
+            Some((image, _)) => sheet.when(cutting, |d| d.cursor_crosshair()).when(!cutting, |d| d.cursor_text()).child(img(image).w(px(width)).h(px(height))).children(selected).children(marks).children(cut),
             None => sheet.flex().items_center().justify_center().text_size(px(12.)).text_color(Theme::text_placeholder()).child(if self.broken.contains(&index) { format!("第 {} 页无法渲染", index + 1) } else { format!("第 {} 页", index + 1) }),
         };
         div().w_full().flex().pb(px(PAGE_GAP)).child(sheet).into_any_element()
+    }
+
+    /// The page under a point of the window, and the point in that page's own points.
+    fn locate(&self, position: Point<Pixels>) -> Option<(usize, f32, f32)> {
+        let top = self.list.logical_scroll_top().item_ix;
+        (top..self.sizes.len().min(top + 8)).find_map(|index| {
+            let bounds = self.list.bounds_for_item(index)?;
+            if position.y < bounds.top() || position.y >= bounds.bottom() { return None }
+            let scale = self.scale_of(index);
+            let left = f32::from(bounds.left()) + self.sheet_left(self.sizes[index].0 * scale);
+            Some((index, (f32::from(position.x) - left) / scale, f32::from(position.y - bounds.top()) / scale))
+        })
+    }
+
+    /// The pointer went down on a page: a selection starts at the glyph under it.
+    fn press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        self.selection = None;
+        self.selecting = false;
+        if self.cutting {
+            // A piece of the page is cut out from here.
+            self.cut = self.locate(event.position).map(|(page, x, y)| (page, [x, y, x, y]));
+            self.selecting = self.cut.is_some();
+            return cx.notify();
+        }
+        if let Some((page, x, y)) = self.locate(event.position) && let Some(at) = self.marks.get(&page).and_then(|marks| pdftext::mark_at(marks, x, y)) {
+            self.selection = Some(Selection { page, anchor: at, focus: at });
+            self.selecting = true;
+        }
+        cx.notify();
+    }
+
+    /// The pointer moved with the button held: the selection reaches to the glyph under it, on the page it began on.
+    fn drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.selecting { return }
+        if event.pressed_button != Some(MouseButton::Left) { return self.release(cx) }
+        let Some((page, x, y)) = self.locate(event.position) else { return };
+        if let Some((cut_page, corners)) = self.cut.as_mut() {
+            if *cut_page == page {
+                (corners[2], corners[3]) = (x, y);
+                cx.notify();
+            }
+            return;
+        }
+        let Some(at) = self.marks.get(&page).and_then(|marks| pdftext::mark_at(marks, x, y)) else { return };
+        if let Some(selection) = self.selection.as_mut().filter(|selection| selection.page == page && selection.focus != at) {
+            selection.focus = at;
+            cx.notify();
+        }
+    }
+
+    /// The button came up: a pointer that never left its glyph selected nothing.
+    fn release(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.selecting) { return }
+        if self.selection.is_some_and(|selection| selection.anchor == selection.focus) { self.selection = None }
+        // A piece too small to show anything was a slip of the hand.
+        if self.cut.is_some_and(|(_, [x0, y0, x1, y1])| (x1 - x0).abs() < 8. || (y1 - y0).abs() < 8.) { self.cut = None }
+        cx.notify();
+    }
+
+    /// Cut pieces out of pages with the pointer, or go back to selecting text.
+    pub fn toggle_cutting(&mut self, cx: &mut Context<Self>) {
+        self.cutting = !self.cutting;
+        (self.cut, self.selection, self.selecting) = (None, None, false);
+        cx.notify();
+    }
+
+    pub fn cutting(&self) -> bool {
+        self.cutting
+    }
+
+    /// The piece cut out, as a PNG: taken from the picture the page is drawn with.
+    fn cut_picture(&self) -> Option<Vec<u8>> {
+        let (page, [x0, y0, x1, y1]) = self.cut?;
+        let (image, scale, _) = self.images.get(&page)?;
+        let (width, height) = (image.size(0).width.0 as u32, image.size(0).height.0 as u32);
+        let edge = |at: f32, most: u32| ((at * scale).round().max(0.) as u32).min(most);
+        let (left, right, top, bottom) = (edge(x0.min(x1), width), edge(x0.max(x1), width), edge(y0.min(y1), height), edge(y0.max(y1), height));
+        if right <= left || bottom <= top { return None }
+        let pixels = image.as_bytes(0)?;
+        let mut piece = image::RgbaImage::new(right - left, bottom - top);
+        for (x, y, pixel) in piece.enumerate_pixels_mut() {
+            let at = (((top + y) * width + left + x) * 4) as usize;
+            // The page is kept as BGRA.
+            *pixel = image::Rgba([pixels[at + 2], pixels[at + 1], pixels[at], 255]);
+        }
+        let mut png = vec![];
+        image::DynamicImage::ImageRgba8(piece).to_rgb8().write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+        Some(png)
+    }
+
+    /// Hand the piece cut out to a conversation as a picture, and go back to selecting text.
+    fn send_cut(&mut self, to_library: bool, cx: &mut Context<Self>) {
+        let Some(png) = self.cut_picture() else { return };
+        (self.cut, self.cutting) = (None, false);
+        cx.emit(PdfEvent::Picture(png, to_library));
+        cx.notify();
+    }
+
+    /// The selected text as it reads, and the 1-based page it is on.
+    pub fn selected(&self) -> Option<(usize, String)> {
+        let selection = self.selection?;
+        let marks = self.marks.get(&selection.page)?;
+        let text = pdftext::marks_text(marks.get(selection.anchor.min(selection.focus)..=selection.anchor.max(selection.focus))?);
+        (!text.is_empty()).then_some((selection.page + 1, text))
+    }
+
+    fn copy(&mut self, cx: &mut Context<Self>) {
+        let Some((_, text)) = self.selected() else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        cx.emit(PdfEvent::Copied);
+    }
+
+    /// Hand what is selected to a conversation, and let go of it.
+    fn quote(&mut self, to_library: bool, cx: &mut Context<Self>) {
+        let Some((page, text)) = self.selected() else { return };
+        self.selection = None;
+        cx.emit(PdfEvent::Quote(page, text, to_library));
+        cx.notify();
+    }
+
+    /// What can be done with the selection, beside where it ends.
+    fn selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.selecting { return None }
+        // What the bar is about: the piece cut out of a page, or the text selected; and the box it stands under.
+        let (page, last, piece) = match (self.cut, self.selection) {
+            (Some((page, [x0, y0, x1, y1])), _) => (page, [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)], true),
+            (None, Some(selection)) => {
+                let marks = self.marks.get(&selection.page)?;
+                (selection.page, pdftext::mark_boxes(marks.get(selection.anchor.min(selection.focus)..=selection.anchor.max(selection.focus))?).pop()?, false)
+            }
+            (None, None) => return None,
+        };
+        let (item, view) = (self.list.bounds_for_item(page)?, self.list.viewport_bounds());
+        let scale = self.scale_of(page);
+        // Under the last line of the selection, kept inside the viewer.
+        let left = f32::from(item.left() - view.left()) + self.sheet_left(self.sizes.get(page)?.0 * scale) + last[0] * scale;
+        let top = f32::from(item.top() - view.top()) + last[3] * scale + 6.;
+        let button = |id: &'static str, label: &'static str| div().id(id).flex().flex_none().items_center().h(px(26.)).px(px(9.)).rounded(px(6.)).cursor_pointer().hover(|s| s.bg(Theme::hover())).child(label);
+        Some(
+            div()
+                .absolute()
+                .left(px(left.clamp(8., (self.width - 250.).max(8.))))
+                .top(px(top.clamp(8., (self.height - 44.).max(8.))))
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .p(px(3.))
+                .rounded(px(8.))
+                .bg(Theme::bg_body())
+                .border_1()
+                .border_color(Theme::line_strong())
+                .shadow(crate::theme::shadow_card())
+                .text_size(px(12.))
+                .occlude()
+                // A press on the bar is not a press on the page.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .when(!piece, |d| d.child(button("pdf-copy", "复制").on_click(cx.listener(|this, _, _, cx| this.copy(cx)))))
+                .when(!piece && self.library_chat, |d| d.child(button("pdf-quote-library", "加到文献库对话").text_color(Theme::accent()).on_click(cx.listener(|this, _, _, cx| this.quote(true, cx)))).child(button("pdf-quote-paper", "加到这篇的对话").text_color(Theme::accent()).on_click(cx.listener(|this, _, _, cx| this.quote(false, cx)))))
+                .when(!piece && !self.library_chat, |d| d.child(button("pdf-quote-paper", "添加到对话").text_color(Theme::accent()).on_click(cx.listener(|this, _, _, cx| this.quote(false, cx)))))
+                // A piece of the page: a picture for the next question.
+                .when(piece && self.library_chat, |d| d.child(button("pdf-cut-library", "截图加到文献库对话").text_color(Theme::accent()).on_click(cx.listener(|this, _, _, cx| this.send_cut(true, cx)))).child(button("pdf-cut-paper", "截图加到这篇的对话").text_color(Theme::accent()).on_click(cx.listener(|this, _, _, cx| this.send_cut(false, cx)))))
+                .when(piece && !self.library_chat, |d| d.child(button("pdf-cut-paper", "用这张截图提问").text_color(Theme::accent()).on_click(cx.listener(|this, _, _, cx| this.send_cut(false, cx)))))
+                .when(piece, |d| d.child(button("pdf-cut-cancel", "取消").on_click(cx.listener(|this, _, _, cx| this.toggle_cutting(cx)))))
+                .into_any_element(),
+        )
     }
 
     /// The viewer, `width` logical pixels wide.
@@ -539,10 +789,18 @@ impl Render for PdfView {
         self.device_scale = window.scale_factor();
         let entity = cx.entity();
         let (measured, wheel) = (cx.entity(), cx.entity());
+        let bar = self.selection_bar(cx);
         div()
+            .id("pdf-viewer")
+            .key_context("PdfView")
+            .track_focus(&self.focus)
             .size_full()
             .bg(Theme::bg_sunken())
             .relative()
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy(cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::press))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag(event, cx)))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.release(cx)))
             // Under the pages: it learns the viewer's height, and hears the wheel before the list does.
             .child(
                 canvas(
@@ -560,6 +818,7 @@ impl Render for PdfView {
             )
             .child(list(self.list.clone(), move |index, _, cx| entity.update(cx, |this, _| this.page(index))).size_full().pt(px(PAGE_GAP)))
             // Said plainly: the page is the cited one, the sentence was not found on it or anywhere else.
+            .children(bar)
             .children(self.missing.then(|| div().absolute().top(px(8.)).left_0().w_full().flex().justify_center().child(div().px(px(10.)).py(px(5.)).rounded(px(6.)).bg(Theme::bg_body()).border_1().border_color(Theme::line()).text_size(px(12.)).text_color(Theme::text_secondary()).child("已跳到引用的页，但没有在 PDF 里找到这句原文。"))))
             .into_any_element()
     }
