@@ -320,6 +320,23 @@ impl Paper {
         }
     }
 
+    /// The paper as a sentence cites it: `Zhang et al., 2019`.
+    pub fn citation(&self) -> String {
+        // `Zhang, Tian-Qi` or `Tian-Qi Zhang`: the family name either way.
+        let family = |name: &str| name.split_once(',').map(|(family, _)| family.trim().to_string()).unwrap_or_else(|| name.split_whitespace().last().unwrap_or("").to_string());
+        let names: Vec<String> = self.authors.split(';').map(str::trim).filter(|n| !n.is_empty()).map(family).collect();
+        let who = match names.as_slice() {
+            [] => self.title.split_whitespace().take(3).collect::<Vec<_>>().join(" "),
+            [one] => one.clone(),
+            [one, two] => format!("{one} and {two}"),
+            [first, ..] => format!("{first} et al."),
+        };
+        match self.year {
+            Some(year) => format!("{who}, {year}"),
+            None => who,
+        }
+    }
+
     /// "Zhang et al." style short author line.
     pub fn short_authors(&self) -> String {
         let names: Vec<&str> = self.authors.split(';').map(str::trim).filter(|n| !n.is_empty()).collect();

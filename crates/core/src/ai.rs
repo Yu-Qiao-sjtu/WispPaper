@@ -869,7 +869,7 @@ pub struct Slash {
     pub template: &'static str,
 }
 
-pub const SLASH: [Slash; 5] = [
+pub const SLASH: [Slash; 6] = [
     Slash {
         name: "search",
         about: "在全文和记录里检索",
@@ -893,6 +893,12 @@ pub const SLASH: [Slash; 5] = [
         about: "比较几篇文献的方法和结论",
         hint: "文献标签或题目，如 P1 P3",
         template: "比较下面这几篇文献：{}\n\n先用 get_paper 和 read_fulltext 把它们读一遍。用一张表列出各自的研究问题、材料与方法、主要结论和局限，表后用几句话说明它们一致、互补和矛盾的地方。依据全文的内容给出页码；只有摘要可依据的文献要说明。",
+    },
+    Slash {
+        name: "write",
+        about: "参照文献库里同一部分的写法起草一段",
+        hint: "哪一部分和要写的内容，如：导言 根系如何感知土壤紧实",
+        template: "参照文献库里的文献，帮我起草论文的一段：{}\n\n先判断这段属于论文的哪个部分（摘要、导言、方法、结果、讨论），用 find_sentences 取这一部分的候选句：先不带 query 看各篇文献怎么开头，再用英文关键词查与要写的内容相近的句子。然后用英文写出这一段：借鉴候选句的结构和措辞，但句子要自己写，不要照抄；引述他人结论的地方给出引用标签和页码。写完后列出你参考的 3 到 5 个候选句（原句、标签、页码），说明各借鉴了什么。文献库里没有这一部分的句子可参考时直接说明。",
     },
     Slash { name: "new", about: "开始一次新对话", hint: "", template: "" },
 ];
@@ -1012,6 +1018,28 @@ pub fn plain_request(profile: &Profile, system: &str, prompt: &str) -> Result<Ht
         Protocol::Responses => request.body["instructions"] = json!(system),
     }
     Ok(request)
+}
+
+/// What a model is told when it reads a page of a paper that gave no text.
+pub const READ_PAGE_PROMPT: &str = "这是一篇学术论文的一页的图像。按阅读顺序逐字转写这一页的文字（双栏先左栏后右栏）。标题单独成行；段落之间空一行；同一段内不要换行，行末被连字符拆开的单词要接回去。\n\
+不要转写页眉页脚和页码、图片里的文字、表格内容；图注和表注可以保留。保持原文的语言，不要翻译、不要总结、不要添加任何说明或 Markdown 标记。\n这一页没有正文文字时，只输出 EMPTY。";
+
+/// A request for the text of one page, given as a picture.
+pub fn read_page_request(profile: &Profile, image: ImageData) -> Result<HttpRequest, String> {
+    let mut request = plain_request(profile, "你是一个准确的文字转写工具。", READ_PAGE_PROMPT)?;
+    let message = user_message_with(profile.protocol, READ_PAGE_PROMPT, &[image]);
+    match profile.protocol {
+        Protocol::Anthropic => request.body["messages"] = json!([message]),
+        Protocol::OpenAI => request.body["messages"][1] = message,
+        Protocol::Responses => request.body["input"] = json!([message]),
+    }
+    Ok(request)
+}
+
+/// What a model made of a page: its text, empty when it said there is none.
+pub fn page_reading(reply: &str) -> String {
+    let text = reply.trim().trim_start_matches("```text").trim_start_matches("```").trim_end_matches("```").trim();
+    if text == "EMPTY" { String::new() } else { text.to_string() }
 }
 
 // ---- translation
@@ -1629,7 +1657,7 @@ mod tests {
     #[test]
     fn slash_popup() {
         let names = |input: &str| slash_matches(input).iter().map(|command| command.name).collect::<Vec<_>>();
-        assert_eq!(names("/"), ["search", "cite", "review", "compare", "new"]);
+        assert_eq!(names("/"), ["search", "cite", "review", "compare", "write", "new"]);
         assert_eq!(names("/c"), ["cite", "compare"]);
         assert_eq!(names("/RE"), ["review"]);
         // Found by what it does, after those found by name.

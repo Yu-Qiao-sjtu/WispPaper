@@ -51,16 +51,19 @@ pub enum Task {
     /// The assistant that reads the papers waiting for a decision, several at a time.
     Screen,
     Translate,
+    /// 写作's groundwork: sorting a full text into the parts of a paper, reading the pages of a scan.
+    Structure,
 }
 
 impl Task {
-    pub const ALL: [Task; 3] = [Task::Chat, Task::Screen, Task::Translate];
+    pub const ALL: [Task; 4] = [Task::Chat, Task::Screen, Task::Translate, Task::Structure];
 
     pub fn label(self) -> &'static str {
         match self {
             Task::Chat => "提问",
             Task::Screen => "批量筛选",
             Task::Translate => "翻译",
+            Task::Structure => "整理全文",
         }
     }
 }
@@ -74,6 +77,7 @@ pub struct Tasks {
     pub chat: String,
     pub screen: String,
     pub translate: String,
+    pub structure: String,
 }
 
 impl Tasks {
@@ -82,6 +86,7 @@ impl Tasks {
             Task::Chat => &self.chat,
             Task::Screen => &self.screen,
             Task::Translate => &self.translate,
+            Task::Structure => &self.structure,
         }
     }
 
@@ -90,6 +95,7 @@ impl Tasks {
             Task::Chat => &mut self.chat,
             Task::Screen => &mut self.screen,
             Task::Translate => &mut self.translate,
+            Task::Structure => &mut self.structure,
         } = id.to_string();
     }
 }
@@ -248,12 +254,12 @@ mod tests {
         assert_eq!((s.profiles[strong].id.as_str(), s.profiles[cheap].id.as_str()), ("m1", "m2"));
         let uses = |s: &Settings, task: Task| s.profile_for(task).unwrap().name.clone();
         // Unbound, everything is the first profile; screening and translation follow the one for questions.
-        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["strong", "strong", "strong"]);
+        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["strong", "strong", "strong", "strong"]);
         s.tasks.set(Task::Chat, "m2");
-        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["cheap", "cheap", "cheap"]);
+        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["cheap", "cheap", "cheap", "cheap"]);
         s.tasks.set(Task::Chat, "");
         s.tasks.set(Task::Translate, "m2");
-        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["strong", "strong", "cheap"]);
+        assert_eq!(Task::ALL.map(|task| uses(&s, task)), ["strong", "strong", "cheap", "strong"]);
         // A removed profile takes its bindings along, and its id is not handed out twice while others keep theirs.
         s.remove_profile(strong);
         assert_eq!((s.profiles.len(), s.tasks.translate.as_str(), uses(&s, Task::Chat).as_str()), (1, "m2", "cheap"));

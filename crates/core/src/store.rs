@@ -178,6 +178,41 @@ CREATE TABLE IF NOT EXISTS conversation_images (
     data BLOB NOT NULL,
     PRIMARY KEY (conversation_id, id)
 );
+
+-- 写作: the sentences of a stored full text, each with the part of the paper
+-- it stands in (a key of `structure::SECTIONS`), in reading order.
+CREATE TABLE IF NOT EXISTS sentences (
+    resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    section TEXT NOT NULL,
+    heading TEXT NOT NULL DEFAULT '',
+    page INTEGER NOT NULL,
+    -- Its place among the sentences of that part: 0 opens the part.
+    position INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (resource_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_sentences_section ON sentences(section);
+-- How a full text was sorted into parts: by rule (with the version of the
+-- rules), by a model (author says which), or not at all (none: no text).
+-- A file without a row has not been through this yet.
+CREATE TABLE IF NOT EXISTS structures (
+    resource_id TEXT PRIMARY KEY NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    method TEXT NOT NULL CHECK (method IN ('rules','model','none')),
+    author TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 0,
+    -- Who read the text off the pages when the file gave none: a model profile.
+    text_by TEXT NOT NULL DEFAULT '',
+    -- How many paragraphs the rules only guessed the part of (`structure::open_paragraphs`).
+    open INTEGER NOT NULL DEFAULT 0,
+    made_at TEXT NOT NULL
+);
+-- 草稿: what the person is writing, one text per part of the manuscript.
+CREATE TABLE IF NOT EXISTS drafts (
+    section TEXT PRIMARY KEY NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
 "#;
 
 const PAPER_COLUMNS: &str = "id, title, abstract, authors_json, journal, year, publication_state, url, source, \
@@ -278,6 +313,29 @@ pub struct Suggestion {
     pub confidence: Option<f64>,
     pub author: String,
     pub created_at: String,
+}
+
+/// How one full text was sorted into the parts of a paper.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StructureInfo {
+    pub paper_id: String,
+    /// rules, model, or none when the file gave no text.
+    pub method: String,
+    /// The model profile that sorted it; empty for the rules.
+    pub author: String,
+    /// The model profile that read the text off the pages; empty when the file gave its own.
+    pub text_by: String,
+    /// How many paragraphs the rules only guessed the part of.
+    pub open: usize,
+    /// How many sentences each part holds, by a key of `structure::SECTIONS`.
+    pub counts: BTreeMap<String, usize>,
+}
+
+/// A sentence of a stored full text, with the paper it is from.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PaperSentence {
+    pub paper_id: String,
+    pub sentence: crate::structure::Sentence,
 }
 
 /// What undoing a batch did.
@@ -861,17 +919,129 @@ impl Store {
         Ok(row.map(|(pages, error)| if error.is_empty() { Ok(json_strings(&pages)) } else { Err(error) }))
     }
 
+    /// Keep the page text of a file (or why there is none), and sort it
+    /// into the parts of a paper by rule, for 写作.
     pub fn save_fulltext_pages(&mut self, resource_id: &str, pages: &std::result::Result<Vec<String>, String>) -> Result<()> {
-        let (pages, error) = match pages {
+        self.save_pages(resource_id, pages, "")
+    }
+
+    /// Keep page text a model read off the pages of a file that gave none.
+    pub fn save_read_pages(&mut self, resource_id: &str, pages: Vec<String>, model: &str) -> Result<()> {
+        self.save_pages(resource_id, &Ok(pages), model)
+    }
+
+    fn save_pages(&mut self, resource_id: &str, pages: &std::result::Result<Vec<String>, String>, text_by: &str) -> Result<()> {
+        let (json, error) = match pages {
             Ok(pages) => (to_json(pages), String::new()),
             Err(error) => ("[]".to_string(), error.clone()),
         };
         // The file may have been removed while its text was being extracted.
-        self.db.execute(
+        let kept = self.db.execute(
             "INSERT INTO fulltext_text(resource_id, pages, error, extracted_at) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM resources WHERE id = ?1) \
              ON CONFLICT(resource_id) DO UPDATE SET pages = excluded.pages, error = excluded.error, extracted_at = excluded.extracted_at",
-            params![resource_id, pages, error, now_iso()],
+            params![resource_id, json, error, now_iso()],
         )?;
+        if kept == 0 { return Ok(()) }
+        let abstract_text: String = self.db.query_row("SELECT p.abstract FROM papers p JOIN resources r ON r.paper_id = p.id WHERE r.id = ?1", [resource_id], |r| r.get(0)).optional()?.unwrap_or_default();
+        match pages {
+            Ok(pages) => {
+                let (sentences, open) = crate::structure::by_rule(pages, &abstract_text);
+                self.write_structure(resource_id, "rules", "", text_by, open, &sentences)
+            }
+            Err(_) => self.write_structure(resource_id, "none", "", "", 0, &[]),
+        }
+    }
+
+    // ---- structure: the sentences of a full text, by the part of the paper
+
+    fn write_structure(&mut self, resource_id: &str, method: &str, author: &str, text_by: &str, open: usize, sentences: &[crate::structure::Sentence]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM sentences WHERE resource_id = ?1", [resource_id])?;
+        tx.execute(
+            "INSERT INTO structures(resource_id, method, author, version, text_by, open, made_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(resource_id) DO UPDATE SET method = excluded.method, author = excluded.author, version = excluded.version, open = excluded.open, made_at = excluded.made_at, \
+                text_by = CASE WHEN excluded.text_by = '' AND excluded.method = 'model' THEN structures.text_by ELSE excluded.text_by END",
+            params![resource_id, method, author, crate::structure::VERSION, text_by, open as i64, now_iso()],
+        )?;
+        {
+            let mut insert = tx.prepare("INSERT INTO sentences(resource_id, seq, section, heading, page, position, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+            for (seq, sentence) in sentences.iter().enumerate() {
+                insert.execute(params![resource_id, seq as i64, sentence.section, sentence.heading, sentence.page as i64, sentence.position as i64, sentence.text])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace the sentences of a file with those a model's reading of its
+    /// outline gave where the rules only guessed. `author` is the model profile.
+    pub fn save_model_structure(&mut self, resource_id: &str, author: &str, sentences: &[crate::structure::Sentence]) -> Result<()> {
+        if self.db.query_row("SELECT 1 FROM resources WHERE id = ?1", [resource_id], |_| Ok(())).optional()?.is_none() { return Ok(()) }
+        self.write_structure(resource_id, "model", author, "", 0, sentences)
+    }
+
+    /// Whether a file has yet to be read and sorted for 写作: one stored
+    /// before there was such a thing, or just added.
+    pub fn needs_structure(&self, resource_id: &str) -> Result<bool> {
+        Ok(self.db.query_row("SELECT 1 FROM structures WHERE resource_id = ?1", [resource_id], |_| Ok(())).optional()?.is_none())
+    }
+
+    /// Sort again, by rule, the texts sorted by an earlier version of the
+    /// rules. What a model sorted stays. Returns how many were redone.
+    pub fn restructure_outdated(&mut self) -> Result<usize> {
+        let outdated: Vec<String> = {
+            let mut stmt = self.db.prepare("SELECT resource_id FROM structures WHERE method = 'rules' AND version < ?1")?;
+            stmt.query_map([crate::structure::VERSION], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for id in &outdated {
+            let text_by: String = self.db.query_row("SELECT text_by FROM structures WHERE resource_id = ?1", [id], |r| r.get(0))?;
+            if let Some(pages) = self.fulltext_pages(id)? { self.save_pages(id, &pages, &text_by)? }
+        }
+        Ok(outdated.len())
+    }
+
+    /// How each full text outside the trash was sorted, by file id.
+    pub fn structures(&self) -> Result<BTreeMap<String, StructureInfo>> {
+        let mut out = BTreeMap::new();
+        let mut stmt = self.db.prepare(
+            "SELECT s.resource_id, r.paper_id, s.method, s.author, s.text_by, s.open FROM structures s JOIN resources r ON r.id = s.resource_id \
+             WHERE r.resource_type = 'fulltext' AND r.paper_id NOT IN (SELECT paper_id FROM trashed_papers)",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            out.insert(row.get::<_, String>(0)?, StructureInfo { paper_id: row.get(1)?, method: row.get(2)?, author: row.get(3)?, text_by: row.get(4)?, open: row.get::<_, i64>(5)? as usize, counts: BTreeMap::new() });
+        }
+        let mut stmt = self.db.prepare("SELECT resource_id, section, count(*) FROM sentences GROUP BY resource_id, section")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let Some(info) = out.get_mut(&row.get::<_, String>(0)?) { info.counts.insert(row.get(1)?, row.get::<_, i64>(2)? as usize); }
+        }
+        Ok(out)
+    }
+
+    /// The sentences of one part, of every paper outside the trash or of one paper, in reading order.
+    pub fn section_sentences(&self, section: &str, paper_id: &str) -> Result<Vec<PaperSentence>> {
+        let mut stmt = self.db.prepare(
+            "SELECT r.paper_id, s.section, s.heading, s.page, s.position, s.text FROM sentences s JOIN resources r ON r.id = s.resource_id \
+             WHERE s.section = ?1 AND r.resource_type = 'fulltext' AND (?2 = '' OR r.paper_id = ?2) AND r.paper_id NOT IN (SELECT paper_id FROM trashed_papers) \
+             ORDER BY r.paper_id, s.seq",
+        )?;
+        Ok(stmt
+            .query_map(params![section, paper_id], |r| Ok(PaperSentence { paper_id: r.get(0)?, sentence: crate::structure::Sentence { section: r.get(1)?, heading: r.get(2)?, page: r.get::<_, i64>(3)? as usize, position: r.get::<_, i64>(4)? as usize, text: r.get(5)? } }))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---- drafts
+
+    /// What the person has written for each part of the manuscript, by a key of `structure::SECTIONS`.
+    pub fn drafts(&self) -> Result<BTreeMap<String, String>> {
+        let mut stmt = self.db.prepare("SELECT section, body FROM drafts")?;
+        Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+    }
+
+    pub fn save_draft(&mut self, section: &str, body: &str) -> Result<()> {
+        if !crate::structure::SECTIONS.iter().any(|(key, _)| *key == section) { bail!("没有这个部分：{section}") }
+        self.db.execute("INSERT INTO drafts(section, body, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(section) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at", params![section, body, now_iso()])?;
         Ok(())
     }
 
@@ -1002,6 +1172,63 @@ fn copy_hashed(source: &Path, target: &Path) -> Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structure_and_drafts() {
+        let dir = temp_dir("structure");
+        let mut store = Store::in_memory(&dir).unwrap();
+        let p = store.add_paper(paper("A paper with parts", "")).unwrap();
+        let source = dir.join("a.txt");
+        std::fs::write(&source, "x").unwrap();
+        let file = store.import_file(&p.id, &source, "fulltext").unwrap();
+        assert!(store.needs_structure(&file.id).unwrap());
+        let page = "Introduction\n\nRoots grow continuously because of the stem cells at their tips. However, how they respond to soil remains poorly understood.\n\nMethods\n\nSeeds were sown on plates and grown for five days under long days.";
+        store.save_fulltext_pages(&file.id, &Ok(vec![page.into()])).unwrap();
+        assert!(!store.needs_structure(&file.id).unwrap());
+        let info = &store.structures().unwrap()[&file.id];
+        assert_eq!((info.method.as_str(), info.paper_id.as_str(), info.counts.get("introduction"), info.counts.get("methods")), ("rules", p.id.as_str(), Some(&2), Some(&1)));
+        let intro = store.section_sentences("introduction", "").unwrap();
+        assert_eq!(intro.iter().map(|s| (s.paper_id.as_str(), s.sentence.position, s.sentence.page)).collect::<Vec<_>>(), [(p.id.as_str(), 0, 1), (p.id.as_str(), 1, 1)]);
+        assert!(store.section_sentences("introduction", "P-other").unwrap().is_empty());
+
+        // A model's sorting replaces the rules' and is not redone by them.
+        let moved = crate::structure::Sentence { section: "results".into(), page: 1, text: "Seeds were sown on plates and grown for five days under long days.".into(), ..Default::default() };
+        store.save_model_structure(&file.id, "模型 · m", &[moved]).unwrap();
+        store.db.execute("UPDATE structures SET version = 0", []).unwrap();
+        assert_eq!(store.restructure_outdated().unwrap(), 0);
+        let info = &store.structures().unwrap()[&file.id];
+        assert_eq!((info.method.as_str(), info.author.as_str(), info.counts.get("results"), info.counts.get("introduction")), ("model", "模型 · m", Some(&1), None));
+        // The rules' own work is done again when the rules change.
+        store.db.execute("UPDATE structures SET method = 'rules'", []).unwrap();
+        assert_eq!(store.restructure_outdated().unwrap(), 1);
+        assert_eq!(store.section_sentences("introduction", &p.id).unwrap().len(), 2);
+
+        // A file that gives no text is known as such, and may get its text from a model later.
+        let scan = dir.join("scan.txt");
+        std::fs::write(&scan, "y").unwrap();
+        let q = store.add_paper(paper("A scan", "")).unwrap();
+        let scanned = store.import_file(&q.id, &scan, "fulltext").unwrap();
+        store.save_fulltext_pages(&scanned.id, &Err("没有可提取的文字".into())).unwrap();
+        assert_eq!(store.structures().unwrap()[&scanned.id].method, "none");
+        store.save_read_pages(&scanned.id, vec![page.into()], "视觉 · v").unwrap();
+        let info = &store.structures().unwrap()[&scanned.id];
+        assert_eq!((info.method.as_str(), info.text_by.as_str(), info.counts.get("methods")), ("rules", "视觉 · v", Some(&1)));
+        store.save_model_structure(&scanned.id, "模型 · m", &[]).unwrap();
+        assert_eq!(store.structures().unwrap()[&scanned.id].text_by, "视觉 · v");
+
+        // The trash and a removed file take their sentences along.
+        store.trash_paper(&p.id).unwrap();
+        assert!(store.section_sentences("introduction", "").unwrap().iter().all(|s| s.paper_id == q.id));
+        store.remove_file(&scanned.id).unwrap();
+        assert!(store.section_sentences("introduction", "").unwrap().is_empty());
+
+        assert!(store.drafts().unwrap().is_empty());
+        store.save_draft("introduction", "Roots are").unwrap();
+        store.save_draft("introduction", "Roots are long.").unwrap();
+        assert_eq!(store.drafts().unwrap().get("introduction").map(String::as_str), Some("Roots are long."));
+        assert!(store.save_draft("preface", "x").is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wisp-test-{name}-{}", new_id("T")));

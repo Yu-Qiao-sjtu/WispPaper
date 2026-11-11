@@ -82,6 +82,32 @@ mod device {
     }
 }
 
+/// The first pages of a PDF as PNG pictures, for a model to read a file
+/// that gives no text of its own. One and a half pixels per point: enough
+/// to read print by, and small enough to send.
+pub fn page_pictures(path: &Path, limit: usize) -> Result<Vec<Vec<u8>>, String> {
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::vello_cpu::color::palette::css::WHITE;
+    use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
+    let data = std::fs::read(path).map_err(|err| format!("无法读取文件：{err}"))?;
+    let pdf = Pdf::new(data).map_err(|err| format!("无法解析这个 PDF（{err:?}）。"))?;
+    let (cache, interpreter, settings) = (RenderCache::new(), InterpreterSettings::default(), RenderSettings::default());
+    let mut out = vec![];
+    for page in pdf.pages().iter().take(limit) {
+        let (w, h) = page.render_dimensions();
+        let scale = 1.5_f32.min(2000. / w.max(h).max(1.));
+        let pixmap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render(page, &cache, &interpreter, &settings, &PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE }))).map_err(|_| "这个 PDF 的页面画不出来。".to_string())?;
+        // On an opaque white background premultiplied colour is the colour itself.
+        let picture = image::RgbaImage::from_raw(pixmap.width() as u32, pixmap.height() as u32, pixmap.data_as_u8_slice().to_vec()).ok_or("这个 PDF 的页面画不出来。")?;
+        let mut png = vec![];
+        image::DynamicImage::ImageRgba8(picture).to_rgb8().write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|err| format!("页面图像写不出来：{err}"))?;
+        out.push(png);
+    }
+    if out.is_empty() { return Err("这个 PDF 没有页面。".into()) }
+    Ok(out)
+}
+
 fn worker(path: PathBuf, requests: mpsc::Receiver<Request>, replies: async_channel::Sender<Reply>) {
     use hayro::hayro_interpret::{Context, InterpreterCache, InterpreterSettings, TransformExt, interpret_page};
     use hayro::hayro_syntax::Pdf;

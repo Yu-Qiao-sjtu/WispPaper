@@ -20,8 +20,8 @@ use wisp_core::lookup::{self, Identifier};
 use wisp_core::model::*;
 pub(crate) use wisp_core::settings::default_root;
 use wisp_core::settings::{Settings, Task, settings_file};
-use wisp_core::store::{Conversation, ConversationInfo, ImportBatch, SavedSearch, Store, Suggestion, TrashEntry, translation_key};
-use wisp_core::{export, fulltext, import, time, tools};
+use wisp_core::store::{Conversation, ConversationInfo, ImportBatch, SavedSearch, Store, StructureInfo, Suggestion, TrashEntry, translation_key};
+use wisp_core::{export, fulltext, import, structure, time, tools};
 
 /// What the middle of an open library shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +36,8 @@ pub enum Page {
     Guide,
     /// 检索与导入: saved searches for the literature databases and what they brought in.
     Sources,
+    /// 写作: the manuscript, and beside it how the library's papers put the same part.
+    Write,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +216,14 @@ pub enum Cmd {
     /// How often the open library runs its searches on its own, in hours; 0 turns it off.
     SetAutoSync(u32),
     ToggleSearch(String),
+    // Writing
+    /// Write another part of the manuscript (a key of `structure::SECTIONS`).
+    WriteSection(String),
+    /// Put a citation in at the caret.
+    WriteCite(String),
+    /// Have the model sort the full texts into parts (false), or read the pages of the files that gave no text (true).
+    WriteRun(bool),
+    WriteStop,
     // Dialogs
     CloseModal,
     SubmitModal,
@@ -304,6 +314,59 @@ impl Screen {
     pub fn running(&self) -> bool {
         !self.reading.is_empty() || !self.todo.is_empty()
     }
+}
+
+/// 写作's groundwork under way: a model sorting full texts into the parts
+/// of a paper, or reading the pages of files that gave no text.
+#[derive(Default)]
+pub struct Sorting {
+    /// The run reads pages; otherwise it sorts parts.
+    pub reading: bool,
+    /// The files still to do, last first.
+    todo: Vec<String>,
+    /// The files being worked on.
+    pub working: Vec<String>,
+    pub total: usize,
+    pub done: usize,
+    pub failed: usize,
+    streak: usize,
+    pub model: String,
+    pub error: String,
+    /// Bumped when a run starts or stops, so what still arrives for an earlier one is dropped.
+    run: u64,
+}
+
+impl Sorting {
+    pub fn running(&self) -> bool {
+        !self.working.is_empty() || !self.todo.is_empty()
+    }
+}
+
+/// The pages of one file a model is asked to read: a paper is rarely longer, a book is not what this is for.
+const READ_PAGES: usize = 40;
+
+/// The writing page: the part of the manuscript being written, and the
+/// sentences the library's papers have in the same part.
+pub struct Writing {
+    /// The part being written, a key of `structure::SECTIONS`.
+    pub section: String,
+    pub editor: Entity<TextInput>,
+    /// Words to look for, instead of what is being written.
+    pub find: Entity<TextInput>,
+    /// What the candidates on show were looked for: the part and the words.
+    asked: Option<(String, String)>,
+    /// The English words a search was made with, when they are not the person's own.
+    pub words: String,
+    /// What `find_sentences` gave.
+    pub candidates: Option<Result<Value, String>>,
+    pub searching: bool,
+    round: u64,
+    /// English search words a model gave for something written in Chinese; `None` while it is asked.
+    keywords: HashMap<String, Option<String>>,
+    /// How each full text was sorted into parts, by file id.
+    pub structures: BTreeMap<String, StructureInfo>,
+    pub sorting: Sorting,
+    pub scroll: ScrollHandle,
 }
 
 /// A run of the screening assistant gives up after this many papers in a
@@ -500,6 +563,7 @@ pub struct Library {
     pub running: HashSet<String>,
     /// How many dropped or picked files are still being read.
     pub importing: usize,
+    pub writing: Writing,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -715,6 +779,7 @@ impl Library {
         self.searches = self.store.list_searches()?;
         self.suggestions = self.store.list_suggestions()?.into_iter().map(|s| (s.paper_id.clone(), s)).collect();
         self.batches = self.store.list_batches(30)?;
+        self.writing.structures = self.store.structures()?;
         // Filters on a field that no longer exists would hide everything.
         let known: HashSet<&str> = self.fields.iter().map(|f| f.id.as_str()).collect();
         self.filters.fields.retain(|id, _| known.contains(id.as_str()));
@@ -1000,6 +1065,41 @@ impl Workspace {
                 if let Some(lib) = self.lib.as_mut() {
                     lib.page = page;
                     if page == Page::Ask { lib.library_chat.input.read(cx).focus(window) }
+                    if page == Page::Write {
+                        lib.writing.editor.read(cx).focus(window);
+                        lib.writing.structures = lib.store.structures().unwrap_or_default();
+                        lib.writing.asked = None;
+                        self.writing_changed(cx);
+                    }
+                }
+            }
+            Cmd::WriteSection(section) => {
+                if let Some(lib) = self.lib.as_mut().filter(|l| l.writing.section != section) {
+                    let draft = lib.store.drafts().ok().and_then(|mut drafts| drafts.remove(&section)).unwrap_or_default();
+                    lib.writing.section = section;
+                    lib.writing.candidates = None;
+                    lib.writing.editor.update(cx, |input, cx| input.set_text(&draft, cx));
+                    lib.writing.editor.read(cx).focus(window);
+                    self.writing_changed(cx);
+                }
+            }
+            Cmd::WriteCite(cite) => {
+                if let Some(lib) = self.lib.as_ref() {
+                    lib.writing.editor.update(cx, |input, cx| {
+                        let before = input.text()[..input.caret()].chars().last();
+                        let space = if before.is_none_or(|c| c.is_whitespace()) { "" } else { " " };
+                        input.insert(&format!("{space}({cite})"), cx);
+                    });
+                    lib.writing.editor.read(cx).focus(window);
+                }
+            }
+            Cmd::WriteRun(reading) => self.write_run_start(reading, cx),
+            Cmd::WriteStop => {
+                if let Some(lib) = self.lib.as_mut() {
+                    let sorting = &mut lib.writing.sorting;
+                    sorting.run += 1;
+                    sorting.todo.clear();
+                    sorting.working.clear();
                 }
             }
             Cmd::SetFilter(key, value) => {
@@ -1516,6 +1616,20 @@ impl Workspace {
         }
         let guide = Guide::new(&info.topic, cx);
         let screen = Screen::new(&info.criteria, cx);
+        let section = "introduction".to_string();
+        let draft = store.drafts().ok().and_then(|mut drafts| drafts.remove(&section)).unwrap_or_default();
+        let editor = cx.new(|cx| TextInput::new("在这里写。右边会列出文献库里的文献在同一部分是怎么写的；中文也可以，先写下想表达的意思。", cx).multiline(14).with_text(&draft));
+        let find = cx.new(|cx| TextInput::new("找句子：输入词或短语，例如 remains unclear", cx));
+        subscriptions.push(cx.subscribe(&editor, |this, input, event: &InputEvent, cx| {
+            if *event != InputEvent::Changed { return }
+            let text = input.read(cx).text().to_string();
+            let saved = this.lib.as_mut().map(|lib| lib.store.save_draft(&lib.writing.section.clone(), &text));
+            if let Some(Err(err)) = saved { this.fail(format!("草稿没有保存：{err:#}"), cx) }
+        }));
+        // The caret moving to another paragraph changes what is looked for, as typing does.
+        subscriptions.push(cx.observe(&editor, |this, _, cx| this.writing_changed(cx)));
+        subscriptions.push(cx.observe(&find, |this, _, cx| this.writing_changed(cx)));
+        let writing = Writing { section, editor, find, asked: None, words: String::new(), candidates: None, searching: false, round: 0, keywords: HashMap::new(), structures: BTreeMap::new(), sorting: Sorting::default(), scroll: ScrollHandle::new() };
         let mut lib = Library {
             info,
             store,
@@ -1547,6 +1661,7 @@ impl Workspace {
             trial: None,
             running: HashSet::new(),
             importing: 0,
+            writing,
             _subscriptions: subscriptions,
         };
         if let Err(err) = lib.reload() {
@@ -1787,7 +1902,7 @@ impl Workspace {
             };
             let kind = if lib.store.paper_files(&target)?.iter().any(|f| f.kind == "fulltext") { "supplement" } else { "fulltext" };
             let file = lib.store.import_file(&target, path, kind)?;
-            if lib.store.fulltext_pages(&file.id)?.is_none() { lib.store.save_fulltext_pages(&file.id, &pages)? }
+            if lib.store.needs_structure(&file.id)? { lib.store.save_fulltext_pages(&file.id, &pages)? }
             selected = Some(target);
             Ok(())
         });
@@ -1802,26 +1917,35 @@ impl Workspace {
         if !outcome.is_empty() { self.say(outcome, cx) }
     }
 
-    /// Extract the text of stored full texts that have none yet, one at a time.
+    /// Read the text of the stored full texts that have not been read and
+    /// sorted into parts yet, one at a time: new files, and those an
+    /// earlier build read without telling headings from paragraphs.
     pub fn extract_missing(&mut self, cx: &mut Context<Self>) {
         let Some(lib) = self.lib.as_mut() else { return };
+        let _ = lib.store.restructure_outdated();
         let mut todo = vec![];
         for file in &lib.files {
             if file.kind != "fulltext" || lib.extracting.contains(&file.id) { continue }
-            if matches!(lib.store.fulltext_pages(&file.id), Ok(None)) {
-                todo.push((file.id.clone(), lib.store.file_path(file)));
+            if matches!(lib.store.needs_structure(&file.id), Ok(true)) {
+                todo.push((file.id.clone(), lib.store.file_path(file), lib.store.fulltext_pages(&file.id).ok().flatten()));
             }
         }
         if todo.is_empty() { return }
-        lib.extracting.extend(todo.iter().map(|(id, _)| id.clone()));
+        lib.extracting.extend(todo.iter().map(|(id, ..)| id.clone()));
         let library = lib.info.id.clone();
         cx.spawn(async move |this, cx| {
-            for (id, path) in todo {
-                let pages = cx.background_executor().spawn(async move { fulltext::file_pages(&path) }).await;
+            for (id, path, known) in todo {
+                let pages = cx.background_executor().spawn(async move { fulltext::reread(&path, known) }).await;
                 let same = this.update(cx, |this, cx| {
                     let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library) else { return false };
                     lib.extracting.remove(&id);
                     let _ = lib.store.save_fulltext_pages(&id, &pages);
+                    lib.writing.structures = lib.store.structures().unwrap_or_default();
+                    // The candidates on show were found without this paper.
+                    if lib.extracting.is_empty() {
+                        lib.writing.asked = None;
+                        this.writing_changed(cx);
+                    }
                     cx.notify();
                     true
                 });
@@ -2588,6 +2712,186 @@ impl Workspace {
         .detach();
     }
 
+    // ---- writing
+
+    /// Look for candidates again when the part, the words looked for or
+    /// what is being written has changed: a moment after the last change,
+    /// so typing does not ask for every letter.
+    fn writing_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut().filter(|l| l.page == Page::Write) else { return };
+        let writing = &mut lib.writing;
+        let find = writing.find.read(cx).text().trim().to_string();
+        let query = if find.is_empty() {
+            let editor = writing.editor.read(cx);
+            structure::writing_at(editor.text(), editor.caret())
+        } else {
+            find
+        };
+        let wanted = (writing.section.clone(), query);
+        if writing.asked.as_ref() == Some(&wanted) { return }
+        writing.asked = Some(wanted);
+        writing.round += 1;
+        let (round, library) = (writing.round, lib.info.id.clone());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(220)).await;
+            this.update(cx, |this, cx| {
+                if this.lib.as_ref().is_some_and(|l| l.info.id == library && l.writing.round == round) { this.writing_search(cx) }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Find the candidates for what was last asked. Something written in
+    /// Chinese is first put into English search words by the model for
+    /// translation (once per text): the library's sentences are English.
+    fn writing_search(&mut self, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_for_or_default(Task::Translate);
+        let Some(lib) = self.lib.as_mut() else { return };
+        let Some((section, query)) = lib.writing.asked.clone() else { return };
+        let round = lib.writing.round;
+        let mut words = query.clone();
+        if structure::in_chinese(&query) {
+            match lib.writing.keywords.get(&query) {
+                Some(Some(known)) => words = known.clone(),
+                Some(None) => return,
+                None => {
+                    // Without a model the words go as written, and find what little they can.
+                    if let Ok(request) = ai::plain_request(&profile, structure::KEYWORDS_SYSTEM, &query) {
+                        lib.writing.keywords.insert(query.clone(), None);
+                        lib.writing.searching = true;
+                        let (library, protocol) = (lib.info.id.clone(), profile.protocol);
+                        let work = cx.background_executor().spawn(async move { wisp_net::complete(request, protocol) });
+                        cx.spawn(async move |this, cx| {
+                            let reply = work.await;
+                            this.update(cx, |this, cx| {
+                                let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library) else { return };
+                                let found = reply.map(|words| words.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_else(|_| query.clone());
+                                lib.writing.keywords.insert(query, Some(found));
+                                if lib.writing.round == round { this.writing_search(cx) }
+                            })
+                            .ok();
+                        })
+                        .detach();
+                        return cx.notify();
+                    }
+                }
+            }
+        }
+        lib.writing.searching = true;
+        lib.writing.words = if words == query { String::new() } else { words.clone() };
+        self.library_tool("find_sentences", serde_json::json!({"section": section, "query": words, "limit": 30}), cx, move |this, result, _| {
+            let Some(lib) = this.lib.as_mut().filter(|l| l.writing.round == round) else { return };
+            lib.writing.searching = false;
+            lib.writing.candidates = Some(result);
+            lib.writing.scroll.set_offset(point(px(0.), px(0.)));
+        });
+    }
+
+    /// Start the model on the full texts: sorting those the rules sorted
+    /// into parts, or reading the pages of those that gave no text.
+    fn write_run_start(&mut self, reading: bool, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_for_or_default(Task::Structure);
+        let workers = self.settings.screen_workers;
+        let Some(lib) = self.lib.as_mut() else { return };
+        if lib.writing.sorting.running() { return }
+        lib.writing.sorting.error.clear();
+        if let Err(err) = ai::plain_request(&profile, "s", "p") {
+            lib.writing.sorting.error = err;
+            return cx.notify();
+        }
+        // Pages to look at: only a PDF has them. Parts to sort: the texts the rules had to guess at.
+        let mut todo: Vec<String> = lib.writing.structures.iter().filter(|(id, info)| if reading { info.method == "none" && lib.files.iter().any(|f| f.id == **id && f.format == "pdf") } else { info.method == "rules" && info.open >= structure::OPEN_ENOUGH }).map(|(id, _)| id.clone()).collect();
+        if todo.is_empty() { return }
+        todo.reverse();
+        let sorting = &mut lib.writing.sorting;
+        sorting.run += 1;
+        (sorting.reading, sorting.total, sorting.done, sorting.failed, sorting.streak, sorting.todo) = (reading, todo.len(), 0, 0, 0, todo);
+        sorting.model = format!("{} · {}", profile.title(), profile.model);
+        let run = sorting.run;
+        // A file's pages are read one after another; two files at a time is as much as a service takes kindly.
+        for _ in 0..if reading { workers.min(2) } else { workers } {
+            self.write_run_next(run, cx);
+        }
+        cx.notify();
+    }
+
+    /// Work on the next file of the run, and on the one after it once this is done.
+    fn write_run_next(&mut self, run: u64, cx: &mut Context<Self>) {
+        enum Made {
+            Sorted(Vec<structure::Sentence>),
+            Read(Vec<String>),
+        }
+        let profile = self.settings.profile_for_or_default(Task::Structure);
+        let Some(lib) = self.lib.as_mut().filter(|l| l.writing.sorting.run == run) else { return };
+        let Some(file_id) = lib.writing.sorting.todo.pop() else { return };
+        let Some(file) = lib.files.iter().find(|f| f.id == file_id).cloned() else { return self.write_run_next(run, cx) };
+        let (title, summary) = lib.paper(&file.paper_id).map(|p| (p.title.clone(), p.abstract_text.clone())).unwrap_or_default();
+        let author = format!("{} · {}", profile.title(), profile.model);
+        let (library, protocol, reading) = (lib.info.id.clone(), profile.protocol, lib.writing.sorting.reading);
+        let path = lib.store.file_path(&file);
+        let pages = lib.store.fulltext_pages(&file.id).ok().flatten().and_then(Result::ok).unwrap_or_default();
+        lib.writing.sorting.working.push(file_id.clone());
+        let name = title.clone();
+        let work = cx.background_executor().spawn(async move {
+            if reading {
+                let mut pages = vec![];
+                for picture in crate::pdf::page_pictures(&path, READ_PAGES)? {
+                    let request = ai::read_page_request(&profile, ai::ImageData { media_type: "image/png".into(), data: ai::base64(&picture) })?;
+                    pages.push(ai::page_reading(&wisp_net::complete(request, protocol)?));
+                }
+                if pages.iter().all(|page| page.trim().is_empty()) { return Err("模型在页面上没有读到文字。".to_string()) }
+                Ok(Made::Read(pages))
+            } else {
+                let blocks = structure::blocks(&pages);
+                let request = ai::plain_request(&profile, structure::OUTLINE_SYSTEM, &structure::outline_prompt(&name, &blocks))?;
+                let read = structure::parse_outline(&wisp_net::complete(request, protocol)?, &blocks, &summary)?;
+                // What stands under a heading that names its part stays there; the model decides the rest.
+                let (labels, sure) = structure::assign_sure(&blocks, &summary);
+                Ok(Made::Sorted(structure::sentences(&blocks, &structure::merge(&labels, &sure, &read))))
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let made = work.await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library && l.writing.sorting.run == run) else { return };
+                lib.writing.sorting.working.retain(|working| *working != file_id);
+                lib.writing.sorting.done += 1;
+                let saved = made.and_then(|made| {
+                    match made {
+                        Made::Sorted(sentences) => lib.store.save_model_structure(&file_id, &author, &sentences),
+                        Made::Read(pages) => lib.store.save_read_pages(&file_id, pages, &author),
+                    }
+                    .map_err(|e| format!("{e:#}"))
+                });
+                let sorting = &mut lib.writing.sorting;
+                match saved {
+                    Ok(()) => {
+                        sorting.streak = 0;
+                        lib.writing.structures = lib.store.structures().unwrap_or_default();
+                        lib.writing.asked = None;
+                        this.write_run_next(run, cx);
+                        this.writing_changed(cx);
+                    }
+                    Err(err) => {
+                        sorting.failed += 1;
+                        sorting.streak += 1;
+                        if sorting.streak >= SCREEN_GIVE_UP {
+                            sorting.error = format!("连续 {SCREEN_GIVE_UP} 篇没有成功，已停止。最后一篇「{title}」：{err}");
+                            sorting.todo.clear();
+                        } else {
+                            sorting.error = format!("「{title}」没有整理成：{err}");
+                            this.write_run_next(run, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Run a library tool off the main thread, on a connection of its own
     /// and with the network, and hand the result back if the same library
     /// is still open.
@@ -2794,8 +3098,17 @@ impl Workspace {
                 "open" => self.libraries.get(arg.parse::<usize>().unwrap_or(0)).map(|l| Cmd::OpenLibrary(l.id.clone())),
                 "select" => self.lib.as_ref().and_then(|l| l.shown.get(arg.parse::<usize>().unwrap_or(0)).map(|&i| Cmd::Select(l.papers[i].id.clone()))),
                 "tab" => Some(Cmd::SetTab(match arg { "pdf" => Tab::Pdf, "ask" => Tab::Ask, _ => Tab::Info })),
-                "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, "sources" => Page::Sources, "screen" => Page::Screen, _ => Page::Papers })),
+                "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, "sources" => Page::Sources, "screen" => Page::Screen, "write" => Page::Write, _ => Page::Papers })),
+                // `write:methods` shows another part of the manuscript; `draft:<text>` leaves text in it, as if typed.
+                "write" => Some(Cmd::WriteSection(arg.to_string())),
+                "draft" => {
+                    if let Some(lib) = self.lib.as_ref() { lib.writing.editor.update(cx, |input, cx| input.insert(arg, cx)) }
+                    return;
+                }
                 "screen" => Some(Cmd::ScreenStart),
+                // `sort` has the model sort the full texts into parts, `read` has it read the pages of those without text.
+                "sort" => Some(Cmd::WriteRun(false)),
+                "read" => Some(Cmd::WriteRun(true)),
                 // `guide:new` is what a new library shows; `guide:search` goes straight to composing, `guide:go` also generates.
                 "guide" => {
                     self.run(Cmd::OpenGuide(arg == "new"), window, cx);

@@ -7,7 +7,7 @@
 //! first time it is searched fills a cache; it changes nothing a person sees.
 
 use crate::filter::{Filters, filter_papers};
-use crate::fulltext::{file_pages, terms};
+use crate::fulltext::terms;
 use crate::libraries::{self, LibraryInfo};
 use crate::model::{FULLTEXTS, Paper, READINGS, SCREENINGS, one_of};
 use crate::sources::{self, Fetch};
@@ -99,6 +99,18 @@ pub fn catalog() -> Vec<ToolDef> {
                 "limit": {"type": "integer", "description": "最多返回多少处命中，默认 20，最大 100。"},
             }),
             &["query"],
+        ),
+        scoped(
+            "find_sentences",
+            "查找候选句",
+            "写作时的参考：从文献库里各篇文献的同一部分（摘要、导言、方法、结果、讨论）找出句子，看别人在这个位置是怎么写的。给出 query 时返回与它意思最接近的句子（按词匹配，英文效果最好）；不给时返回各篇文献这一部分开头的句子。句子逐字取自已保存的全文（摘要取自文献记录），带页码，可用于核对和引用；写作时应借鉴写法并注明出处，不要照抄。没有保存全文的文献只有摘要可查。",
+            json!({
+                "section": {"type": "string", "enum": keys(&crate::structure::SECTIONS), "description": "论文的哪个部分：abstract 摘要、introduction 导言、methods 方法、results 结果、discussion 讨论（含结论）、other 其他正文（如综述的主题章节）。"},
+                "query": {"type": "string", "description": "正在写的句子或要表达的意思，最好用英文关键词。"},
+                "paperId": {"type": "string", "description": "只看这一篇文献。"},
+                "limit": {"type": "integer", "description": "最多返回多少句，默认 20，最大 100。"},
+            }),
+            &["section"],
         ),
         scoped(
             "read_fulltext",
@@ -277,6 +289,7 @@ pub fn call_in(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, 
 fn dispatch(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fetch: Fetch) -> Result<Value> {
     match name {
         "find_citations" => find_citations(store, args),
+        "find_sentences" => find_sentences(store, args),
         "search_online" => search_online(store, args, fetch),
         // With how each database wants its queries written, for whoever composes the next one.
         "list_searches" => Ok(json!({"searches": store.list_searches()?, "syntax": sources::KINDS.iter().map(|(key, _)| (key.to_string(), json!(sources::syntax(key)))).collect::<Map<String, Value>>()})),
@@ -426,11 +439,65 @@ fn extract_missing(store: &mut Store, paper_id: Option<&str>) -> Result<()> {
         None => store.list_files()?,
     };
     for file in files.iter().filter(|f| f.kind == "fulltext") {
-        if store.fulltext_pages(&file.id)?.is_some() { continue }
-        let pages = file_pages(&store.file_path(file));
+        if !store.needs_structure(&file.id)? { continue }
+        let pages = crate::fulltext::reread(&store.file_path(file), store.fulltext_pages(&file.id)?);
         store.save_fulltext_pages(&file.id, &pages)?;
     }
+    store.restructure_outdated()?;
     Ok(())
+}
+
+fn find_sentences(store: &mut Store, args: &Value) -> Result<Value> {
+    let section = choice(args, "section", &crate::structure::SECTIONS)?;
+    if section.is_empty() { bail!("请用 section 指明论文的哪个部分。") }
+    let query = text(args, "query")?;
+    let only = text(args, "paperId")?;
+    let limit = number(args, "limit", 20, 100)?.max(1);
+    extract_missing(store, (!only.is_empty()).then_some(only))?;
+    let papers: Vec<Paper> = store.list_papers()?.into_iter().filter(|p| p.screening != "irrelevant" && (only.is_empty() || p.id == only)).collect();
+    let by_id: BTreeMap<&str, &Paper> = papers.iter().map(|p| (p.id.as_str(), p)).collect();
+    // The abstract is the record's; the other parts are read off the stored full text.
+    let found: Vec<crate::store::PaperSentence> = if section == "abstract" {
+        papers
+            .iter()
+            .flat_map(|p| {
+                let kept = crate::structure::split_sentences(&p.abstract_text).into_iter().filter(|s| crate::structure::usable(s)).enumerate();
+                kept.map(|(position, text)| crate::store::PaperSentence { paper_id: p.id.clone(), sentence: crate::structure::Sentence { section: "abstract".into(), position, text, ..Default::default() } }).collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        store.section_sentences(section, only)?.into_iter().filter(|s| by_id.contains_key(s.paper_id.as_str())).collect()
+    };
+    let texts: Vec<&str> = found.iter().map(|s| s.sentence.text.as_str()).collect();
+    let owners: Vec<&str> = found.iter().map(|s| s.paper_id.as_str()).collect();
+    let picked: Vec<usize> = if query.is_empty() {
+        // How each paper opens the part: first sentences first, paper by paper.
+        let mut order: Vec<usize> = (0..found.len()).collect();
+        order.sort_by_key(|i| (found[*i].sentence.position, *i));
+        order.into_iter().take(limit).collect()
+    } else {
+        crate::structure::rank(&texts, &owners, query, limit).into_iter().map(|(index, _)| index).collect()
+    };
+    let sentences: Vec<Value> = picked
+        .into_iter()
+        .map(|index| {
+            let (paper, sentence) = (by_id[owners[index]], &found[index].sentence);
+            let mut out = json!({"paperId": paper.id, "title": paper.title, "cite": paper.citation(), "journal": paper.journal, "position": sentence.position, "text": sentence.text});
+            if sentence.page > 0 { out["page"] = json!(sentence.page) }
+            if !sentence.heading.is_empty() { out["heading"] = json!(sentence.heading) }
+            out
+        })
+        .collect();
+    let with_sentences: std::collections::BTreeSet<&str> = owners.iter().copied().collect();
+    Ok(json!({
+        "section": section,
+        "query": query,
+        "sentences": sentences,
+        // What there was to choose from: a short list must not pass for "nobody writes this".
+        "sentencesInSection": found.len(),
+        "papersWithSection": with_sentences.len(),
+        "papersWithout": papers.len() - with_sentences.len(),
+    }))
 }
 
 /// A text ready for matching: lowercase, every whitespace character a space.
@@ -904,6 +971,44 @@ pub(crate) mod tests {
             assert!(error.contains(message), "{name}: {error}");
         }
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sentences_for_writing() {
+        let root = std::env::temp_dir().join(format!("wisp-tools-{}", new_id("T")));
+        let info = libraries::create(&root, "根", "根尖发育", "green").unwrap();
+        let mut store = Store::open(&info.dir).unwrap();
+        let paper = |title: &str, authors: &str, abstract_text: &str| Paper { title: title.into(), authors: authors.into(), year: Some(2021), abstract_text: abstract_text.into(), ..Default::default() };
+        let soil = store.add_paper(paper("Roots in compacted soil", "Zhu, Mingyuan; Hsu, Che-Wei; Pandey, Bipin", "Roots adapt to compacted soil by remodelling their cell walls in outer tissues. We profiled rice roots at single-cell resolution.")).unwrap();
+        let atlas = store.add_paper(paper("A root atlas", "Zhang, Tian-Qi; Wang, Jia-Wei", "")).unwrap();
+        let text = |intro: &str, results: &str| format!("Introduction\n\n{intro}\n\nResults\n\nA heading of the paper\n\n{results}\n\nReferences\n\n1. Someone, A. A paper that is cited here and nowhere else. Journal 1, 1 (2020).");
+        for (id, name, body) in [
+            (&soil.id, "soil.txt", text("Soil compaction reduces root penetration and thereby limits the uptake of water. However, how roots respond to compacted soil at the cellular level remains poorly understood.", "We profiled more than 47,000 root cells grown in compacted soil. Cell wall genes were induced in the outer tissues of roots in compacted soil.")),
+            (&atlas.id, "atlas.txt", text("Roots grow continuously because of the stem cells at their tips. Single-cell RNA sequencing has transformed the study of root development in recent years.", "About 15,000 cells were profiled from the root tips of seedlings.")),
+        ] {
+            let source = root.join(name);
+            std::fs::write(&source, body).unwrap();
+            store.import_file(id, &source, "fulltext").unwrap();
+        }
+        drop(store);
+        // No question: how each paper opens the part.
+        let openers = call(&root, "find_sentences", &json!({"section": "introduction"})).unwrap();
+        assert_eq!((openers["sentencesInSection"].as_u64(), openers["papersWithSection"].as_u64(), openers["papersWithout"].as_u64()), (Some(4), Some(2), Some(0)));
+        assert_eq!(openers["sentences"].as_array().unwrap().iter().map(|s| s["position"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 0, 1, 1]);
+        // A question: the sentences that say it, with where they are from.
+        let found = call(&root, "find_sentences", &json!({"section": "introduction", "query": "how roots respond to compaction is poorly understood", "limit": 1})).unwrap();
+        let best = &found["sentences"][0];
+        assert_eq!((best["paperId"].as_str(), best["cite"].as_str(), best["page"].as_u64()), (Some(soil.id.as_str()), Some("Zhu et al., 2021"), Some(1)));
+        assert!(best["text"].as_str().unwrap().starts_with("However, how roots respond"));
+        // The same words in another part are another matter; the paper's own heading comes along.
+        let results = call(&root, "find_sentences", &json!({"section": "results", "query": "compacted soil", "paperId": soil.id})).unwrap();
+        assert_eq!((results["sentences"].as_array().unwrap().len(), results["sentences"][0]["heading"].as_str()), (2, Some("A heading of the paper")));
+        assert_eq!(call(&root, "find_sentences", &json!({"section": "methods"})).unwrap()["sentences"], json!([]));
+        // The abstract is the record's, with or without a stored text.
+        let abstracts = call(&root, "find_sentences", &json!({"section": "abstract", "query": "cell walls"})).unwrap();
+        assert_eq!((abstracts["sentences"][0]["paperId"].as_str(), abstracts["sentences"][0].get("page"), abstracts["papersWithout"].as_u64()), (Some(soil.id.as_str()), None, Some(1)));
+        assert!(call(&root, "find_sentences", &json!({"section": "preface"})).is_err());
+        assert_eq!(describe_call("find_sentences", &json!({"section": "introduction", "query": "soil"})), "查找候选句：soil · introduction");
     }
 
     #[test]

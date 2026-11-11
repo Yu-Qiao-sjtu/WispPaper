@@ -827,6 +827,7 @@ impl Workspace {
             row(Task::Screen.label(), Some("筛选页里替你逐篇阅读待判断文献的助手。文献多的时候，可以给它一个更快、更便宜的模型。".into()), pick(1, Task::Screen, self, cx)).into_any_element(),
             row("同时阅读的篇数", Some("批量筛选时同时发出的请求数。服务限速时调小。".into()), segmented("workers", workers, WORKERS.iter().position(|count| *count == settings.screen_workers).unwrap_or(usize::MAX), self, cx)).into_any_element(),
             row(Task::Translate.label(), Some("翻译题目和摘要。翻译用不着思考：可以给它一个把「思考」设为关闭的小模型。".into()), pick(2, Task::Translate, self, cx)).into_any_element(),
+            row(Task::Structure.label(), Some("写作页的准备工作：把全文按导言、方法、结果、讨论分开，以及读出扫描件页面上的文字（需要能看图的模型）。".into()), pick(3, Task::Structure, self, cx)).into_any_element(),
         ];
         // The column's width in pixels, less the card's border and padding: a
         // wrapping text field needs to be told its width here, where every

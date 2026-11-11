@@ -9,6 +9,8 @@
 //! - `export`   BibTeX and CSV writers
 //! - `lookup`   Crossref / Europe PMC records → `Paper`
 //! - `fulltext` page text of a stored PDF
+//! - `pdftext`  that text read off a PDF's glyphs, with the breaks the page shows
+//! - `structure` that text sorted into the parts of a paper and cut into sentences, for 写作
 //! - `markdown` the Markdown of an answer → blocks to draw
 //! - `ai`       context building, request bodies and stream parsing for 文献库提问
 //! - `sources`  literature database searches: URLs to ask, records read from the replies
@@ -27,9 +29,11 @@ pub mod lookup;
 pub mod markdown;
 pub mod mcp;
 pub mod model;
+pub mod pdftext;
 pub mod settings;
 pub mod sources;
 pub mod store;
+pub mod structure;
 pub mod time;
 pub mod tools;
 pub mod update;
