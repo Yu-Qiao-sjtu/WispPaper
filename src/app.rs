@@ -8,7 +8,7 @@ use crate::settings::{SettingsPage, SettingsView, UpdateState};
 use crate::shortcuts::{self, Dismiss};
 use crate::theme;
 use gpui::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 use serde_json::Value;
@@ -19,7 +19,7 @@ use wisp_core::lookup::{self, Identifier};
 use wisp_core::model::*;
 pub(crate) use wisp_core::settings::default_root;
 use wisp_core::settings::{Settings, settings_file};
-use wisp_core::store::{ImportBatch, SavedSearch, Store, TrashEntry};
+use wisp_core::store::{ImportBatch, SavedSearch, Store, Suggestion, TrashEntry};
 use wisp_core::{export, fulltext, import, time, tools};
 
 /// What the middle of an open library shows.
@@ -29,6 +29,8 @@ pub enum Page {
     /// 文献库提问: questions over the current list.
     Ask,
     Trash,
+    /// 筛选: the papers waiting for a decision, with what the assistant suggests for each.
+    Screen,
     /// The guide of a new library: where to start, and searches composed with the assistant.
     Guide,
     /// 检索与导入: saved searches for the literature databases and what they brought in.
@@ -160,6 +162,12 @@ pub enum Cmd {
     GuideGenerate,
     GuideToggleIdea(usize),
     GuideImport,
+    // Screening
+    /// Ask the assistant about the pending papers it has not judged yet.
+    ScreenStart,
+    ScreenStop,
+    /// The person's decision on a paper, made on the screening page.
+    ScreenDecide(String, String),
     // Dialogs
     CloseModal,
     SubmitModal,
@@ -216,6 +224,36 @@ impl Guide {
         Guide { choosing: false, keywords, kinds: vec!["pubmed".into()], busy: false, error: String::new(), ideas: vec![], round: 0 }
     }
 }
+
+/// The screening page: what to screen against, and the assistant's run
+/// over the papers still waiting for a decision.
+pub struct Screen {
+    pub criteria: Entity<TextInput>,
+    /// Papers the assistant has yet to be asked about in this run, last first.
+    todo: Vec<String>,
+    /// Requests in flight.
+    active: usize,
+    pub total: usize,
+    pub done: usize,
+    pub error: String,
+    /// Bumped when a run starts or stops, so answers to an earlier one are dropped.
+    run: u64,
+}
+
+impl Screen {
+    fn new(criteria: &str, cx: &mut App) -> Screen {
+        let criteria = cx.new(|cx| TextInput::new("筛选标准：什么样的文献应当收进这个文献库。留空则按文献库的主题判断。", cx).multiline(2).with_text(criteria));
+        Screen { criteria, todo: vec![], active: 0, total: 0, done: 0, error: String::new(), run: 0 }
+    }
+
+    /// Whether the assistant is working through the papers right now.
+    pub fn running(&self) -> bool {
+        self.active > 0 || !self.todo.is_empty()
+    }
+}
+
+/// How many papers the assistant is asked about at the same time.
+const SCREEN_WORKERS: usize = 3;
 
 /// The steps one question may take. Each is a request to the model; all but
 /// the last end in tool calls.
@@ -305,6 +343,9 @@ pub struct Library {
     /// Files whose text is being extracted.
     pub extracting: HashSet<String>,
     pub guide: Guide,
+    pub screen: Screen,
+    /// The assistant's suggestion for each paper that has one.
+    pub suggestions: HashMap<String, Suggestion>,
     pub searches: Vec<SavedSearch>,
     /// The latest import batches, newest first.
     pub batches: Vec<ImportBatch>,
@@ -392,6 +433,20 @@ impl Library {
         files.iter().find(|f| f.kind == "fulltext" && f.format == "pdf").or(files.iter().find(|f| f.format == "pdf")).copied()
     }
 
+    /// The papers waiting for a decision, as the screening page lists them:
+    /// those with a suggestion first (to include, related, uncertain,
+    /// irrelevant; the surer ones first), then the rest, newest first.
+    pub fn screen_queue(&self) -> Vec<&Paper> {
+        let rank = |p: &Paper| match self.suggestions.get(&p.id) {
+            Some(s) => (SCREENINGS.iter().position(|(key, _)| *key == s.verdict).unwrap_or(9), -s.confidence.unwrap_or(0.)),
+            None => (99, 0.),
+        };
+        let mut queue: Vec<&Paper> = self.papers.iter().filter(|p| p.screening == "pending").collect();
+        // Stable: within a group the library's own order holds.
+        queue.sort_by(|a, b| rank(a).partial_cmp(&rank(b)).unwrap_or(std::cmp::Ordering::Equal));
+        queue
+    }
+
     pub fn refilter(&mut self) {
         self.shown = filter::filter_papers(&self.papers, &self.filters, time::now_millis());
     }
@@ -403,6 +458,7 @@ impl Library {
         self.files = self.store.list_files()?;
         self.trash = self.store.list_trash()?;
         self.searches = self.store.list_searches()?;
+        self.suggestions = self.store.list_suggestions()?.into_iter().map(|s| (s.paper_id.clone(), s)).collect();
         self.batches = self.store.list_batches(30)?;
         // Filters on a field that no longer exists would hide everything.
         let known: HashSet<&str> = self.fields.iter().map(|f| f.id.as_str()).collect();
@@ -864,6 +920,25 @@ impl Workspace {
                 if let Some(Modal::Search { kind, .. }) = self.modal.as_mut() { *kind = value }
             }
 
+            Cmd::ScreenStart => self.screen_start(cx),
+            Cmd::ScreenStop => {
+                if let Some(lib) = self.lib.as_mut() {
+                    // Answers still on their way belong to a run that is over.
+                    lib.screen.run += 1;
+                    lib.screen.todo.clear();
+                    lib.screen.active = 0;
+                }
+            }
+            Cmd::ScreenDecide(id, verdict) => {
+                let Some(lib) = self.lib.as_ref() else { return };
+                // The paper after this one in the queue comes up next; the one before when it was the last.
+                let queue: Vec<&str> = lib.screen_queue().iter().map(|p| p.id.as_str()).collect();
+                let next = queue.iter().position(|p| *p == id).and_then(|at| queue.get(at + 1).or(at.checked_sub(1).and_then(|before| queue.get(before)))).map(|p| p.to_string());
+                // Agreeing with the assistant takes its reason along; deciding otherwise leaves the reason to the person.
+                let reason = lib.suggestions.get(&id).filter(|s| s.verdict == verdict).map(|s| s.reason.clone()).unwrap_or_default();
+                if self.edit_paper(&id, cx, |p| p.decide(&verdict, &reason)) { self.select(next, window, cx) }
+            }
+
             Cmd::OpenGuide(choosing) => {
                 if let Some(lib) = self.lib.as_mut() {
                     lib.page = Page::Guide;
@@ -1015,6 +1090,7 @@ impl Workspace {
             }));
         }
         let guide = Guide::new(&info.topic, cx);
+        let screen = Screen::new(&info.criteria, cx);
         let mut lib = Library {
             info,
             store,
@@ -1037,6 +1113,8 @@ impl Workspace {
             detail_scroll: ScrollHandle::new(),
             extracting: HashSet::new(),
             guide,
+            screen,
+            suggestions: HashMap::new(),
             searches: vec![],
             batches: vec![],
             trial: None,
@@ -1654,6 +1732,103 @@ impl Workspace {
         .detach();
     }
 
+    /// Start asking the assistant about the pending papers it has not judged
+    /// yet, a few at a time. What it says is saved as a suggestion; the
+    /// decision stays with the person.
+    fn screen_start(&mut self, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_or_default();
+        let Some(lib) = self.lib.as_mut() else { return };
+        if lib.screen.running() { return }
+        lib.screen.error.clear();
+        // The key and address are checked once here, not once per paper.
+        if let Err(err) = ai::plain_request(&profile, "s", "p") {
+            lib.screen.error = err;
+            return cx.notify();
+        }
+        // The criteria are the library's: they are kept with it.
+        let criteria = lib.screen.criteria.read(cx).text().trim().to_string();
+        if criteria != lib.info.criteria {
+            lib.info.criteria = criteria;
+            if let Err(err) = libraries::save(&lib.info) {
+                lib.screen.error = format!("{err:#}");
+                return cx.notify();
+            }
+        }
+        let mut todo: Vec<String> = lib.screen_queue().iter().filter(|p| !lib.suggestions.contains_key(&p.id)).map(|p| p.id.clone()).collect();
+        if todo.is_empty() {
+            lib.screen.error = "待判断的文献都已经有建议了。".into();
+            return cx.notify();
+        }
+        todo.reverse();
+        lib.screen.run += 1;
+        (lib.screen.total, lib.screen.done, lib.screen.todo) = (todo.len(), 0, todo);
+        let run = lib.screen.run;
+        for _ in 0..SCREEN_WORKERS {
+            self.screen_next(run, cx);
+        }
+        cx.notify();
+    }
+
+    /// Ask about the next paper of the run, and about the one after it once
+    /// the answer is in. The first failure ends the run: a wrong key or a
+    /// service that is down would fail every paper the same way.
+    fn screen_next(&mut self, run: u64, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_or_default();
+        let Some(lib) = self.lib.as_mut().filter(|l| l.screen.run == run) else { return };
+        let Some(id) = lib.screen.todo.pop() else { return };
+        let Some(paper) = lib.paper(&id).cloned() else { return self.screen_next(run, cx) };
+        let pages = lib.store.paper_pages(&id).ok().flatten();
+        let (system, prompt, basis) = ai::screen_prompt(&lib.info.topic, &lib.info.criteria, &paper, pages.as_deref());
+        let author = format!("{} · {}", profile.name, profile.model);
+        // Nothing to read: say so without asking, rather than have the model guess from a title.
+        if basis == "none" {
+            let mut suggestion = Suggestion { paper_id: id, verdict: "uncertain".into(), reason: "这篇文献没有摘要，也没有保存全文，无法判断。".into(), basis: basis.into(), author, ..Default::default() };
+            let saved = lib.store.save_suggestion(&mut suggestion);
+            lib.screen.done += 1;
+            if saved.is_ok() { lib.suggestions.insert(suggestion.paper_id.clone(), suggestion); }
+            return self.screen_next(run, cx);
+        }
+        let request = match ai::plain_request(&profile, &system, &prompt) {
+            Ok(request) => request,
+            Err(err) => {
+                lib.screen.error = err;
+                lib.screen.todo.clear();
+                return;
+            }
+        };
+        lib.screen.active += 1;
+        let (library, protocol) = (lib.info.id.clone(), profile.protocol);
+        let work = cx.background_executor().spawn(async move {
+            let judged = wisp_net::complete(request, protocol).and_then(|reply| ai::parse_judgement(&reply, &paper, pages.as_deref()));
+            (paper, judged)
+        });
+        cx.spawn(async move |this, cx| {
+            let (paper, judged) = work.await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library && l.screen.run == run) else { return };
+                lib.screen.active = lib.screen.active.saturating_sub(1);
+                let saved = judged.and_then(|j| {
+                    let mut suggestion = Suggestion { paper_id: paper.id.clone(), verdict: j.verdict, reason: j.reason, excerpt: j.excerpt, page: j.page, basis: basis.into(), confidence: j.confidence, author, ..Default::default() };
+                    lib.store.save_suggestion(&mut suggestion).map(|()| suggestion).map_err(|e| format!("{e:#}"))
+                });
+                match saved {
+                    Ok(suggestion) => {
+                        lib.screen.done += 1;
+                        lib.suggestions.insert(suggestion.paper_id.clone(), suggestion);
+                        this.screen_next(run, cx);
+                    }
+                    Err(err) => {
+                        lib.screen.error = format!("判断「{}」时出错，已停止：{err}", paper.title);
+                        lib.screen.todo.clear();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Run a library tool off the main thread, on a connection of its own
     /// and with the network, and hand the result back if the same library
     /// is still open.
@@ -1838,7 +2013,8 @@ impl Workspace {
                 "open" => self.libraries.get(arg.parse::<usize>().unwrap_or(0)).map(|l| Cmd::OpenLibrary(l.id.clone())),
                 "select" => self.lib.as_ref().and_then(|l| l.shown.get(arg.parse::<usize>().unwrap_or(0)).map(|&i| Cmd::Select(l.papers[i].id.clone()))),
                 "tab" => Some(Cmd::SetTab(match arg { "pdf" => Tab::Pdf, "ask" => Tab::Ask, _ => Tab::Info })),
-                "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, "sources" => Page::Sources, _ => Page::Papers })),
+                "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, "sources" => Page::Sources, "screen" => Page::Screen, _ => Page::Papers })),
+                "screen" => Some(Cmd::ScreenStart),
                 // `guide:new` is what a new library shows; `guide:search` goes straight to composing, `guide:go` also generates.
                 "guide" => {
                     self.run(Cmd::OpenGuide(arg == "new"), window, cx);

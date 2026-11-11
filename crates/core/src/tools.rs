@@ -11,7 +11,7 @@ use crate::fulltext::{file_pages, terms};
 use crate::libraries::{self, LibraryInfo};
 use crate::model::{FULLTEXTS, Paper, READINGS, SCREENINGS, one_of};
 use crate::sources::{self, Fetch};
-use crate::store::{SavedSearch, Store};
+use crate::store::{SavedSearch, Store, Suggestion};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -30,7 +30,7 @@ pub struct ToolDef {
 
 /// A tool that works inside one library: it also takes `library`.
 /// The tools that change the library.
-const WRITING: [&str; 4] = ["save_search", "remove_search", "run_search", "undo_import"];
+const WRITING: [&str; 5] = ["save_search", "remove_search", "run_search", "undo_import", "suggest_screening"];
 
 fn scoped(name: &'static str, title: &'static str, description: &'static str, mut properties: Value, required: &[&str]) -> ToolDef {
     properties["library"] = json!({"type": "string", "description": "文献库的 ID 或名称；只有一个文献库时可以省略。"});
@@ -144,6 +144,20 @@ pub fn catalog() -> Vec<ToolDef> {
             json!({"batchId": {"type": "string", "description": "run_search 或 list_imports 给出的批次号。"}}),
             &["batchId"],
         ),
+        scoped(
+            "suggest_screening",
+            "提出收录建议",
+            "为一篇文献提出收录判断的建议，供用户在筛选页确认。这不会改变文献的收录判断：判断只由用户本人做出。同一篇文献的新建议会替换旧的。建议前先读这篇文献的记录（get_paper），有全文时读全文（read_fulltext）。",
+            json!({
+                "id": {"type": "string", "description": "文献 ID。"},
+                "verdict": {"type": "string", "enum": ["included", "excluded", "irrelevant", "uncertain"], "description": "included：符合文献库的主题，应当收录；excluded：不完全符合但相关、值得留着备查（界面上显示为「相关」）；irrelevant：与主题无关；uncertain：信息不足，无法判断。"},
+                "reason": {"type": "string", "description": "1 到 3 句理由，说出文中的具体依据。"},
+                "excerpt": {"type": "string", "description": "支持判断的一段原文，逐字摘自摘要或全文。不在原文中的引文不会被保存。"},
+                "confidence": {"type": "number", "description": "对这个判断的把握，0 到 1。"},
+                "author": {"type": "string", "description": "提出建议的是谁，例如模型或 agent 的名字。"},
+            }),
+            &["id", "verdict", "reason"],
+        ),
     ]
 }
 
@@ -250,6 +264,7 @@ fn dispatch(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fet
         "run_search" => run_search(store, text(args, "id")?, fetch),
         "list_imports" => Ok(json!({"imports": store.list_batches(number(args, "limit", 20, 200)?)?})),
         "undo_import" => undo_import(store, args),
+        "suggest_screening" => suggest_screening(store, args),
         "library_status" => library_status(store, info),
         "list_papers" => list_papers(store, info, args),
         "get_paper" => get_paper(store, args),
@@ -342,6 +357,9 @@ fn list_papers(store: &mut Store, info: &LibraryInfo, args: &Value) -> Result<Va
     };
     let (limit, offset) = (number(args, "limit", 50, 500)?, number(args, "offset", 0, usize::MAX)?);
     let papers = store.list_papers()?;
+    // What an assistant has proposed for each paper, beside what its owner decided.
+    let suggestions = store.list_suggestions()?;
+    let suggested: BTreeMap<&str, &str> = suggestions.iter().map(|s| (s.paper_id.as_str(), s.verdict.as_str())).collect();
     let shown = filter_papers(&papers, &filters, crate::time::now_millis());
     let page: Vec<Value> = shown
         .iter()
@@ -350,7 +368,7 @@ fn list_papers(store: &mut Store, info: &LibraryInfo, args: &Value) -> Result<Va
         .map(|&i| {
             let p = &papers[i];
             json!({"id": p.id, "title": p.title, "authors": p.short_authors(), "year": p.year, "journal": p.journal, "doi": p.doi, "pmid": p.pmid,
-                "screening": p.screening, "reading": p.reading, "fulltext": p.fulltext, "starred": p.starred, "tags": p.tags})
+                "screening": p.screening, "reading": p.reading, "fulltext": p.fulltext, "starred": p.starred, "tags": p.tags, "suggested": suggested.get(p.id.as_str())})
         })
         .collect();
     Ok(json!({"library": info.name, "total": shown.len(), "offset": offset, "papers": page}))
@@ -366,6 +384,7 @@ fn get_paper(store: &mut Store, args: &Value) -> Result<Value> {
     }
     out["fields"] = Value::Object(fields);
     out["link"] = json!(paper.link());
+    out["suggestion"] = json!(store.suggestion(&paper.id)?);
     let mut files = vec![];
     for file in store.paper_files(&paper.id)? {
         let pages = match store.fulltext_pages(&file.id)? {
@@ -625,6 +644,45 @@ fn undo_import(store: &mut Store, args: &Value) -> Result<Value> {
     Ok(json!({"removed": undone.removed, "kept": undone.kept.iter().map(|(id, title)| json!({"id": id, "title": title})).collect::<Vec<_>>()}))
 }
 
+// ---- screening
+
+/// Record what an agent thinks the screening decision should be. The
+/// decision itself is the person's and is not touched here; a quotation the
+/// paper's text does not hold is not kept as evidence.
+fn suggest_screening(store: &mut Store, args: &Value) -> Result<Value> {
+    let paper = store.get_paper(text(args, "id")?)?;
+    extract_missing(store, Some(&paper.id))?;
+    let pages = store.paper_pages(&paper.id)?;
+    let quote = text(args, "excerpt")?;
+    let found = if quote.is_empty() { None } else { crate::ai::locate_quote(quote, &paper, pages.as_deref()) };
+    let confidence = match &args["confidence"] {
+        Value::Null => None,
+        value => Some(value.as_f64().ok_or_else(|| anyhow!("参数 confidence 应为 0 到 1 之间的数字。"))?),
+    };
+    let author = text(args, "author")?;
+    let mut suggestion = Suggestion {
+        paper_id: paper.id.clone(),
+        verdict: text(args, "verdict")?.into(),
+        reason: text(args, "reason")?.into(),
+        excerpt: if found.is_some() { quote.into() } else { String::new() },
+        page: found.flatten(),
+        basis: if pages.is_some() { "fulltext" } else if paper.abstract_text.is_empty() { "none" } else { "abstract" }.into(),
+        confidence,
+        author: if author.is_empty() { "agent".into() } else { author.into() },
+        ..Default::default()
+    };
+    store.save_suggestion(&mut suggestion)?;
+    Ok(json!({
+        "saved": true,
+        "paperId": paper.id,
+        "excerptKept": quote.is_empty() || found.is_some(),
+        "page": suggestion.page,
+        // Said every time: an agent that reads this knows the paper is still undecided.
+        "screening": paper.screening,
+        "note": "建议已保存，文献的收录判断没有改变，由用户在筛选页确认。",
+    }))
+}
+
 // ---- the command line
 
 /// `paperId` as a flag: `paper-id`.
@@ -668,6 +726,7 @@ pub fn cli_args(schema: &Value, words: &[String]) -> Result<Value, String> {
         let Some(value) = value.or_else(|| words.next().cloned()) else { return Err(format!("--{} 后面需要一个值。", flag_name(&key))) };
         let parsed = match kind {
             "integer" => json!(value.parse::<i64>().map_err(|_| format!("--{} 应为整数：{value}", flag_name(&key)))?),
+            "number" => json!(value.parse::<f64>().map_err(|_| format!("--{} 应为数字：{value}", flag_name(&key)))?),
             "boolean" => json!(value == "true"),
             _ => json!(value),
         };
@@ -866,6 +925,27 @@ pub(crate) mod tests {
         assert_eq!(call(&root, "list_papers", &json!({})).unwrap()["total"], 1);
         assert_eq!(call(&root, "remove_search", &json!({"id": search})).unwrap()["removed"], true);
         assert!(catalog().iter().filter(|t| t.writes).map(|t| t.name).eq(WRITING));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn suggestions_are_not_decisions() {
+        let (root, id) = sample();
+        let said = call(&root, "suggest_screening", &json!({"id": id, "verdict": "included", "reason": "用了 10x 平台", "excerpt": "prepared with 10x Genomics Chromium", "confidence": 0.8, "author": "codex"})).unwrap();
+        assert_eq!((said["excerptKept"].as_bool(), said["page"].as_u64(), said["screening"].as_str()), (Some(true), Some(2), Some("pending")));
+        let paper = call(&root, "get_paper", &json!({"id": id})).unwrap();
+        assert_eq!((paper["screening"].as_str(), paper["suggestion"]["verdict"].as_str(), paper["suggestion"]["author"].as_str(), paper["suggestion"]["basis"].as_str()), (Some("pending"), Some("included"), Some("codex"), Some("fulltext")));
+        assert_eq!(call(&root, "list_papers", &json!({})).unwrap()["papers"][0]["suggested"], "included");
+        // An invented quotation is dropped, and the caller is told.
+        let invented = call(&root, "suggest_screening", &json!({"id": id, "verdict": "irrelevant", "reason": "r", "excerpt": "This paper is about leaves only."})).unwrap();
+        assert_eq!(invented["excerptKept"], false);
+        assert_eq!(call(&root, "get_paper", &json!({"id": id})).unwrap()["suggestion"]["excerpt"], "");
+        for (args, message) in [(json!({"id": id, "verdict": "pending", "reason": "r"}), "建议应为"), (json!({"id": id, "verdict": "included"}), "需要参数 reason"), (json!({"id": id, "verdict": "included", "reason": "r", "confidence": "high"}), "confidence"), (json!({"id": "P-none", "verdict": "included", "reason": "r"}), "文献不存在")] {
+            let error = call(&root, "suggest_screening", &args).unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+        let schema = &catalog().into_iter().find(|t| t.name == "suggest_screening").unwrap().input_schema;
+        assert_eq!(cli_args(schema, &["P-1".into(), "included".into(), "理由".into(), "--confidence".into(), "0.7".into()]).unwrap(), json!({"id": "P-1", "verdict": "included", "reason": "理由", "confidence": 0.7}));
         std::fs::remove_dir_all(root).ok();
     }
 

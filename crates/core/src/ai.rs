@@ -273,7 +273,7 @@ pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields:
 - 「我的笔记」是用户自己写的，可以引用，但要与论文本身的结论区分开。\n\
 - 只列出题目的文献没有摘要，对它们的内容不要下结论。\n\
 - 上面的材料不够时使用工具：search_fulltext 在已保存的全文里找短语或关键词，read_fulltext 按页读原文核对上下文，list_papers 和 get_paper 查文献记录。工具查的是整个文献库，不限于上面列出的文献。\n\
-- search_online 可以在 PubMed、Europe PMC、Crossref、arXiv 里试检索，不写入文献库。保存或删除检索式、运行导入、撤销导入会改动文献库：只在用户明确要求时使用，并说明做了什么。
+- search_online 可以在 PubMed、Europe PMC、Crossref、arXiv 里试检索，不写入文献库。保存或删除检索式、运行导入、撤销导入会改动文献库：只在用户明确要求时使用，并说明做了什么。收录判断由用户本人做出：你可以用 suggest_screening 提出建议，它会出现在筛选页等用户确认。
 \n- 工具结果里每篇文献带有 label，就是引用它时用的标签；工具的 paperId 和 id 参数可以直接填标签（如 P3）。没有保存全文的文献只有记录和摘要，回答依据的只是摘要时要说明。\n\
 - 用用户提问的语言回答，直接回答问题，不必复述材料。"
     );
@@ -703,6 +703,100 @@ pub fn parse_queries(reply: &str) -> Result<Vec<QueryIdea>, String> {
     Ok(ideas)
 }
 
+// ---- screening suggestions
+
+/// Room for a paper's full text in one screening request, in bytes.
+const SCREEN_BUDGET: usize = 240_000;
+
+const SCREEN_SYSTEM: &str = "你是文献筛选助手。用户正在为一个文献库逐篇筛选文献，会给出筛选标准和一篇文献的信息（题目、书目信息、摘要，可能还有全文）。\n\
+判断这篇文献属于哪一类：\n\
+- include：符合筛选标准，是这个文献库要收的文献。\n\
+- related：不完全符合，但与主题相关，可能有参考价值，值得留着备查。\n\
+- irrelevant：与主题无关。\n\
+- uncertain：给出的信息不足以判断。\n\
+要求：\n\
+- 只依据给出的内容判断，不要补充文中没有的信息。\n\
+- reason 用中文写 1 到 3 句，说出文中的具体依据。\n\
+- excerpt 是支持判断的一段原文，必须逐字摘自给出的摘要或全文，不超过 300 字，不翻译、不改写、不把几处拼在一起；没有合适的就留空字符串。\n\
+- confidence 是你对这个判断的把握，0 到 1 之间的小数。\n\
+只输出一个 JSON 对象，不要其他文字：{\"verdict\": \"include\" | \"related\" | \"irrelevant\" | \"uncertain\", \"reason\": \"…\", \"excerpt\": \"…\", \"confidence\": 0.8}";
+
+/// The instructions and the question that ask whether one paper belongs in
+/// the library, and what the model gets to read: "fulltext", "abstract", or
+/// "none" when there is neither and asking would be guessing.
+pub fn screen_prompt(topic: &str, criteria: &str, paper: &Paper, pages: Option<&[String]>) -> (String, String, &'static str) {
+    let mut prompt = String::new();
+    if !criteria.trim().is_empty() { prompt.push_str(&format!("筛选标准：{}\n", criteria.trim())) }
+    if !topic.trim().is_empty() { prompt.push_str(&format!("文献库的主题：{}\n", topic.trim())) }
+    prompt.push_str(&format!("\n## 文献\n题目：{}\n", paper.title));
+    for (name, value) in [("作者", paper.authors.clone()), ("期刊", paper.journal.clone()), ("年份", paper.year.map(|y| y.to_string()).unwrap_or_default())] {
+        if !value.trim().is_empty() { prompt.push_str(&format!("{name}：{}\n", value.trim())) }
+    }
+    if !paper.abstract_text.trim().is_empty() { prompt.push_str(&format!("摘要：{}\n", paper.abstract_text.trim())) }
+    let pages = pages.filter(|pages| pages.iter().any(|page| !page.trim().is_empty()));
+    if let Some(pages) = pages {
+        prompt.push_str("\n## 全文（逐页）\n");
+        let mut used = 0;
+        for (n, page) in pages.iter().enumerate() {
+            if used + page.len() > SCREEN_BUDGET {
+                prompt.push_str(&format!("\n（后面的 {} 页因篇幅未提供。）\n", pages.len() - n));
+                break;
+            }
+            used += page.len();
+            prompt.push_str(&format!("\n[p.{}]\n{}\n", n + 1, page.trim()));
+        }
+    }
+    let basis = if pages.is_some() { "fulltext" } else if paper.abstract_text.trim().is_empty() { "none" } else { "abstract" };
+    (SCREEN_SYSTEM.to_string(), prompt, basis)
+}
+
+/// Where a quotation stands: `Some(None)` in the abstract or title,
+/// `Some(Some(page))` on a full-text page, `None` when it is in neither.
+/// Only letters and digits are compared, so the spacing, line breaks and
+/// hyphenation of PDF text do not hide a quotation that is really there.
+pub fn locate_quote(quote: &str, paper: &Paper, pages: Option<&[String]>) -> Option<Option<usize>> {
+    let bare = |text: &str| text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>();
+    let wanted = bare(quote);
+    // A few characters would be found anywhere.
+    if wanted.chars().count() < 8 { return None }
+    if bare(&paper.abstract_text).contains(&wanted) || bare(&paper.title).contains(&wanted) { return Some(None) }
+    pages.into_iter().flatten().position(|page| bare(page).contains(&wanted)).map(|n| Some(n + 1))
+}
+
+/// What the model said about one paper, with its quotation checked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Judgement {
+    /// A key of `SCREENINGS`: included, excluded (shown as 「相关」), irrelevant or uncertain.
+    pub verdict: String,
+    pub reason: String,
+    /// The quotation, when it really is in the abstract or the full text; empty otherwise.
+    pub excerpt: String,
+    pub page: Option<usize>,
+    pub confidence: Option<f64>,
+}
+
+/// Read the reply to `screen_prompt`. A quotation that is not in the text
+/// the model was given is dropped rather than shown as evidence.
+pub fn parse_judgement(reply: &str, paper: &Paper, pages: Option<&[String]>) -> Result<Judgement, String> {
+    let value: Value = reply.find('{').zip(reply.rfind('}')).filter(|(start, end)| start < end).and_then(|(start, end)| serde_json::from_str(&reply[start..=end]).ok()).ok_or("模型的回答不是要求的格式。")?;
+    let verdict = match value["verdict"].as_str().unwrap_or("").trim().to_lowercase().as_str() {
+        "include" | "included" => "included",
+        "related" => "excluded",
+        "irrelevant" => "irrelevant",
+        "uncertain" => "uncertain",
+        other => return Err(format!("模型给出了不认识的结论：{other}")),
+    };
+    let quote = value["excerpt"].as_str().unwrap_or("").trim();
+    let found = locate_quote(quote, paper, pages);
+    Ok(Judgement {
+        verdict: verdict.into(),
+        reason: value["reason"].as_str().unwrap_or("").trim().to_string(),
+        excerpt: if found.is_some() { quote.to_string() } else { String::new() },
+        page: found.flatten(),
+        confidence: value["confidence"].as_f64().map(|c| c.clamp(0., 1.)),
+    })
+}
+
 /// What to tell the reader when a turn did not end normally.
 pub fn stop_note(reason: &str) -> Option<&'static str> {
     match reason {
@@ -997,6 +1091,33 @@ mod tests {
         let other = plain_request(&Profile { protocol: Protocol::OpenAI, base_url: "http://x/v1".into(), api_key: "k".into(), model: "m".into(), ..Default::default() }, "S", "Q").unwrap();
         assert_eq!(other.body["messages"], json!([{"role": "system", "content": "S"}, {"role": "user", "content": "Q"}]));
         assert!(plain_request(&Profile::default(), "S", "Q").is_err() || !Profile::default().key().is_empty());
+    }
+
+    #[test]
+    fn screening_judgements() {
+        let p = paper("a", "Root stem cell niche", "WOX5 maintains the quiescent centre of the Arabidopsis root.");
+        let pages = vec!["Introduction.".to_string(), "Libraries were prepared with\n10x Genomics Chromium.".to_string()];
+        let (system, prompt, basis) = screen_prompt("根尖发育", "只收拟南芥根的单细胞研究", &p, Some(&pages));
+        assert!(system.contains("related") && system.contains("逐字"));
+        assert!(prompt.starts_with("筛选标准：只收拟南芥根的单细胞研究\n文献库的主题：根尖发育\n") && prompt.contains("题目：Root stem cell niche") && prompt.contains("[p.2]\nLibraries were prepared"));
+        assert_eq!(basis, "fulltext");
+        assert_eq!(screen_prompt("t", "", &p, None).2, "abstract");
+        assert_eq!(screen_prompt("t", "", &p, Some(&[" ".to_string()])).2, "abstract");
+        assert_eq!(screen_prompt("t", "", &paper("b", "Only a title", ""), None).2, "none");
+
+        // The quotation is found across the line break and case of the page, and its page kept.
+        let judged = parse_judgement("```json\n{\"verdict\": \"Include\", \"reason\": \" 用了 10x 平台 \", \"excerpt\": \"prepared with 10X genomics chromium\", \"confidence\": 1.4}\n```", &p, Some(&pages)).unwrap();
+        assert_eq!(judged, Judgement { verdict: "included".into(), reason: "用了 10x 平台".into(), excerpt: "prepared with 10X genomics chromium".into(), page: Some(2), confidence: Some(1.) });
+        // `related` is stored under the key the window shows as 「相关」.
+        let related = parse_judgement(r#"{"verdict": "related", "excerpt": "WOX5 maintains the quiescent centre"}"#, &p, None).unwrap();
+        assert_eq!((related.verdict.as_str(), related.excerpt.as_str(), related.page, related.confidence), ("excluded", "WOX5 maintains the quiescent centre", None, None));
+        // A quotation that is not in the text is not evidence.
+        let invented = parse_judgement(r#"{"verdict": "irrelevant", "reason": "r", "excerpt": "This paper studies leaves only."}"#, &p, Some(&pages)).unwrap();
+        assert_eq!((invented.verdict.as_str(), invented.excerpt.as_str()), ("irrelevant", ""));
+        assert_eq!(locate_quote("WOX5", &p, None), None);
+        for bad in ["不知道", r#"{"verdict": "maybe"}"#, "} {"] {
+            assert!(parse_judgement(bad, &p, None).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INSTRUCTIONS: &str = "Wisp Paper 的本地文献库。先用 list_libraries 看有哪些文献库，再用 library 参数指定其中一个。\
 查出处时先 search_fulltext，再用 read_fulltext 读命中的页面核对上下文；没有保存全文的文献只有书目信息和摘要。\
-收录判断（screening）由用户本人决定；它的存储值不等于界面上的名称（excluded 显示为「相关」），名称见 library_status 的 labels。\nsearch_online 只是试检索，不写入；save_search、run_search、undo_import 会改动文献库，新导入的文献都是「待判断」。";
+收录判断（screening）由用户本人决定；它的存储值不等于界面上的名称（excluded 显示为「相关」），名称见 library_status 的 labels。\nsearch_online 只是试检索，不写入；save_search、run_search、undo_import 会改动文献库，新导入的文献都是「待判断」。\n筛选文献时，逐篇读记录和全文后用 suggest_screening 提出建议（附理由和逐字引文）；建议不会改变收录判断，用户在窗口里确认。";
 
 /// How this server runs: how its tools reach the network, and whether the
 /// tools that change a library are offered at all.
