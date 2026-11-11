@@ -1,7 +1,7 @@
 //! An open library: the sidebar (collect, views, tags), the paper table with
 //! its search and filters, and the trash.
 
-use crate::app::{Cmd, Edge, FilterKey, Library, MenuKind, Page, Tab, Workspace};
+use crate::app::{Cmd, FilterKey, Library, MenuKind, Page, Tab, Workspace};
 use crate::settings::SettingsPage;
 use crate::theme::{self, Theme};
 use crate::ui;
@@ -12,9 +12,6 @@ use wisp_core::model::*;
 use wisp_core::time;
 
 const SIDEBAR_W: f32 = 224.;
-/// How narrow and how wide the sidebar is dragged. Pulled in past half its narrowest, it is put away.
-const SIDEBAR_MIN: f32 = 176.;
-const SIDEBAR_MAX: f32 = 420.;
 pub const DETAIL_W: f32 = 448.;
 /// The narrowest the detail panel is dragged to, and what the list beside it keeps.
 const DETAIL_MIN: f32 = 320.;
@@ -42,33 +39,6 @@ enum ColumnKind {
 }
 
 impl Workspace {
-    /// The sidebar's width for this window: none while it is put away, else
-    /// the width the reader dragged it to, or the one it comes with.
-    pub fn sidebar_width(&self, window: &Window) -> f32 {
-        if self.settings.sidebar_hidden { return 0. }
-        let own = if self.settings.sidebar_width > 0. { self.settings.sidebar_width } else { SIDEBAR_W };
-        own.min(Self::sidebar_max(window)).max(SIDEBAR_MIN)
-    }
-
-    fn sidebar_max(window: &Window) -> f32 {
-        SIDEBAR_MAX.min(f32::from(window.viewport_size().width) * 0.4)
-    }
-
-    /// The sidebar's edge is being dragged: the sidebar reaches from the
-    /// window's left edge to the pointer, and is put away once the pointer
-    /// is well inside its narrowest width (back out, and it is there again).
-    pub fn drag_sidebar(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.resizing != Some(Edge::Sidebar) { return }
-        if event.pressed_button != Some(MouseButton::Left) { return self.end_drag(cx) }
-        let x = f32::from(event.position.x);
-        let hidden = x < SIDEBAR_MIN / 2.;
-        let width = x.min(Self::sidebar_max(window)).max(SIDEBAR_MIN);
-        if hidden == self.settings.sidebar_hidden && (hidden || (width - self.settings.sidebar_width).abs() < 0.5) { return }
-        self.settings.sidebar_hidden = hidden;
-        if !hidden { self.settings.sidebar_width = width }
-        cx.notify();
-    }
-
     /// The detail panel's width for this window: the width the reader
     /// dragged it to, or the one it comes with; most of the window while it
     /// is expanded. The list beside it keeps `MAIN_MIN` where the window allows.
@@ -77,18 +47,17 @@ impl Workspace {
         if lib.selected.is_none() || matches!(lib.page, Page::Trash | Page::Sources | Page::Guide) { return 0. }
         let viewport = f32::from(window.viewport_size().width);
         let own = if self.settings.detail_width > 0. { self.settings.detail_width } else { DETAIL_W };
-        let sidebar = self.sidebar_width(window);
-        if lib.wide { (viewport * 0.62).max(DETAIL_W).min(viewport - sidebar - 80.) } else { own.min(viewport - sidebar - MAIN_MIN).max(DETAIL_MIN) }
+        if lib.wide { (viewport * 0.62).max(DETAIL_W).min(viewport - SIDEBAR_W - 80.) } else { own.min(viewport - SIDEBAR_W - MAIN_MIN).max(DETAIL_MIN) }
     }
 
     /// The edge between the list and the detail panel is being dragged:
     /// the panel reaches from the pointer to the window's right edge.
     pub fn drag_detail(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.resizing != Some(Edge::Detail) { return }
+        if !self.resizing { return }
         // Let go outside the window: the button is up by the time the pointer is back.
-        if event.pressed_button != Some(MouseButton::Left) { return self.end_drag(cx) }
+        if event.pressed_button != Some(MouseButton::Left) { return self.end_drag_detail(cx) }
         let viewport = f32::from(window.viewport_size().width);
-        let width = (viewport - f32::from(event.position.x)).min(viewport - self.sidebar_width(window) - MAIN_MIN).max(DETAIL_MIN);
+        let width = (viewport - f32::from(event.position.x)).min(viewport - SIDEBAR_W - MAIN_MIN).max(DETAIL_MIN);
         if (width - self.settings.detail_width).abs() < 0.5 { return }
         self.settings.detail_width = width;
         if let Some(lib) = self.lib.as_mut() { lib.wide = false }
@@ -96,16 +65,15 @@ impl Workspace {
     }
 
     /// The edge was let go: the width is kept for the next time.
-    pub fn end_drag(&mut self, cx: &mut Context<Self>) {
-        if self.resizing.take().is_none() { return }
+    pub fn end_drag_detail(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.resizing) { return }
         self.save_settings(cx);
         cx.notify();
     }
 
     pub fn render_library(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let sidebar_width = self.sidebar_width(window);
         let detail_width = self.detail_width(window);
-        let main_width = f32::from(window.viewport_size().width) - sidebar_width - detail_width;
+        let main_width = f32::from(window.viewport_size().width) - SIDEBAR_W - detail_width;
         let page = self.lib.as_ref().map_or(Page::Papers, |l| l.page);
         let main = match page {
             Page::Papers => self.render_papers(main_width, window, cx),
@@ -116,62 +84,13 @@ impl Workspace {
             Page::Screen => self.render_screen(window, cx),
             Page::Write => self.render_write(main_width, window, cx),
         };
-        let shown = sidebar_width > 0.;
-        // The sidebar's right edge: drag it for a wider or narrower sidebar, click it twice to put the sidebar away.
-        let dragging = self.resizing == Some(Edge::Sidebar);
-        let edge = div()
-            .id("sidebar-edge")
-            .group("sidebar-edge")
-            .absolute()
-            .top_0()
-            .left(px(-4.))
-            .w(px(9.))
-            .h_full()
-            .flex()
-            .justify_center()
-            .cursor_col_resize()
-            .occlude()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                if event.click_count >= 2 {
-                    this.resizing = None;
-                    this.settings.sidebar_hidden = true;
-                    this.save_settings(cx);
-                } else {
-                    this.resizing = Some(Edge::Sidebar);
-                }
-                cx.notify();
-            }))
-            .child(div().w(px(2.)).h_full().when(dragging, |d| d.bg(Theme::accent())).when(!dragging, |d| d.group_hover("sidebar-edge", |s| s.bg(Theme::accent().opacity(0.5)))));
-        // With the sidebar put away its two top buttons sit over the list, where they were.
-        let strip = if shown { ui::title_strip() } else { self.render_corner(true, cx).h(px(Self::corner_top() + 28.)).pt(px(Self::corner_top())).pl(px(10. + Self::corner_left())) };
         div()
             .flex()
             .size_full()
-            .when(shown, |d| d.child(self.render_sidebar(sidebar_width, cx)))
-            .child(div().relative().flex().flex_col().flex_1().min_w_0().h_full().bg(Theme::bg_body()).when(shown, |d| d.border_l_1().border_color(Theme::line())).child(strip).child(div().flex().flex_col().flex_1().min_h_0().child(main)).when(shown || dragging, |d| d.child(edge)))
+            .child(self.render_sidebar(cx))
+            .child(div().flex().flex_col().flex_1().min_w_0().h_full().bg(Theme::bg_body()).border_l_1().border_color(Theme::line()).child(ui::title_strip()).child(div().flex().flex_col().flex_1().min_h_0().child(main)))
             .when(detail_width > 0., |d| d.child(self.render_detail(detail_width, window, cx)))
             .into_any_element()
-    }
-
-    /// Where the top-left buttons start: past macOS's traffic lights.
-    fn corner_left() -> f32 {
-        (ui::traffic_lights_width() - 6.).max(0.)
-    }
-
-    /// How far below the window's top the top-left buttons are, with the sidebar put away.
-    fn corner_top() -> f32 {
-        if ui::custom_titlebar() { 8. } else { 10. }
-    }
-
-    /// The window's top-left corner in a library: the button that puts the
-    /// sidebar away or brings it back, and the way back to the libraries.
-    /// A narrow sidebar keeps the arrow and drops its words.
-    fn render_corner(&self, roomy: bool, cx: &mut Context<Self>) -> Div {
-        ui::title_strip()
-            .when(!ui::custom_titlebar(), |d| d.h(px(28.)))
-            .pl(px(Self::corner_left()))
-            .child(ui::ghost_button("toggle-sidebar", Some("panel-left"), None).occlude().on_click(self.on(Cmd::ToggleSidebar, cx)))
-            .child(ui::ghost_button("back-home", Some("arrow-left"), roomy.then(|| "所有文献库".into())).occlude().on_click(self.on(Cmd::GoHome, cx)))
     }
 
     /// The PDFs being read in, on every page of the library: how far the
@@ -249,7 +168,7 @@ impl Workspace {
         )
     }
 
-    fn render_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let lib = self.lib.as_ref().unwrap();
         let now = time::now_millis();
         let nav = |id: &'static str, icon: &'static str, label: &'static str, count: Option<usize>, active: bool, cmd: Cmd, this: &Self, cx: &mut Context<Self>| {
@@ -312,13 +231,13 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(width))
+            .w(px(SIDEBAR_W))
             .h_full()
             .px(px(10.))
             .pb(px(10.))
             .pt(px(if ui::custom_titlebar() { 4. } else { 10. }))
             .gap(px(10.))
-            .child(self.render_corner(width >= Self::corner_left() + 150., cx))
+            .child(ui::title_strip().pl(px(ui::traffic_lights_width())).child(ui::ghost_button("back-home", Some("arrow-left"), Some("所有文献库".into())).occlude().on_click(self.on(Cmd::GoHome, cx))))
             .child(
                 div()
                     .id("library-head")

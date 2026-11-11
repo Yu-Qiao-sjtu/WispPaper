@@ -1,9 +1,9 @@
 //! The window's frame (menus, dialogs and toasts over the page) and the
 //! home page: one card per library.
 
-use crate::app::{Cmd, Edge, MenuKind, Workspace};
+use crate::app::{Cmd, MenuKind, Workspace};
 use crate::settings::{SettingsPage, UpdateState};
-use crate::shortcuts::{AddPaper, AskLibrary, FocusSearch, ImportPdf, NewLibrary, ShowHome, ShowSettings, CopyPicked, ToggleDetail, ToggleSidebar, ZoomFit, ZoomIn, ZoomOut};
+use crate::shortcuts::{AddPaper, AskLibrary, FocusSearch, ImportPdf, NewLibrary, ShowHome, ShowSettings, CopyPicked, ToggleDetail, ZoomFit, ZoomIn, ZoomOut};
 use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
@@ -40,7 +40,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ImportPdf, window, cx| this.shortcut("import-pdf", window, cx)))
             .on_action(cx.listener(|this, _: &AskLibrary, window, cx| this.shortcut("ask", window, cx)))
             .on_action(cx.listener(|this, _: &ToggleDetail, window, cx| this.shortcut("detail", window, cx)))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.shortcut("sidebar", window, cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, window, cx| this.shortcut("zoom-in", window, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, window, cx| this.shortcut("zoom-out", window, cx)))
             .on_action(cx.listener(|this, _: &ZoomFit, window, cx| this.shortcut("zoom-fit", window, cx)))
@@ -51,9 +50,9 @@ impl Render for Workspace {
             .children(self.render_modal(window, cx))
             .children(self.render_menu(cx))
             .children(self.render_toast())
-            // While an edge is held (the sidebar's, the detail panel's), a layer over everything hears the pointer
-            // wherever it goes: an element only hears the moves made over it.
-            .children(self.resizing.map(|edge| {
+            // While the detail panel's edge is held, a layer over everything hears the pointer wherever it goes:
+            // an element only hears the moves made over it.
+            .children(self.resizing.then(|| {
                 div()
                     .id("resize-layer")
                     .absolute()
@@ -62,11 +61,8 @@ impl Render for Workspace {
                     .size_full()
                     .occlude()
                     .cursor_col_resize()
-                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, cx| match edge {
-                        Edge::Sidebar => this.drag_sidebar(event, window, cx),
-                        Edge::Detail => this.drag_detail(event, window, cx),
-                    }))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_drag(cx)))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| this.drag_detail(event, window, cx)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_drag_detail(cx)))
             }))
             .children(ui::window_controls(window))
     }
