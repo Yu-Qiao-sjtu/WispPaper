@@ -54,6 +54,65 @@ fn tidy(page: &str) -> String {
     out
 }
 
+/// A text reduced to what a quotation is compared by: its letters and
+/// digits, lowercase, with ligatures spelled out. Spacing, line breaks,
+/// hyphens and punctuation differ between a PDF's text and a quotation of
+/// it; these do not.
+pub fn bare(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            'ﬀ' => out.push_str("ff"),
+            'ﬁ' => out.push_str("fi"),
+            'ﬂ' => out.push_str("fl"),
+            'ﬃ' => out.push_str("ffi"),
+            'ﬄ' => out.push_str("ffl"),
+            c if c.is_alphanumeric() => out.extend(c.to_lowercase()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Where a quotation stands among the glyphs of a page, given the text of
+/// each glyph in drawing order: the range of glyphs it covers. When the whole
+/// quotation is not there, its first 80, 40 or 20 characters are looked for,
+/// so a quotation that drifts from the page after a while is still found.
+pub fn find_quote(glyphs: &[String], quote: &str) -> Option<std::ops::Range<usize>> {
+    // Every compared character, with the glyph it came from.
+    let mut stream: Vec<(char, usize)> = vec![];
+    for (index, glyph) in glyphs.iter().enumerate() {
+        stream.extend(bare(glyph).chars().map(|c| (c, index)));
+    }
+    let wanted: Vec<char> = bare(quote).chars().collect();
+    for length in [wanted.len(), 80, 40, 20] {
+        if length > wanted.len() || length < 8 { continue }
+        let part = &wanted[..length];
+        if let Some(at) = stream.windows(length).position(|window| window.iter().map(|(c, _)| c).eq(part.iter())) {
+            return Some(stream[at].1..stream[at + length - 1].1 + 1);
+        }
+    }
+    None
+}
+
+/// Glyph boxes (`[left, top, right, bottom]`, in drawing order) merged into
+/// one box per line of text, for highlighting a passage.
+pub fn line_boxes(glyphs: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    let mut lines: Vec<[f32; 4]> = vec![];
+    for glyph in glyphs {
+        let same_line = lines.last().is_some_and(|line| {
+            let overlap = line[3].min(glyph[3]) - line[1].max(glyph[1]);
+            // On the line when it shares most of its height, and does not start far back to the left.
+            overlap > 0.5 * (glyph[3] - glyph[1]).min(line[3] - line[1]) && glyph[0] >= line[0] - (glyph[3] - glyph[1])
+        });
+        match lines.last_mut() {
+            Some(line) if same_line => *line = [line[0].min(glyph[0]), line[1].min(glyph[1]), line[2].max(glyph[2]), line[3].max(glyph[3])],
+            _ => lines.push(*glyph),
+        }
+    }
+    lines
+}
+
 /// The words of a question worth matching: lowercase runs of letters and
 /// digits at least two characters long; every CJK character pair counts as a
 /// word, since Chinese has no spaces.
@@ -126,6 +185,30 @@ mod tests {
         assert!(file_pages(&bad).is_err());
         assert!(file_pages(&dir.join("x.docx")).is_err());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quotations_among_glyphs() {
+        assert_eq!(bare("Single-cell\nRNA-seq: ﬁve ﬂoors, 10×!"), "singlecellrnaseqfivefloors10");
+        // One glyph per character, as a PDF draws them; the ligature is one glyph.
+        let glyphs: Vec<String> = "Libraries were prepared with 10x Genomics Chromium. The ﬁrst run failed.".chars().map(String::from).collect();
+        let found = find_quote(&glyphs, "prepared with\n10X genomics chromium").unwrap();
+        assert_eq!(glyphs[found.clone()].concat(), "prepared with 10x Genomics Chromium");
+        assert_eq!(glyphs[find_quote(&glyphs, "The first run").unwrap()].concat(), "The ﬁrst run");
+        // A quotation that leaves the page after its beginning is found by that beginning: its first 40 characters here.
+        let drifting = find_quote(&glyphs, "Libraries were prepared with 10x Genomics Chromium and then something the page never says at all").unwrap();
+        assert_eq!(glyphs[drifting].concat(), "Libraries were prepared with 10x Genomics Chro");
+        assert_eq!(find_quote(&glyphs, "nothing of the kind here"), None);
+        assert_eq!(find_quote(&glyphs, "with"), None);
+        assert_eq!(find_quote(&[], "prepared with 10x"), None);
+    }
+
+    #[test]
+    fn boxes_by_line() {
+        // Two glyphs on one line, a superscript on it, then the next line starting back at the left.
+        let glyphs = [[10., 100., 16., 112.], [16., 100., 22., 112.], [22., 97., 25., 106.], [10., 114., 16., 126.], [16., 114., 30., 126.]];
+        assert_eq!(line_boxes(&glyphs), [[10., 97., 25., 112.], [10., 114., 30., 126.]]);
+        assert!(line_boxes(&[]).is_empty());
     }
 
     #[test]

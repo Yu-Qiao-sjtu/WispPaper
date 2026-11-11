@@ -120,7 +120,7 @@ impl Workspace {
                 // The words the suggestion rests on; with a page, a click opens the PDF there.
                 let quote = div().id(("screen-quote", index)).flex().gap(px(8.)).px(px(10.)).py(px(8.)).rounded(px(6.)).bg(Theme::bg_body()).border_l_2().border_color(Theme::accent()).text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_secondary()).child(div().flex_1().min_w_0().child(s.excerpt.clone()));
                 row = row.child(match s.page {
-                    Some(page) => quote.cursor_pointer().child(div().flex_none().text_color(Theme::accent()).child(format!("第 {page} 页"))).on_click(self.on(Cmd::GotoSource(paper.id.clone(), Some(page)), cx)),
+                    Some(page) => quote.cursor_pointer().child(div().flex_none().text_color(Theme::accent()).child(format!("第 {page} 页"))).on_click(self.on(Cmd::GotoSource(paper.id.clone(), Some(page), s.excerpt.clone()), cx)),
                     None => quote.child(div().flex_none().text_color(Theme::text_tertiary()).child("摘要")),
                 });
             }
