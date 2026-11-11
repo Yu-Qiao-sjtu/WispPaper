@@ -11,7 +11,8 @@ use gpui::*;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
-use wisp_core::ai::{self, ChatMessage, Protocol, Scope, StreamEvent};
+use serde_json::Value;
+use wisp_core::ai::{self, ChatEvent, Protocol, Scope, ToolCall};
 use wisp_core::filter::{self, Filters, View};
 use wisp_core::libraries::{self, LibraryInfo};
 use wisp_core::lookup::{self, Identifier};
@@ -19,7 +20,7 @@ use wisp_core::model::*;
 pub(crate) use wisp_core::settings::default_root;
 use wisp_core::settings::{Settings, settings_file};
 use wisp_core::store::{Store, TrashEntry};
-use wisp_core::{export, fulltext, import, time};
+use wisp_core::{export, fulltext, import, time, tools};
 
 /// What the middle of an open library shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,10 +162,31 @@ pub struct Toast {
     pub at: Instant,
 }
 
+/// The steps one question may take. Each is a request to the model; all but
+/// the last end in tool calls.
+const MAX_CHAT_STEPS: usize = 16;
+
+/// What a conversation shows, in order.
+pub enum ChatItem {
+    /// A question, as typed.
+    User(String),
+    /// Text of the model; one answer may come in several pieces with tool calls between them.
+    Answer(String),
+    /// A tool the model called, and what came back (summary, failed) once it has run.
+    Tool { call: String, result: Option<(String, bool)> },
+}
+
 /// One conversation: with the library (the current list) or with one paper.
 pub struct Chat {
     pub input: Entity<TextInput>,
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<ChatItem>,
+    /// The conversation as the model's protocol carries it: questions, the
+    /// model's turns as it sent them, tool results. Only ever appended to.
+    wire: Vec<Value>,
+    /// The protocol `wire` is written in.
+    protocol: Option<Protocol>,
+    /// Requests made for the question being answered.
+    steps: usize,
     /// What the model was given, built with the first question.
     pub ctx: Option<ai::Context>,
     pub busy: bool,
@@ -258,11 +280,26 @@ impl Chat {
             input.submit_on_enter = true;
             input
         });
-        Chat { input, messages: vec![], ctx: None, busy: false, error: String::new(), note: String::new(), scroll: ScrollHandle::new(), generation: 0 }
+        Chat { input, messages: vec![], wire: vec![], protocol: None, steps: 0, ctx: None, busy: false, error: String::new(), note: String::new(), scroll: ScrollHandle::new(), generation: 0 }
+    }
+
+    /// An answer piece that never got any text leaves no empty bubble behind.
+    fn drop_empty_answer(&mut self) {
+        if matches!(self.messages.last(), Some(ChatItem::Answer(text)) if text.is_empty()) { self.messages.pop(); }
+    }
+
+    /// The question has been answered, or given up on.
+    fn end_run(&mut self) {
+        self.busy = false;
+        self.drop_empty_answer();
+        if self.note.is_empty() && self.error.is_empty() && !matches!(self.messages.last(), Some(ChatItem::Answer(_))) { self.note = "模型没有返回内容。".into() }
     }
 
     fn reset(&mut self, cx: &mut App) {
         self.messages.clear();
+        self.wire.clear();
+        self.protocol = None;
+        self.steps = 0;
         self.ctx = None;
         self.busy = false;
         self.error.clear();
@@ -1083,7 +1120,18 @@ impl Workspace {
         if question.is_empty() || chat.busy { return }
         chat.error.clear();
         chat.note.clear();
+        // `/search …` and `/cite …` stand for a longer request; the bubble shows what was typed.
+        let prompt = match ai::expand_slash(&question) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                chat.error = err;
+                return cx.notify();
+            }
+        };
 
+        // A changed context or protocol starts the wire again from the text of what was said:
+        // the model's own turns are only valid in the conversation that produced them.
+        let replay = chat.ctx.is_none() || chat.protocol != Some(profile.protocol);
         if chat.ctx.is_none() {
             let scope = match (about_paper, &paper_id) {
                 (true, Some(id)) => Scope::Paper(id.clone()),
@@ -1106,25 +1154,63 @@ impl Workspace {
                 chat.error = "当前列表里没有文献。先添加文献，或清空筛选条件。".into();
                 return cx.notify();
             }
-            chat.ctx = Some(ai::build_context(&lib.info.name, &lib.info.topic, &papers, &lib.fields, &fulltext, &scope, &question));
+            let mut ctx = ai::build_context(&lib.info.name, &lib.info.topic, &papers, &lib.fields, &fulltext, &scope, &prompt);
+            // The tools reach every paper of the library, so every paper can be cited.
+            ctx.add_sources(&lib.papers);
+            chat.ctx = Some(ctx);
         }
-        chat.messages.push(ChatMessage { from_user: true, content: question });
-        let request = match ai::chat_request(&profile, chat.ctx.as_ref().unwrap(), &chat.messages) {
-            Ok(request) => request,
-            Err(err) => {
+        if replay {
+            chat.wire = chat
+                .messages
+                .iter()
+                .filter_map(|item| match item {
+                    ChatItem::User(text) => Some(ai::user_message(text)),
+                    ChatItem::Answer(text) if !text.is_empty() => Some(ai::assistant_message(text)),
+                    _ => None,
+                })
+                .collect();
+            chat.protocol = Some(profile.protocol);
+        }
+        chat.wire.push(ai::user_message(&prompt));
+        chat.messages.push(ChatItem::User(question));
+        chat.steps = 0;
+        let sent = self.chat_step(about_paper, cx);
+        if let Some(lib) = self.lib.as_mut() {
+            let chat = if about_paper { &mut lib.paper_chat } else { &mut lib.library_chat };
+            if sent {
+                chat.input.update(cx, |input, cx| input.set_text("", cx));
+            } else {
+                // Nothing was sent: the question stays in the box to be asked again.
+                chat.wire.pop();
                 chat.messages.pop();
                 if chat.messages.is_empty() { chat.ctx = None }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Send the conversation to the model and follow its turn: the text as
+    /// it arrives, then either the end of the answer or the tools it asked
+    /// for. False when the request could not be made.
+    fn chat_step(&mut self, about_paper: bool, cx: &mut Context<Self>) -> bool {
+        let profile = self.settings.profile_or_default();
+        let Some(lib) = self.lib.as_mut() else { return false };
+        let chat = if about_paper { &mut lib.paper_chat } else { &mut lib.library_chat };
+        let Some(ctx) = chat.ctx.as_ref() else { return false };
+        let request = match ai::chat_request(&profile, ctx, &chat.wire, &tools::library_catalog()) {
+            Ok(request) => request,
+            Err(err) => {
                 chat.error = err;
-                return cx.notify();
+                chat.busy = false;
+                return false;
             }
         };
-        chat.input.update(cx, |input, cx| input.set_text("", cx));
-        chat.messages.push(ChatMessage { from_user: false, content: String::new() });
+        chat.messages.push(ChatItem::Answer(String::new()));
         chat.busy = true;
+        chat.steps += 1;
         chat.scroll.scroll_to_bottom();
         let generation = chat.generation;
         let library = lib.info.id.clone();
-        cx.notify();
 
         let (sender, events) = async_channel::unbounded();
         let protocol = profile.protocol;
@@ -1137,34 +1223,111 @@ impl Workspace {
                     if chat.generation != generation { return false }
                     // Keep following the answer while the reader is at the bottom.
                     let at_bottom = chat.scroll.offset().y <= -chat.scroll.max_offset().height + px(40.);
-                    let mut done = false;
-                    match event {
-                        StreamEvent::Text(text) => {
-                            if let Some(last) = chat.messages.last_mut() { last.content.push_str(&text) }
+                    let mut calls = None;
+                    let more = match event {
+                        ChatEvent::Text(text) => {
+                            if let Some(ChatItem::Answer(answer)) = chat.messages.last_mut() { answer.push_str(&text) }
+                            true
                         }
-                        StreamEvent::Stop(reason) => {
-                            chat.note = ai::stop_note(&reason).unwrap_or_default().to_string();
-                            done = true;
-                        }
-                        StreamEvent::Error(error) => {
+                        ChatEvent::Error(error) => {
                             chat.error = error;
-                            done = true;
+                            chat.end_run();
+                            false
                         }
-                    }
-                    if done {
-                        chat.busy = false;
-                        // An answer that never started leaves no empty bubble behind.
-                        if chat.messages.last().is_some_and(|m| !m.from_user && m.content.is_empty()) {
-                            chat.messages.pop();
-                            if chat.note.is_empty() && chat.error.is_empty() { chat.note = "模型没有返回内容。".into() }
+                        ChatEvent::Done(turn) => {
+                            if !turn.message.is_null() { chat.wire.push(turn.message.clone()) }
+                            if turn.calls.is_empty() {
+                                chat.note = ai::stop_note(&turn.stop).unwrap_or_default().to_string();
+                                chat.end_run();
+                            } else if !turn.runnable() || chat.steps >= MAX_CHAT_STEPS {
+                                // The calls still get an answer: a conversation that ends on an unanswered call cannot continue.
+                                let (why, note) = if turn.runnable() {
+                                    ("已达到单次提问的步数上限，工具没有执行。", "已达到单次提问的步数上限。可以继续提问，让它接着做。")
+                                } else {
+                                    ("回答被截断，工具没有执行。", ai::stop_note(&turn.stop).unwrap_or("回答没有正常结束。"))
+                                };
+                                let results: Vec<(String, String, bool)> = turn.calls.iter().map(|call| (call.id.clone(), why.to_string(), true)).collect();
+                                chat.wire.extend(ai::tool_results(protocol, &results));
+                                chat.note = note.to_string();
+                                chat.end_run();
+                            } else {
+                                chat.drop_empty_answer();
+                                calls = Some(turn.calls);
+                            }
+                            false
                         }
-                    }
+                    };
                     if at_bottom { chat.scroll.scroll_to_bottom() }
+                    if let Some(calls) = calls { this.run_tools(about_paper, calls, cx) }
                     cx.notify();
-                    !done
+                    more
                 });
                 if !matches!(alive, Ok(true)) { break }
             }
+        })
+        .detach();
+        true
+    }
+
+    /// Run the tools a turn asked for, off the main thread, then hand the
+    /// results to the model with the next step.
+    fn run_tools(&mut self, about_paper: bool, calls: Vec<ToolCall>, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut() else { return };
+        let info = lib.info.clone();
+        let chat = if about_paper { &mut lib.paper_chat } else { &mut lib.library_chat };
+        let Some(protocol) = chat.protocol else { return };
+        let sources = chat.ctx.as_ref().map(|ctx| ctx.sources.clone()).unwrap_or_default();
+        let generation = chat.generation;
+        let first = chat.messages.len();
+        let mut prepared = vec![];
+        for call in calls {
+            chat.messages.push(ChatItem::Tool { call: tools::describe_call(&call.name, call.args.as_ref().unwrap_or(&Value::Null)), result: None });
+            // The model may name a paper by its label.
+            let args = call.args.map(|mut args| {
+                ai::resolve_labels(&mut args, &sources);
+                args
+            });
+            prepared.push((call.id, call.name, args));
+        }
+        chat.scroll.scroll_to_bottom();
+        let library = info.id.clone();
+        let work = cx.background_executor().spawn(async move {
+            // A connection of its own: the window's stays free while a PDF's text is being extracted.
+            let mut store = Store::open(&info.dir).map_err(|e| format!("{e:#}"));
+            let mut done = vec![];
+            for (id, name, args) in prepared {
+                let result = match (&mut store, args) {
+                    (Ok(store), Ok(args)) => tools::call_in(store, &info, &name, &args).map(|mut value| {
+                        ai::add_labels(&mut value, &sources);
+                        value
+                    }),
+                    (Err(err), _) => Err(err.clone()),
+                    (_, Err(err)) => Err(err),
+                };
+                let shown = tools::describe_result(&result);
+                let (output, failed) = match result {
+                    Ok(value) => (tools::output_text(&value), false),
+                    Err(err) => (err, true),
+                };
+                done.push((id, output, failed, shown));
+            }
+            done
+        });
+        cx.spawn(async move |this, cx| {
+            let done = work.await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library) else { return };
+                let chat = if about_paper { &mut lib.paper_chat } else { &mut lib.library_chat };
+                if chat.generation != generation { return }
+                for (n, (_, _, failed, shown)) in done.iter().enumerate() {
+                    if let Some(ChatItem::Tool { result, .. }) = chat.messages.get_mut(first + n) { *result = Some((shown.clone(), *failed)) }
+                }
+                let results: Vec<(String, String, bool)> = done.into_iter().map(|(id, output, failed, _)| (id, output, failed)).collect();
+                chat.wire.extend(ai::tool_results(protocol, &results));
+                this.chat_step(about_paper, cx);
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -1392,6 +1555,11 @@ impl Workspace {
                         lib.refilter();
                     }
                     None
+                }
+                // Ask the library a question (no commas in it: they separate the steps).
+                "ask" => {
+                    if let Some(lib) = self.lib.as_ref() { lib.library_chat.input.update(cx, |input, cx| input.set_text(arg, cx)) }
+                    Some(Cmd::Ask(false))
                 }
                 "settings" => Some(Cmd::OpenSettings(match arg {
                     "appearance" => SettingsPage::Appearance,

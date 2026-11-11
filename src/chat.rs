@@ -1,8 +1,9 @@
 //! 提问: the conversation with the library (the current list) or with the
 //! selected paper. The answer cites labels like [P3 p.5]; the chips under
-//! it open the paper, or its PDF at that page.
+//! it open the paper, or its PDF at that page. Between the pieces of an
+//! answer stand the tools the assistant called to find it.
 
-use crate::app::{Cmd, Workspace};
+use crate::app::{ChatItem, Cmd, Workspace};
 use crate::settings::SettingsPage;
 use crate::theme::Theme;
 use crate::ui;
@@ -45,16 +46,39 @@ impl Workspace {
 
         let mut items: Vec<AnyElement> = vec![];
         for (i, message) in chat.messages.iter().enumerate() {
-            if message.from_user {
-                items.push(div().flex().justify_end().child(div().max_w(relative(0.85)).px(px(12.)).py(px(8.)).rounded(px(12.)).bg(Theme::accent_soft()).child(message.content.clone())).into_any_element());
-                continue;
-            }
-            let waiting = message.content.is_empty();
+            let content = match message {
+                ChatItem::User(text) => {
+                    items.push(div().flex().justify_end().child(div().max_w(relative(0.85)).px(px(12.)).py(px(8.)).rounded(px(12.)).bg(Theme::accent_soft()).child(text.clone())).into_any_element());
+                    continue;
+                }
+                // What the assistant did between two pieces of its answer: the call, then what came back.
+                ChatItem::Tool { call, result } => {
+                    let (outcome, color) = match result {
+                        None => ("…".to_string(), Theme::text_tertiary()),
+                        Some((text, false)) => (text.clone(), Theme::text_tertiary()),
+                        Some((text, true)) => (text.clone(), Theme::danger()),
+                    };
+                    items.push(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .child(ui::icon("search", 12., Theme::text_tertiary()))
+                            .child(div().flex_none().max_w(relative(0.6)).truncate().text_color(Theme::text_secondary()).child(call.clone()))
+                            .child(div().min_w_0().truncate().text_color(color).child(outcome))
+                            .into_any_element(),
+                    );
+                    continue;
+                }
+                ChatItem::Answer(text) => text,
+            };
+            let waiting = content.is_empty();
             // Each cited label, once, in the order the answer uses it.
             let chips: Vec<AnyElement> = chat
                 .ctx
                 .iter()
-                .flat_map(|ctx| ai::citations(&message.content).into_iter().filter_map(move |(label, page)| ctx.sources.iter().find(|s| s.label == label).map(|s| (s.clone(), page))))
+                .flat_map(|ctx| ai::citations(content).into_iter().filter_map(move |(label, page)| ctx.sources.iter().find(|s| s.label == label).map(|s| (s.clone(), page))))
                 .enumerate()
                 .map(|(n, (source, page))| {
                     let text = match page {
@@ -87,7 +111,7 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .child(div().line_height(px(22.)).text_color(if waiting { Theme::text_tertiary() } else { Theme::text() }).child(if waiting { "正在阅读文献并思考…".to_string() } else { message.content.clone() }))
+                    .child(div().line_height(px(22.)).text_color(if waiting { Theme::text_tertiary() } else { Theme::text() }).child(if waiting { "正在阅读文献并思考…".to_string() } else { content.clone() }))
                     .when(!chips.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(6.)).children(chips)))
                     .into_any_element(),
             );
@@ -104,7 +128,7 @@ impl Workspace {
             ui::empty_state("sparkle", "还没有配置模型", "提问需要一个模型服务：Claude API，或任何 OpenAI 兼容的服务。API Key 只保存在本机。").child(ui::primary_button(if about_paper { "chat-settings-paper" } else { "chat-settings" }, "打开设置").on_click(self.on(Cmd::OpenSettings(SettingsPage::Ai), cx))).into_any_element()
         } else if empty {
             let suggestions: &[&str] = if about_paper { &["这篇文献的研究问题、方法和主要结论是什么？", "作者的结论有哪些证据支持？有什么局限？", "用三句话向同行介绍这篇文章。"] } else { &["这些文献主要在研究哪些问题？按主题归类。", "哪些文献的结论相互支持或矛盾？", "我还没读的文献里，哪几篇最值得先读？为什么？"] };
-            ui::empty_state("sparkle", if about_paper { "就这篇文献提问" } else { "向文献库提问" }, "回答依据文献库里的记录、笔记和已存 PDF 的全文，并标出出处。")
+            ui::empty_state("sparkle", if about_paper { "就这篇文献提问" } else { "向文献库提问" }, "回答依据文献库里的记录、笔记和已存 PDF 的全文，并标出出处。需要时助手会自己检索和翻阅全文。")
                 .children(suggestions.iter().enumerate().map(|(i, text)| ui::secondary_button(SharedString::from(format!("suggest-{about_paper}-{i}")), *text).h(px(30.)).on_click(self.on(Cmd::Suggest(about_paper, text.to_string()), cx))))
                 .into_any_element()
         } else {
@@ -155,7 +179,7 @@ impl Workspace {
                                 .child(ui::field(&chat.input, window, cx).flex_1().max_h(px(160.)).overflow_hidden())
                                 .child(ui::primary_button(if about_paper { "chat-send-paper" } else { "chat-send" }, "").w(px(34.)).px(px(0.)).when(chat.busy, |d| d.opacity(0.5)).child(ui::icon("send", 16., Theme::on_accent())).on_click(self.on(Cmd::Ask(about_paper), cx))),
                         )
-                        .child(div().text_size(px(11.)).text_color(Theme::text_placeholder()).child(format!("{model} · Enter 发送，Shift+Enter 换行 · 回答可能有误，请对照原文"))),
+                        .child(div().text_size(px(11.)).text_color(Theme::text_placeholder()).child(format!("{model} · Enter 发送，Shift+Enter 换行 · /search 检索 · /cite 配引用 · 回答可能有误，请对照原文"))),
                 )
             })
             .into_any_element()
