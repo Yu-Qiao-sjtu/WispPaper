@@ -20,7 +20,7 @@ cargo run -p wisp_core --example seed -- /tmp/wisp-demo some.pdf
 WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 ```
 
-手头没有 API Key 时，`cargo run -p wisp_core --example mock_model -- 8787` 是一个假的 Claude 接口；把示例目录 `settings.json` 里的一个模型服务指向 `http://127.0.0.1:8787` 即可。
+手头没有 API Key 时，`cargo run -p wisp_core --example mock_model -- 8787` 是一个假的 Claude 接口；把示例目录 `settings.json` 里的一个模型服务指向 `http://127.0.0.1:8787` 即可。端口后面再写一个毫秒数（`-- 8787 1500`），每个回答就晚这么久，可以看清批量筛选的进度；它会打印每个请求的模型和思考参数，用来核对各个任务用的是哪个模型。
 
 ## 调试用的环境变量
 
@@ -76,7 +76,7 @@ GPUI 应用。
 | `pdf` | PDF 预览：后台线程渲染，虚拟化列表显示；在页面的字形里定位引文并高亮 |
 | `guide` | 建库向导：从哪里开始，助手拟的检索式和它们的试检索结果 |
 | `searches` | 「检索与导入」页面：检索式、试检索结果、导入记录 |
-| `screen` | 「筛选」页面：待判断的队列、助手的建议、确认按钮 |
+| `screen` | 「筛选」页面：待判断的队列、助手这一轮的进度、按建议分组、确认按钮 |
 | `theme` / `ui` | 浅色 / 深色两套颜色与通用控件；窗口标题栏 |
 
 ### `vendor/`

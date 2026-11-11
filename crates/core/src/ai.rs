@@ -32,26 +32,46 @@ pub enum Protocol {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Profile {
+    /// What the task bindings in the settings point at. Given once, when the
+    /// profile is added or first read from an older settings file.
+    pub id: String,
     pub name: String,
     pub protocol: Protocol,
     pub base_url: String,
     /// Empty means the ANTHROPIC_API_KEY / OPENAI_API_KEY environment variable.
     pub api_key: String,
     pub model: String,
+    /// How hard this model thinks, a key of `EFFORTS`: empty leaves it to the
+    /// service, `off` asks for no thinking, the rest are levels.
+    pub effort: String,
     /// A proxy for this service alone: empty uses the global one, `direct` none at all.
     pub proxy: String,
 }
+
+/// The thinking settings a profile may have, and what they are called.
+pub const EFFORTS: [(&str, &str); 7] = [("", "默认"), ("off", "关闭"), ("low", "低"), ("medium", "中"), ("high", "高"), ("xhigh", "极高"), ("max", "最高")];
 
 pub const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 
 impl Default for Profile {
     fn default() -> Self {
-        Profile { name: "Claude".into(), protocol: Protocol::Anthropic, base_url: ANTHROPIC_BASE.into(), api_key: String::new(), model: DEFAULT_MODEL.into(), proxy: String::new() }
+        Profile { id: String::new(), name: "Claude".into(), protocol: Protocol::Anthropic, base_url: ANTHROPIC_BASE.into(), api_key: String::new(), model: DEFAULT_MODEL.into(), effort: String::new(), proxy: String::new() }
     }
 }
 
 impl Profile {
+    /// What the profile is called where it is listed or credited: its name, else its model.
+    pub fn title(&self) -> String {
+        let name = if self.name.trim().is_empty() { self.model.trim() } else { self.name.trim() };
+        if name.is_empty() { "未命名模型".into() } else { name.to_string() }
+    }
+
+    /// What is still missing before a request can be made, if anything.
+    pub fn missing(&self) -> Option<&'static str> {
+        if self.key().is_empty() { Some("还缺 API Key") } else if self.model.trim().is_empty() { Some("还缺模型名称") } else { None }
+    }
+
     /// The key to send: the stored one, else the protocol's environment variable.
     pub fn key(&self) -> String {
         if !self.api_key.trim().is_empty() { return self.api_key.trim().to_string() }
@@ -370,6 +390,49 @@ pub struct HttpRequest {
 /// API can then rerun it on another model inside the same call.
 const FALLBACK_MODELS: [&str; 5] = ["claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"];
 
+/// Claude models that cannot stop thinking: a request that tries is refused,
+/// so "off" becomes the lowest effort for them.
+const ALWAYS_THINKING: [&str; 3] = ["claude-fable", "claude-mythos", "claude-opus-5-5"];
+
+/// Put the profile's thinking setting into a request body. Nothing is sent
+/// for the default, so a service that knows none of these parameters still
+/// answers. The three protocols, and the services behind the OpenAI one,
+/// each spell it their own way.
+fn apply_effort(profile: &Profile, base: &str, body: &mut Value) {
+    let (effort, model) = (profile.effort.trim(), profile.model.trim());
+    if effort.is_empty() || !EFFORTS.iter().any(|(key, _)| *key == effort) { return }
+    // Chat completions and Responses know three levels; the two above them are the highest of those.
+    let level = if matches!(effort, "xhigh" | "max") { "high" } else { effort };
+    match (profile.protocol, effort) {
+        (Protocol::Anthropic, "off") => {
+            if ALWAYS_THINKING.iter().any(|name| model.contains(name)) {
+                body["output_config"] = json!({"effort": "low"});
+            } else if model.contains("claude-sonnet-5-5") {
+                // Its way of not thinking; it takes no other field beside it.
+                body["thinking"] = json!({"type": "between_tools"});
+            } else {
+                body["thinking"] = json!({"type": "disabled"});
+            }
+        }
+        (Protocol::Anthropic, _) => {
+            body["thinking"] = json!({"type": "adaptive"});
+            body["output_config"] = json!({"effort": effort});
+        }
+        (Protocol::OpenAI, "off") => {
+            if base.contains("api.openai.com") {
+                body["reasoning_effort"] = json!("none");
+            } else if base.contains("dashscope") || base.contains("siliconflow") {
+                body["enable_thinking"] = json!(false);
+            } else {
+                // DeepSeek, 火山方舟, 智谱 and Kimi turn thinking off this way.
+                body["thinking"] = json!({"type": "disabled"});
+            }
+        }
+        (Protocol::OpenAI, _) => body["reasoning_effort"] = json!(level),
+        (Protocol::Responses, _) => body["reasoning"] = json!({"effort": if effort == "off" { "none" } else { level }}),
+    }
+}
+
 /// A question as it goes on the wire; the same for both protocols.
 pub fn user_message(text: &str) -> Value {
     json!({"role": "user", "content": text})
@@ -386,8 +449,8 @@ pub fn assistant_message(text: &str) -> Value {
 /// the prefix stays cacheable and the model's thinking blocks stay valid.
 pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[ToolDef]) -> Result<HttpRequest, String> {
     let key = profile.key();
-    if key.is_empty() { return Err("还没有配置 API Key。请在「设置 › 模型」里填写，或设置对应的环境变量。".into()) }
-    if profile.model.trim().is_empty() { return Err("请在「设置 › 模型」里填写模型名称。".into()) }
+    if key.is_empty() { return Err("还没有配置 API Key。请在「设置 › AI」里填写，或设置对应的环境变量。".into()) }
+    if profile.model.trim().is_empty() { return Err("请在「设置 › AI」里填写模型名称。".into()) }
     let base = profile.base_url.trim().trim_end_matches('/');
     if !base.starts_with("https://") && !base.starts_with("http://") { return Err("模型服务地址应以 https:// 或 http:// 开头。".into()) }
     match profile.protocol {
@@ -395,7 +458,7 @@ pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[T
             let mut headers = vec![("x-api-key".to_string(), key), ("anthropic-version".to_string(), "2026-10-21".to_string()), ("content-type".to_string(), "application/json".to_string())];
             let mut body = json!({
                 "model": profile.model.trim(),
-                // Streaming, so a long answer has room; thinking stays at the model's default (adaptive).
+                // Streaming, so a long answer has room; thinking is the model's default unless the profile says otherwise.
                 "max_tokens": 64000,
                 "stream": true,
                 // The documents come last in the system prompt with a cache breakpoint: follow-up
@@ -409,6 +472,7 @@ pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[T
             if !tools.is_empty() {
                 body["tools"] = tools.iter().map(|t| json!({"name": t.name, "description": t.description, "input_schema": t.input_schema})).collect();
             }
+            apply_effort(profile, base, &mut body);
             // Only on Anthropic's own API: the other platforms and proxies reject these parameters.
             if base == ANTHROPIC_BASE {
                 // The steps of a tool loop resend the conversation; cache it up to the last block.
@@ -427,6 +491,7 @@ pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[T
             if !tools.is_empty() {
                 body["tools"] = tools.iter().map(|t| json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}})).collect();
             }
+            apply_effort(profile, base, &mut body);
             Ok(HttpRequest { url: format!("{base}/chat/completions"), headers: vec![("authorization".to_string(), format!("Bearer {key}")), ("content-type".to_string(), "application/json".to_string())], body, proxy: profile.proxy.trim().to_string() })
         }
         Protocol::Responses => {
@@ -443,6 +508,7 @@ pub fn chat_request(profile: &Profile, ctx: &Context, wire: &[Value], tools: &[T
             if !tools.is_empty() {
                 body["tools"] = tools.iter().map(|t| json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.input_schema})).collect();
             }
+            apply_effort(profile, base, &mut body);
             Ok(HttpRequest { url: format!("{base}/responses"), headers: vec![("authorization".to_string(), format!("Bearer {key}")), ("content-type".to_string(), "application/json".to_string())], body, proxy: profile.proxy.trim().to_string() })
         }
     }
@@ -759,6 +825,28 @@ pub fn plain_request(profile: &Profile, system: &str, prompt: &str) -> Result<Ht
     Ok(request)
 }
 
+// ---- translation
+
+/// What a translation is made with unless the settings say otherwise.
+pub const TRANSLATION_PROMPT: &str = "你是翻译助手。把用户给出的文本翻译成简体中文，保留术语、基因名、物种学名和数字原样。\n只输出译文，不加解释、不加引号、不加标题。";
+
+/// The longest text one translation takes, in bytes: a title, an abstract
+/// or a passage is far shorter, and anything longer is refused, not cut.
+pub const TRANSLATE_LIMIT: usize = 60_000;
+
+/// The instructions in force: the person's own, else `TRANSLATION_PROMPT`.
+pub fn translation_prompt(custom: &str) -> &str {
+    if custom.trim().is_empty() { TRANSLATION_PROMPT } else { custom.trim() }
+}
+
+/// The request that translates `text` under the person's instructions.
+pub fn translate_request(profile: &Profile, prompt: &str, text: &str) -> Result<HttpRequest, String> {
+    let text = text.trim();
+    if text.is_empty() { return Err("没有要翻译的文字。".into()) }
+    if text.len() > TRANSLATE_LIMIT { return Err("这段文字太长，无法一次翻译。".into()) }
+    plain_request(profile, translation_prompt(prompt), text)
+}
+
 /// A search the model proposes for one literature database.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryIdea {
@@ -1027,6 +1115,49 @@ mod tests {
         assert_eq!(r.body["messages"][1]["role"], "user");
         assert_eq!((r.body["tools"][0]["type"].as_str(), r.body["tools"][0]["function"]["parameters"]["type"].as_str()), (Some("function"), Some("object")));
         assert!(chat_request(&Profile { base_url: "ftp://x".into(), api_key: "k".into(), ..Default::default() }, &ctx, &wire, &tools).is_err());
+    }
+
+    #[test]
+    fn thinking_per_profile() {
+        let body = |protocol: Protocol, base: &str, model: &str, effort: &str| plain_request(&Profile { protocol, base_url: base.into(), api_key: "k".into(), model: model.into(), effort: effort.into(), ..Default::default() }, "s", "p").unwrap().body;
+        let claude = |model: &str, effort: &str| body(Protocol::Anthropic, ANTHROPIC_BASE, model, effort);
+        // The default sends nothing, and neither does a value from a newer build.
+        for effort in ["", "turbo"] {
+            let b = claude("claude-opus-5-5", effort);
+            assert!(b.get("thinking").is_none() && b.get("output_config").is_none(), "{effort}");
+        }
+        let b = claude("claude-opus-5-5", "xhigh");
+        assert_eq!((&b["thinking"], &b["output_config"]), (&json!({"type": "adaptive"}), &json!({"effort": "xhigh"})));
+        // Off, as each model takes it: disabled, between tools, or the lowest effort where thinking cannot stop.
+        assert_eq!(claude("claude-haiku-5-5", "off")["thinking"], json!({"type": "disabled"}));
+        let b = claude("claude-sonnet-5-5", "off");
+        assert!(b["thinking"] == json!({"type": "between_tools"}) && b.get("output_config").is_none());
+        for model in ["claude-opus-5-5", "claude-fable-5-2", "anthropic.claude-mythos-5-2"] {
+            let b = claude(model, "off");
+            assert!(b.get("thinking").is_none() && b["output_config"] == json!({"effort": "low"}), "{model}");
+        }
+
+        let chat = |base: &str, effort: &str| body(Protocol::OpenAI, base, "m", effort);
+        assert!(chat("https://api.deepseek.com/v1", "").get("reasoning_effort").is_none());
+        assert_eq!((&chat("https://api.openai.com/v1", "medium")["reasoning_effort"], &chat("https://api.openai.com/v1", "max")["reasoning_effort"]), (&json!("medium"), &json!("high")));
+        assert_eq!(chat("https://api.openai.com/v1", "off")["reasoning_effort"], "none");
+        assert_eq!(chat("https://api.deepseek.com/v1", "off")["thinking"], json!({"type": "disabled"}));
+        assert_eq!(chat("https://dashscope.aliyuncs.com/compatible-mode/v1", "off")["enable_thinking"], false);
+        let responses = |effort: &str| body(Protocol::Responses, "https://api.openai.com/v1", "m", effort);
+        assert_eq!((&responses("off")["reasoning"], &responses("xhigh")["reasoning"]), (&json!({"effort": "none"}), &json!({"effort": "high"})));
+        assert!(responses("").get("reasoning").is_none());
+    }
+
+    #[test]
+    fn translation_request() {
+        let profile = Profile { api_key: "k".into(), effort: "off".into(), model: "claude-haiku-5-5".into(), ..Default::default() };
+        let r = translate_request(&profile, "  ", " Root stem cells. ").unwrap();
+        assert_eq!((r.body["system"].as_str(), r.body["messages"][0]["content"].as_str()), (Some(TRANSLATION_PROMPT), Some("Root stem cells.")));
+        assert_eq!(r.body["thinking"], json!({"type": "disabled"}));
+        assert_eq!(translate_request(&profile, "译成日语。", "x").unwrap().body["system"], "译成日语。");
+        // Nothing to translate, and a text that would have to be cut, are both refused.
+        assert!(translate_request(&profile, "", "  ").is_err());
+        assert!(translate_request(&profile, "", &"a".repeat(TRANSLATE_LIMIT + 1)).is_err());
     }
 
     fn read(protocol: Protocol, lines: &[&str]) -> (String, Turn) {

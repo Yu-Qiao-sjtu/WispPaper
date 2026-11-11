@@ -18,8 +18,8 @@ use wisp_core::libraries::{self, LibraryInfo};
 use wisp_core::lookup::{self, Identifier};
 use wisp_core::model::*;
 pub(crate) use wisp_core::settings::default_root;
-use wisp_core::settings::{Settings, settings_file};
-use wisp_core::store::{ImportBatch, SavedSearch, Store, Suggestion, TrashEntry};
+use wisp_core::settings::{Settings, Task, settings_file};
+use wisp_core::store::{ImportBatch, SavedSearch, Store, Suggestion, TrashEntry, translation_key};
 use wisp_core::{export, fulltext, import, time, tools};
 
 /// What the middle of an open library shows.
@@ -71,6 +71,8 @@ pub enum MenuKind {
     Reading(String),
     Screening(String),
     LibraryCard(String),
+    /// Which model a task uses (设置 › AI).
+    TaskModel(Task),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +101,17 @@ pub enum Cmd {
     ResetShortcut(String),
     ResetShortcuts,
     PickProtocol(Protocol),
+    /// Show another model service's fields on the AI page.
+    SelectProfile(usize),
+    AddProfile,
+    AskRemoveProfile(usize),
+    RemoveProfile(usize),
+    /// How hard the model on show thinks, a key of `ai::EFFORTS`.
+    SetEffort(String),
+    /// Bind a task to a profile id; an empty id follows the default.
+    SetTaskModel(Task, String),
+    SetScreenWorkers(usize),
+    ResetTranslationPrompt,
     // Collect
     AddById,
     AddManual,
@@ -128,6 +141,9 @@ pub enum Cmd {
     RemoveFile(String),
     SetTab(Tab),
     ToggleWide,
+    /// Show the selected paper's title and abstract translated, or stop showing it.
+    ToggleTranslation,
+    RetryTranslation,
     // Custom fields
     ManageFields,
     EditField(String),
@@ -169,6 +185,11 @@ pub enum Cmd {
     ScreenStop,
     /// The person's decision on a paper, made on the screening page.
     ScreenDecide(String, String),
+    /// Show only the queue's papers with this suggestion (a key of `SCREENINGS`), those without one (`none`), or all (empty).
+    ScreenFilter(String),
+    /// Take the assistant's suggestion for every waiting paper it gave this verdict, after asking.
+    AskScreenAccept(String),
+    ScreenAccept(String),
     /// How often the open library runs its searches on its own, in hours; 0 turns it off.
     SetAutoSync(u32),
     ToggleSearch(String),
@@ -235,10 +256,18 @@ pub struct Screen {
     pub criteria: Entity<TextInput>,
     /// Papers the assistant has yet to be asked about in this run, last first.
     todo: Vec<String>,
-    /// Requests in flight.
-    active: usize,
+    /// The papers being read right now, in the order they were started.
+    pub reading: Vec<String>,
     pub total: usize,
     pub done: usize,
+    /// Papers of the run the assistant gave no usable answer for.
+    pub failed: usize,
+    /// Failures since the last answer that could be used.
+    streak: usize,
+    /// The model the run was started with.
+    pub model: String,
+    /// Which part of the queue is on show: a suggested verdict, `none` for the papers without a suggestion, empty for all.
+    filter: String,
     pub error: String,
     /// Bumped when a run starts or stops, so answers to an earlier one are dropped.
     run: u64,
@@ -247,17 +276,26 @@ pub struct Screen {
 impl Screen {
     fn new(criteria: &str, cx: &mut App) -> Screen {
         let criteria = cx.new(|cx| TextInput::new("筛选标准：什么样的文献应当收进这个文献库。留空则按文献库的主题判断。", cx).multiline(2).with_text(criteria));
-        Screen { criteria, todo: vec![], active: 0, total: 0, done: 0, error: String::new(), run: 0 }
+        Screen { criteria, todo: vec![], reading: vec![], total: 0, done: 0, failed: 0, streak: 0, model: String::new(), filter: String::new(), error: String::new(), run: 0 }
     }
 
     /// Whether the assistant is working through the papers right now.
     pub fn running(&self) -> bool {
-        self.active > 0 || !self.todo.is_empty()
+        !self.reading.is_empty() || !self.todo.is_empty()
     }
 }
 
-/// How many papers the assistant is asked about at the same time.
-const SCREEN_WORKERS: usize = 3;
+/// A run of the screening assistant gives up after this many papers in a
+/// row without a usable answer: a wrong key or a service that is down
+/// would fail every paper the same way.
+const SCREEN_GIVE_UP: usize = 3;
+
+/// Where the translation of one text stands.
+pub enum Translated {
+    Busy,
+    Done(String),
+    Failed(String),
+}
 
 /// The steps one question may take. Each is a request to the model; all but
 /// the last end in tool calls.
@@ -350,6 +388,11 @@ pub struct Library {
     pub screen: Screen,
     /// The assistant's suggestion for each paper that has one.
     pub suggestions: HashMap<String, Suggestion>,
+    /// Translations asked for in this window, by `store::translation_key`.
+    pub translations: HashMap<String, Translated>,
+    /// Whether the detail panel shows the selected paper translated. It
+    /// stays on from paper to paper, so each one opened is translated.
+    pub show_translation: bool,
     pub searches: Vec<SavedSearch>,
     /// The latest import batches, newest first.
     pub batches: Vec<ImportBatch>,
@@ -449,6 +492,20 @@ impl Library {
         // Stable: within a group the library's own order holds.
         queue.sort_by(|a, b| rank(a).partial_cmp(&rank(b)).unwrap_or(std::cmp::Ordering::Equal));
         queue
+    }
+
+    /// Which part of the queue a paper belongs to: its suggested verdict, or `none`.
+    pub fn screen_group(&self, paper_id: &str) -> &str {
+        self.suggestions.get(paper_id).map_or("none", |s| s.verdict.as_str())
+    }
+
+    /// The part of the queue on show, and its filter. A part that has
+    /// emptied (the last of its papers was decided) gives way to the whole queue.
+    pub fn screen_view(&self) -> (Vec<&Paper>, &str) {
+        let queue = self.screen_queue();
+        let filter = self.screen.filter.as_str();
+        if filter.is_empty() || !queue.iter().any(|p| self.screen_group(&p.id) == filter) { return (queue, "") }
+        (queue.into_iter().filter(|p| self.screen_group(&p.id) == filter).collect(), filter)
     }
 
     pub fn refilter(&mut self) {
@@ -589,6 +646,15 @@ impl Workspace {
                     items.push(MenuItem { label: label.into(), checked: current == value, note: None, cmd: Cmd::SetReading(id.clone(), value.into()) });
                 }
             }
+            MenuKind::TaskModel(task) => {
+                let bound = self.settings.tasks.get(task).to_string();
+                // Questions always have a model: the first one until another is chosen.
+                let chosen = if task == Task::Chat { self.settings.profile_for(task).map(|p| p.id.clone()).unwrap_or_default() } else { bound };
+                if task != Task::Chat { items.push(MenuItem { label: "与提问相同".into(), checked: chosen.is_empty(), note: None, cmd: Cmd::SetTaskModel(task, String::new()) }) }
+                for profile in &self.settings.profiles {
+                    items.push(MenuItem { label: profile.title().into(), checked: chosen == profile.id, note: Some(profile.model.clone().into()), cmd: Cmd::SetTaskModel(task, profile.id.clone()) });
+                }
+            }
             MenuKind::Screening(id) => {
                 let Some(current) = self.lib.as_ref().and_then(|l| l.paper(&id)).map(|p| p.screening.clone()) else { return };
                 let hints = [("pending", "还没有判断"), ("included", "符合主题，重点阅读"), ("excluded", "可能有用，保留备查"), ("uncertain", "暂时判断不了"), ("irrelevant", "与主题无关，默认隐藏")];
@@ -694,6 +760,29 @@ impl Workspace {
             Cmd::ResetShortcut(id) => self.set_shortcut(&id, None, cx),
             Cmd::ResetShortcuts => self.reset_shortcuts(cx),
             Cmd::PickProtocol(value) => self.pick_protocol(value, cx),
+            Cmd::SelectProfile(index) => self.select_profile(index, cx),
+            Cmd::AddProfile => self.add_profile(cx),
+            Cmd::AskRemoveProfile(index) => {
+                let Some(profile) = self.settings.profiles.get(index) else { return };
+                let serves: Vec<&str> = Task::ALL.into_iter().filter(|task| self.settings.tasks.get(*task) == profile.id).map(Task::label).collect();
+                let after = if serves.is_empty() { String::new() } else { format!("它现在用于{}，删除后这些任务改用默认的模型。", serves.join("、")) };
+                self.modal_error.clear();
+                self.modal = Some(Modal::Confirm { title: format!("删除模型「{}」？", profile.title()), message: format!("它的地址、API Key 和设置会从 settings.json 里删除。{after}"), action: "删除".into(), cmd: Cmd::RemoveProfile(index) });
+            }
+            Cmd::RemoveProfile(index) => {
+                self.run(Cmd::CloseModal, window, cx);
+                self.remove_profile(index, cx);
+            }
+            Cmd::SetEffort(value) => self.set_effort(value, cx),
+            Cmd::SetTaskModel(task, id) => {
+                self.settings.tasks.set(task, &id);
+                self.save_settings(cx);
+            }
+            Cmd::SetScreenWorkers(count) => {
+                self.settings.screen_workers = count.clamp(1, wisp_core::settings::MAX_SCREEN_WORKERS);
+                self.save_settings(cx);
+            }
+            Cmd::ResetTranslationPrompt => self.reset_translation_prompt(cx),
 
             Cmd::AddById => {
                 let input = self.modal_input("10.1038/s41586-020-2649-2、PMID 或它们的链接", "", false, window, cx);
@@ -806,6 +895,11 @@ impl Workspace {
             Cmd::ToggleWide => {
                 if let Some(lib) = self.lib.as_mut() { lib.wide = !lib.wide }
             }
+            Cmd::ToggleTranslation => {
+                if let Some(lib) = self.lib.as_mut() { lib.show_translation = !lib.show_translation }
+                self.translate_selected(true, cx);
+            }
+            Cmd::RetryTranslation => self.translate_selected(true, cx),
 
             Cmd::ManageFields => self.fields_dialog(None, window, cx),
             Cmd::EditField(id) => self.fields_dialog(Some(id), window, cx),
@@ -945,17 +1039,50 @@ impl Workspace {
                     // Answers still on their way belong to a run that is over.
                     lib.screen.run += 1;
                     lib.screen.todo.clear();
-                    lib.screen.active = 0;
+                    lib.screen.reading.clear();
                 }
             }
             Cmd::ScreenDecide(id, verdict) => {
                 let Some(lib) = self.lib.as_ref() else { return };
-                // The paper after this one in the queue comes up next; the one before when it was the last.
-                let queue: Vec<&str> = lib.screen_queue().iter().map(|p| p.id.as_str()).collect();
+                // The paper after this one in the queue on show comes up next; the one before when it was the last.
+                let queue: Vec<&str> = lib.screen_view().0.iter().map(|p| p.id.as_str()).collect();
                 let next = queue.iter().position(|p| *p == id).and_then(|at| queue.get(at + 1).or(at.checked_sub(1).and_then(|before| queue.get(before)))).map(|p| p.to_string());
                 // Agreeing with the assistant takes its reason along; deciding otherwise leaves the reason to the person.
                 let reason = lib.suggestions.get(&id).filter(|s| s.verdict == verdict).map(|s| s.reason.clone()).unwrap_or_default();
                 if self.edit_paper(&id, cx, |p| p.decide(&verdict, &reason)) { self.select(next, window, cx) }
+            }
+            Cmd::ScreenFilter(filter) => {
+                if let Some(lib) = self.lib.as_mut() { lib.screen.filter = filter }
+            }
+            Cmd::AskScreenAccept(verdict) => {
+                let Some(lib) = self.lib.as_ref() else { return };
+                let count = lib.screen_queue().iter().filter(|p| lib.screen_group(&p.id) == verdict).count();
+                if count == 0 { return }
+                let name = label(&SCREENINGS, &verdict);
+                self.modal_error.clear();
+                self.modal = Some(Modal::Confirm {
+                    title: format!("把这 {count} 篇都判断为「{name}」？"),
+                    message: format!("助手对这 {count} 篇待判断文献的建议都是「{name}」。采纳后，它们的收录判断改为「{name}」，判断理由用助手给出的理由。之后仍然可以在每篇文献的详情里改回来。"),
+                    action: format!("采纳 {count} 篇"),
+                    cmd: Cmd::ScreenAccept(verdict),
+                });
+            }
+            Cmd::ScreenAccept(verdict) => {
+                self.run(Cmd::CloseModal, window, cx);
+                let Some(lib) = self.lib.as_ref() else { return };
+                let agreed: Vec<(String, String)> = lib.screen_queue().iter().filter(|p| lib.screen_group(&p.id) == verdict).map(|p| (p.id.clone(), lib.suggestions[&p.id].reason.clone())).collect();
+                let done = self.change(cx, |lib| {
+                    for (id, reason) in &agreed {
+                        let mut paper = lib.store.get_paper(id)?;
+                        paper.decide(&verdict, reason);
+                        lib.store.save_paper(&mut paper)?;
+                    }
+                    Ok(())
+                });
+                if done {
+                    self.select(None, window, cx);
+                    self.say(format!("已把 {} 篇判断为「{}」。", agreed.len(), label(&SCREENINGS, &verdict)), cx);
+                }
             }
 
             Cmd::OpenGuide(choosing) => {
@@ -1134,6 +1261,8 @@ impl Workspace {
             guide,
             screen,
             suggestions: HashMap::new(),
+            translations: HashMap::new(),
+            show_translation: false,
             searches: vec![],
             batches: vec![],
             trial: None,
@@ -1170,6 +1299,61 @@ impl Workspace {
             }
         }
         self.ensure_pdf(cx);
+        self.translate_selected(false, cx);
+        cx.notify();
+    }
+
+    /// Translate the selected paper's title and abstract while translation
+    /// is on. What the library already holds is shown without asking; the
+    /// rest goes to the model for translation, each text on its own, and is
+    /// kept. `retry` asks again for what failed before.
+    fn translate_selected(&mut self, retry: bool, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_for_or_default(Task::Translate);
+        let prompt = self.settings.translation_prompt.clone();
+        let Some(lib) = self.lib.as_mut().filter(|l| l.show_translation) else { return };
+        let Some(paper) = lib.selected_paper() else { return };
+        let library = lib.info.id.clone();
+        for text in [paper.title.clone(), paper.abstract_text.clone()] {
+            if text.trim().is_empty() { continue }
+            let key = translation_key(&text, ai::translation_prompt(&prompt));
+            match lib.translations.get(&key) {
+                Some(Translated::Done(_) | Translated::Busy) => continue,
+                Some(Translated::Failed(_)) if !retry => continue,
+                _ => {}
+            }
+            if let Ok(Some(kept)) = lib.store.translation(&key) {
+                lib.translations.insert(key, Translated::Done(kept));
+                continue;
+            }
+            let request = match ai::translate_request(&profile, &prompt, &text) {
+                Ok(request) => request,
+                Err(err) => {
+                    lib.translations.insert(key, Translated::Failed(err));
+                    continue;
+                }
+            };
+            lib.translations.insert(key.clone(), Translated::Busy);
+            let (library, protocol, author) = (library.clone(), profile.protocol, format!("{} · {}", profile.title(), profile.model));
+            let work = cx.background_executor().spawn(async move { wisp_net::complete(request, protocol) });
+            cx.spawn(async move |this, cx| {
+                let translated = work.await;
+                this.update(cx, |this, cx| {
+                    let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library) else { return };
+                    let state = match translated {
+                        Ok(text) => {
+                            // Not kept is not lost: it is on show, and asked for again another day.
+                            let _ = lib.store.save_translation(&key, &text, &author);
+                            Translated::Done(text.trim().to_string())
+                        }
+                        Err(err) => Translated::Failed(err),
+                    };
+                    lib.translations.insert(key, state);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -1394,7 +1578,7 @@ impl Workspace {
     // ---- questions
 
     fn ask(&mut self, about_paper: bool, cx: &mut Context<Self>) {
-        let profile = self.settings.profile_or_default();
+        let profile = self.settings.profile_for_or_default(Task::Chat);
         let Some(lib) = self.lib.as_mut() else { return };
         let paper_id = lib.selected.clone();
         let chat = if about_paper { &mut lib.paper_chat } else { &mut lib.library_chat };
@@ -1475,7 +1659,7 @@ impl Workspace {
     /// it arrives, then either the end of the answer or the tools it asked
     /// for. False when the request could not be made.
     fn chat_step(&mut self, about_paper: bool, cx: &mut Context<Self>) -> bool {
-        let profile = self.settings.profile_or_default();
+        let profile = self.settings.profile_for_or_default(Task::Chat);
         let Some(lib) = self.lib.as_mut() else { return false };
         let chat = if about_paper { &mut lib.paper_chat } else { &mut lib.library_chat };
         let Some(ctx) = chat.ctx.as_ref() else { return false };
@@ -1704,7 +1888,7 @@ impl Workspace {
     /// Ask the model for searches on the guide's topic, then try each one so
     /// the person can judge them by what they find.
     fn guide_generate(&mut self, cx: &mut Context<Self>) {
-        let profile = self.settings.profile_or_default();
+        let profile = self.settings.profile_for_or_default(Task::Chat);
         let Some(lib) = self.lib.as_mut() else { return };
         if lib.guide.busy { return }
         let keywords = lib.guide.keywords.read(cx).text().trim().to_string();
@@ -1782,10 +1966,12 @@ impl Workspace {
     }
 
     /// Start asking the assistant about the pending papers it has not judged
-    /// yet, a few at a time. What it says is saved as a suggestion; the
-    /// decision stays with the person.
+    /// yet, several at a time (设置 › AI says how many, and with which
+    /// model). What it says is saved as a suggestion; the decision stays
+    /// with the person.
     fn screen_start(&mut self, cx: &mut Context<Self>) {
-        let profile = self.settings.profile_or_default();
+        let profile = self.settings.profile_for_or_default(Task::Screen);
+        let workers = self.settings.screen_workers;
         let Some(lib) = self.lib.as_mut() else { return };
         if lib.screen.running() { return }
         lib.screen.error.clear();
@@ -1809,26 +1995,29 @@ impl Workspace {
             return cx.notify();
         }
         todo.reverse();
-        lib.screen.run += 1;
-        (lib.screen.total, lib.screen.done, lib.screen.todo) = (todo.len(), 0, todo);
-        let run = lib.screen.run;
-        for _ in 0..SCREEN_WORKERS {
+        let screen = &mut lib.screen;
+        screen.run += 1;
+        (screen.total, screen.done, screen.failed, screen.streak, screen.todo) = (todo.len(), 0, 0, 0, todo);
+        screen.reading.clear();
+        screen.model = format!("{} · {}", profile.title(), profile.model);
+        let run = screen.run;
+        for _ in 0..workers {
             self.screen_next(run, cx);
         }
         cx.notify();
     }
 
     /// Ask about the next paper of the run, and about the one after it once
-    /// the answer is in. The first failure ends the run: a wrong key or a
-    /// service that is down would fail every paper the same way.
+    /// the answer is in. A paper without a usable answer is counted and
+    /// left waiting; several of them in a row end the run.
     fn screen_next(&mut self, run: u64, cx: &mut Context<Self>) {
-        let profile = self.settings.profile_or_default();
+        let profile = self.settings.profile_for_or_default(Task::Screen);
         let Some(lib) = self.lib.as_mut().filter(|l| l.screen.run == run) else { return };
         let Some(id) = lib.screen.todo.pop() else { return };
         let Some(paper) = lib.paper(&id).cloned() else { return self.screen_next(run, cx) };
         let pages = lib.store.paper_pages(&id).ok().flatten();
         let (system, prompt, basis) = ai::screen_prompt(&lib.info.topic, &lib.info.criteria, &paper, pages.as_deref());
-        let author = format!("{} · {}", profile.name, profile.model);
+        let author = format!("{} · {}", profile.title(), profile.model);
         // Nothing to read: say so without asking, rather than have the model guess from a title.
         if basis == "none" {
             let mut suggestion = Suggestion { paper_id: id, verdict: "uncertain".into(), reason: "这篇文献没有摘要，也没有保存全文，无法判断。".into(), basis: basis.into(), author, ..Default::default() };
@@ -1845,7 +2034,7 @@ impl Workspace {
                 return;
             }
         };
-        lib.screen.active += 1;
+        lib.screen.reading.push(id);
         let (library, protocol) = (lib.info.id.clone(), profile.protocol);
         let work = cx.background_executor().spawn(async move {
             let judged = wisp_net::complete(request, protocol).and_then(|reply| ai::parse_judgement(&reply, &paper, pages.as_deref()));
@@ -1855,20 +2044,28 @@ impl Workspace {
             let (paper, judged) = work.await;
             this.update(cx, |this, cx| {
                 let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library && l.screen.run == run) else { return };
-                lib.screen.active = lib.screen.active.saturating_sub(1);
+                lib.screen.reading.retain(|reading| *reading != paper.id);
+                lib.screen.done += 1;
                 let saved = judged.and_then(|j| {
                     let mut suggestion = Suggestion { paper_id: paper.id.clone(), verdict: j.verdict, reason: j.reason, excerpt: j.excerpt, page: j.page, basis: basis.into(), confidence: j.confidence, author, ..Default::default() };
                     lib.store.save_suggestion(&mut suggestion).map(|()| suggestion).map_err(|e| format!("{e:#}"))
                 });
                 match saved {
                     Ok(suggestion) => {
-                        lib.screen.done += 1;
+                        lib.screen.streak = 0;
                         lib.suggestions.insert(suggestion.paper_id.clone(), suggestion);
                         this.screen_next(run, cx);
                     }
                     Err(err) => {
-                        lib.screen.error = format!("判断「{}」时出错，已停止：{err}", paper.title);
-                        lib.screen.todo.clear();
+                        lib.screen.failed += 1;
+                        lib.screen.streak += 1;
+                        if lib.screen.streak >= SCREEN_GIVE_UP {
+                            lib.screen.error = format!("连续 {SCREEN_GIVE_UP} 篇没有得到可用的回答，已停止。最后一篇「{}」：{err}", paper.title);
+                            lib.screen.todo.clear();
+                        } else {
+                            lib.screen.error = format!("「{}」没有判断成，留待下一轮：{err}", paper.title);
+                            this.screen_next(run, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -2010,6 +2207,8 @@ impl Workspace {
                         self.change(cx, |_| Ok(()));
                         self.run(Cmd::CloseModal, window, cx);
                         if !editing { self.select(Some(id), window, cx) }
+                        // An edited title or abstract is a new text to translate.
+                        self.translate_selected(false, cx);
                         self.say(if editing { "修改已保存。" } else { "已添加。" }, cx);
                     }
                     Err(err) => self.modal_error = format!("{err:#}"),
@@ -2074,6 +2273,9 @@ impl Workspace {
                 // `try:0` runs the first saved search as a trial.
                 "try" => self.lib.as_ref().and_then(|l| l.searches.get(arg.parse::<usize>().unwrap_or(0)).map(|s| Cmd::TrySearch(s.id.clone()))),
                 "wide" => Some(Cmd::ToggleWide),
+                "translate" => Some(Cmd::ToggleTranslation),
+                // `profile:1` shows the second model service on the AI page.
+                "profile" => Some(Cmd::SelectProfile(arg.parse().unwrap_or(0))),
                 "menu" => {
                     let kind = match arg { "sort" => MenuKind::Sort, "year" => MenuKind::Filter(FilterKey::Year), _ => MenuKind::Add };
                     self.open_menu(kind, point(px(20.), px(120.)), cx);

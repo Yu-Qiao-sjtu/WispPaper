@@ -146,6 +146,16 @@ CREATE TABLE IF NOT EXISTS screening_suggestions (
     author TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+
+-- Translations already made, so that a title or an abstract is translated
+-- once. The key is `translation_key`: the source text and the instructions.
+CREATE TABLE IF NOT EXISTS translations (
+    cache_key TEXT PRIMARY KEY NOT NULL,
+    translated_text TEXT NOT NULL,
+    -- The model profile that made it.
+    author TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
 "#;
 
 const PAPER_COLUMNS: &str = "id, title, abstract, authors_json, journal, year, publication_state, url, source, \
@@ -723,6 +733,22 @@ impl Store {
         Ok(self.list_suggestions()?.into_iter().find(|s| s.paper_id == paper_id))
     }
 
+    // ---- translations
+
+    /// The translation kept under a `translation_key`, if there is one.
+    pub fn translation(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT translated_text FROM translations WHERE cache_key = ?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    /// Keep a translation. The first one for a key stays: two requests for
+    /// the same text may both come back.
+    pub fn save_translation(&mut self, key: &str, text: &str, author: &str) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() { bail!("译文是空的。") }
+        self.db.execute("INSERT INTO translations(cache_key, translated_text, author, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(cache_key) DO NOTHING", params![key, text, author, now_iso()])?;
+        Ok(())
+    }
+
     /// The pages of a paper's stored full text, when its text has been extracted.
     pub fn paper_pages(&self, paper_id: &str) -> Result<Option<Vec<String>>> {
         for file in self.paper_files(paper_id)?.iter().filter(|f| f.kind == "fulltext") {
@@ -851,6 +877,14 @@ fn write_batch(tx: &Transaction, batch: &ImportBatch) -> Result<()> {
         params![batch.id, batch.search_id, batch.label, batch.started_at, batch.remote_total.map(|n| n as i64), batch.fetched as i64, batch.added as i64, batch.skipped as i64, batch.error, batch.undone_at],
     )?;
     Ok(())
+}
+
+/// What a translation is kept under: the text and the instructions it was
+/// made with, so changed instructions translate anew.
+pub fn translation_key(text: &str, prompt: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_string(&[text.trim(), prompt.trim()]).unwrap_or_default());
+    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn copy_hashed(source: &Path, target: &Path) -> Result<(u64, String)> {
@@ -1014,6 +1048,22 @@ mod tests {
         store.delete_paper(&p.id).unwrap();
         assert!(store.list_suggestions().unwrap().is_empty());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn translations_are_kept() {
+        let mut store = Store::in_memory(Path::new("/tmp/wisp-translations")).unwrap();
+        let key = translation_key(" Root stem cells ", "译成中文");
+        assert_eq!(key.len(), 64);
+        // The same text under other instructions, or another text, is another translation.
+        assert_eq!(key, translation_key("Root stem cells", "译成中文 "));
+        assert!(key != translation_key("Root stem cells", "译成日语") && key != translation_key("Root stem cell", "译成中文"));
+        assert_eq!(store.translation(&key).unwrap(), None);
+        assert!(store.save_translation(&key, "  ", "m").is_err());
+        store.save_translation(&key, " 根干细胞 ", "Haiku").unwrap();
+        // A second answer for the same text does not replace the first.
+        store.save_translation(&key, "根部干细胞", "Haiku").unwrap();
+        assert_eq!(store.translation(&key).unwrap().as_deref(), Some("根干细胞"));
     }
 
     #[test]

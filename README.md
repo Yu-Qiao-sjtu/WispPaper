@@ -64,7 +64,7 @@ cargo run -p wisp_core --example seed -- /tmp/wisp-demo some.pdf
 WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 ```
 
-提问、建库向导和筛选需要一个模型服务，在「设置 › AI」里配置：Claude API、OpenAI 兼容的 chat/completions，或 OpenAI 的 Responses 接口。
+提问、建库向导、筛选和翻译需要模型服务，在「设置 › AI」里配置：Claude API、OpenAI 兼容的 chat/completions，或 OpenAI 的 Responses 接口。可以放进多个模型，提问、批量筛选、翻译各用哪一个、各自思考到什么程度分别指定。
 
 ## 功能
 
@@ -73,7 +73,8 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 - **整理**：搜索、筛选、排序；阅读状态、收录判断、收藏、标签、笔记；每个库自己定义的词条；回收站；导出 BibTeX 和 CSV。
 - **检索与导入**：保存检索式，先试检索再导入，每次导入可以整批撤销；可以定时自动更新。
 - **建库向导**：写下主题，助手为各个数据库拟几条检索式并逐条试检索，你挑靠谱的。
-- **筛选**：助手逐篇给出收录建议和原文依据，你来确认。
+- **筛选**：助手几篇同时读，给出收录建议和原文依据，你来确认；也可以按建议整组采纳。
+- **翻译**：题目和摘要一键译成中文，译过的保存在文献库里。
 - **提问**：对文献库或单篇文献提问，出处可点击并在 PDF 里高亮；`/search` 检索全文，`/cite` 为一段文字找可引用的文献。
 - **PDF 预览**：在详情面板里直接看，可展开成阅读宽度。
 - **命令行与 MCP**：`wisp` 不开窗口就能读写同一个数据目录，`wisp mcp` 把同一组工具交给外部的 AI 客户端。见 [docs/CLI.md](docs/CLI.md)。
