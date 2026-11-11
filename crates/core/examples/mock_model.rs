@@ -56,7 +56,15 @@ fn main() {
         // The last message decides the step: tool results get the answer, a question gets the calls.
         let answered = request.rfind("\"tool_result\"").is_some_and(|at| request.rfind("\"role\":\"user\"").is_some_and(|user| user < at));
         let mut events = String::new();
-        if !request.contains("\"tools\"") {
+        if request.contains("文献筛选助手") {
+            // A screening request: the verdict turns on one word, and the excerpt is the start of the abstract.
+            let quote: String = request.split("摘要：").nth(1).map(|rest| rest.chars().take_while(|c| *c != '\\' && *c != '"').take(90).collect()).unwrap_or_default();
+            let (verdict, reason, confidence) = if request.contains("rabidopsis") { ("include", "（假模型）文中提到拟南芥，按主题收录。", 0.9) } else if quote.is_empty() { ("uncertain", "（假模型）没有摘要可读。", 0.3) } else { ("irrelevant", "（假模型）文中没有提到拟南芥。", 0.7) };
+            let reply = format!(r#"{{"verdict": "{verdict}", "reason": "{reason}", "excerpt": "{}", "confidence": {confidence}}}"#, quote.trim());
+            events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
+            events.push_str(&event(&format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{}}}}}"#, quoted(&reply))));
+            events.push_str(&event(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#));
+        } else if !request.contains("\"tools\"") {
             // A request without tools is the guide asking for search queries: two for PubMed, as JSON in the text.
             let reply = r#"[{"source": "pubmed", "query": "(\"single cell\"[Title/Abstract] OR \"single-cell\"[Title/Abstract]) AND root[Title/Abstract] AND Arabidopsis[Title/Abstract]", "why": "宽：单细胞加根加拟南芥，可能带进只是顺带提到根的文章"}, {"source": "pubmed", "query": "\"single cell\"[Title] AND root[Title] AND (atlas OR \"stem cell niche\")", "why": "聚焦：题目里同时有单细胞和根，并限定图谱或干细胞微环境"}]"#;
             events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));

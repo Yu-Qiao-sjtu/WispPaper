@@ -54,6 +54,7 @@ impl Workspace {
             Page::Trash => self.render_trash(cx),
             Page::Sources => self.render_searches(cx),
             Page::Guide => self.render_guide(window, cx),
+            Page::Screen => self.render_screen(window, cx),
         };
         div()
             .flex()
@@ -150,7 +151,7 @@ impl Workspace {
             )
             .child(ui::primary_button("add-paper", "添加文献").w_full().on_click(self.on_menu(MenuKind::Add, cx)))
             .child(div().flex().flex_col().gap(px(1.)).children(view_rows))
-            .child(div().flex().flex_col().gap(px(1.)).child(nav("page-ask", "sparkle", "向文献库提问", None, lib.page == Page::Ask, Cmd::SetPage(Page::Ask), self, cx)).child(nav("page-sources", "search", "检索与导入", (!lib.searches.is_empty()).then_some(lib.searches.len()), matches!(lib.page, Page::Sources | Page::Guide), Cmd::SetPage(Page::Sources), self, cx)))
+            .child(div().flex().flex_col().gap(px(1.)).child(nav("page-ask", "sparkle", "向文献库提问", None, lib.page == Page::Ask, Cmd::SetPage(Page::Ask), self, cx)).child(nav("page-sources", "search", "检索与导入", (!lib.searches.is_empty()).then_some(lib.searches.len()), matches!(lib.page, Page::Sources | Page::Guide), Cmd::SetPage(Page::Sources), self, cx)).child(nav("page-screen", "list-todo", "筛选", Some(lib.papers.iter().filter(|p| p.screening == "pending").count()).filter(|n| *n > 0), lib.page == Page::Screen, Cmd::SetPage(Page::Screen), self, cx)))
             .child(
                 div()
                     .flex()

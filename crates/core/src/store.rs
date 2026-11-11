@@ -128,6 +128,24 @@ CREATE TABLE IF NOT EXISTS batch_papers (
     paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
     PRIMARY KEY (batch_id, paper_id)
 );
+
+-- What an assistant thinks the screening decision should be. A suggestion
+-- only: the decision in `papers` is made by the person. One per paper; a new
+-- one replaces the old. It stays after the decision, for comparing the two.
+CREATE TABLE IF NOT EXISTS screening_suggestions (
+    paper_id TEXT PRIMARY KEY NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    verdict TEXT NOT NULL CHECK (verdict IN ('included','excluded','uncertain','irrelevant')),
+    reason TEXT NOT NULL DEFAULT '',
+    -- A passage quoted word for word from the abstract or the full text, and its page there.
+    excerpt TEXT NOT NULL DEFAULT '',
+    page INTEGER,
+    -- What was read: fulltext, abstract or none.
+    basis TEXT NOT NULL DEFAULT '',
+    confidence REAL,
+    -- Who suggested it: a model profile, or an outside agent.
+    author TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
 "#;
 
 const PAPER_COLUMNS: &str = "id, title, abstract, authors_json, journal, year, publication_state, url, source, \
@@ -188,6 +206,25 @@ pub struct ImportBatch {
     pub error: String,
     /// When the batch was undone; empty when it was not.
     pub undone_at: String,
+}
+
+/// What an assistant thinks the screening decision for a paper should be.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Suggestion {
+    pub paper_id: String,
+    /// included, excluded, uncertain or irrelevant: the keys of `SCREENINGS` without pending.
+    pub verdict: String,
+    pub reason: String,
+    /// Quoted word for word from the abstract or the full text; empty when there is none.
+    pub excerpt: String,
+    /// The full-text page the excerpt is on.
+    pub page: Option<usize>,
+    /// What was read: fulltext, abstract or none.
+    pub basis: String,
+    pub confidence: Option<f64>,
+    pub author: String,
+    pub created_at: String,
 }
 
 /// What undoing a batch did.
@@ -652,6 +689,48 @@ impl Store {
         Ok(undone)
     }
 
+    // ---- screening suggestions
+
+    /// Record a suggestion, replacing the paper's earlier one. The paper's
+    /// own screening decision is not touched.
+    pub fn save_suggestion(&mut self, suggestion: &mut Suggestion) -> Result<()> {
+        if suggestion.verdict == "pending" || !one_of(&SCREENINGS, &suggestion.verdict) { bail!("建议应为 included、excluded、uncertain 或 irrelevant：{}", suggestion.verdict) }
+        if let Some(confidence) = suggestion.confidence && !(0.0..=1.0).contains(&confidence) { bail!("把握应在 0 到 1 之间。") }
+        self.db.query_row("SELECT 1 FROM papers WHERE id = ?1", [&suggestion.paper_id], |_| Ok(())).optional()?.ok_or_else(|| anyhow!("文献不存在：{}", suggestion.paper_id))?;
+        suggestion.reason = suggestion.reason.trim().to_string();
+        suggestion.excerpt = suggestion.excerpt.trim().to_string();
+        suggestion.created_at = now_iso();
+        self.db.execute(
+            "INSERT INTO screening_suggestions(paper_id, verdict, reason, excerpt, page, basis, confidence, author, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(paper_id) DO UPDATE SET verdict = excluded.verdict, reason = excluded.reason, excerpt = excluded.excerpt, page = excluded.page, basis = excluded.basis, \
+                confidence = excluded.confidence, author = excluded.author, created_at = excluded.created_at",
+            params![suggestion.paper_id, suggestion.verdict, suggestion.reason, suggestion.excerpt, suggestion.page.map(|p| p as i64), suggestion.basis, suggestion.confidence, suggestion.author, suggestion.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Every suggestion, for papers in the trash too.
+    pub fn list_suggestions(&self) -> Result<Vec<Suggestion>> {
+        let mut stmt = self.db.prepare("SELECT paper_id, verdict, reason, excerpt, page, basis, confidence, author, created_at FROM screening_suggestions")?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(Suggestion { paper_id: r.get(0)?, verdict: r.get(1)?, reason: r.get(2)?, excerpt: r.get(3)?, page: r.get::<_, Option<i64>>(4)?.map(|p| p as usize), basis: r.get(5)?, confidence: r.get(6)?, author: r.get(7)?, created_at: r.get(8)? })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn suggestion(&self, paper_id: &str) -> Result<Option<Suggestion>> {
+        Ok(self.list_suggestions()?.into_iter().find(|s| s.paper_id == paper_id))
+    }
+
+    /// The pages of a paper's stored full text, when its text has been extracted.
+    pub fn paper_pages(&self, paper_id: &str) -> Result<Option<Vec<String>>> {
+        for file in self.paper_files(paper_id)?.iter().filter(|f| f.kind == "fulltext") {
+            if let Some(Ok(pages)) = self.fulltext_pages(&file.id)? { return Ok(Some(pages)) }
+        }
+        Ok(None)
+    }
+
     // ---- full text
 
     /// The cached page text of a file: `None` until it has been extracted,
@@ -911,6 +990,29 @@ mod tests {
         store.remove_search(&search.id).unwrap();
         assert!(store.list_searches().unwrap().is_empty() && store.list_batches(10).unwrap().len() == 2);
         assert!(store.remove_search(&search.id).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn suggestions_do_not_decide() {
+        let dir = temp_dir("suggest");
+        let mut store = Store::in_memory(&dir).unwrap();
+        let p = store.add_paper(paper("A paper", "")).unwrap();
+        let mut first = Suggestion { paper_id: p.id.clone(), verdict: "irrelevant".into(), reason: " 讲的是叶 ".into(), basis: "abstract".into(), confidence: Some(0.9), author: "mock".into(), ..Default::default() };
+        store.save_suggestion(&mut first).unwrap();
+        assert_eq!((first.reason.as_str(), store.get_paper(&p.id).unwrap().screening.as_str()), ("讲的是叶", "pending"));
+        // A second one replaces the first.
+        store.save_suggestion(&mut Suggestion { paper_id: p.id.clone(), verdict: "included".into(), excerpt: "roots".into(), page: Some(3), ..Default::default() }).unwrap();
+        let all = store.list_suggestions().unwrap();
+        assert_eq!((all.len(), all[0].verdict.as_str(), all[0].page, all[0].confidence), (1, "included", Some(3), None));
+        assert_eq!(store.suggestion(&p.id).unwrap().unwrap().excerpt, "roots");
+        for bad in [Suggestion { paper_id: p.id.clone(), verdict: "pending".into(), ..Default::default() }, Suggestion { paper_id: p.id.clone(), verdict: "maybe".into(), ..Default::default() }, Suggestion { paper_id: "P-none".into(), verdict: "included".into(), ..Default::default() }, Suggestion { paper_id: p.id.clone(), verdict: "included".into(), confidence: Some(1.5), ..Default::default() }] {
+            assert!(store.save_suggestion(&mut bad.clone()).is_err(), "{bad:?}");
+        }
+        assert!(store.paper_pages(&p.id).unwrap().is_none());
+        // It goes with the paper.
+        store.delete_paper(&p.id).unwrap();
+        assert!(store.list_suggestions().unwrap().is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 

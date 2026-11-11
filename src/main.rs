@@ -14,6 +14,7 @@ mod home;
 mod input;
 mod library;
 mod pdf;
+mod screen;
 mod searches;
 mod settings;
 mod shortcuts;

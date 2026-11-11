@@ -190,8 +190,43 @@ pub fn strip_markup(value: &str) -> String {
             _ => {}
         }
     }
-    let out = out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ");
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    decode_entities(&out).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `&amp;`, `&#x2009;`, `&#8201;` and the like as the characters they stand
+/// for, each read once; anything unknown stays as written.
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let decoded = rest[1..].find(';').filter(|end| *end <= 10).and_then(|end| {
+            let name = &rest[1..end + 1];
+            let c = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                _ => name.strip_prefix("#x").or(name.strip_prefix("#X")).map(|hex| u32::from_str_radix(hex, 16)).or(name.strip_prefix('#').map(str::parse::<u32>)).and_then(Result::ok).and_then(char::from_u32),
+            };
+            c.map(|c| (c, end + 2))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Trim every entry, drop blanks and duplicates, keep the order.
@@ -321,6 +356,13 @@ mod tests {
     #[test]
     fn title_keys_ignore_markup() {
         assert_eq!(title_key("Single-cell <i>RNA</i> atlas."), title_key("single cell rna atlas"));
+    }
+
+    #[test]
+    fn entities() {
+        assert_eq!(strip_markup("188&#x2009;270 cells &amp; 5&#160;&#956;m, p&lt;0.05 &quot;x&quot; it&#39;s"), "188 270 cells & 5 μm, p<0.05 \"x\" it's");
+        // Read once: an escaped entity stays an entity. What is not one stays as written.
+        assert_eq!(strip_markup("&amp;lt; R&D; A & B &#xZZ; &unknown; &"), "&lt; R&D; A & B &#xZZ; &unknown; &");
     }
 
     #[test]
