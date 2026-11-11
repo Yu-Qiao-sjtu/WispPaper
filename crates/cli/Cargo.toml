@@ -1,0 +1,17 @@
+[package]
+name = "wisp_cli"
+version = "0.1.0"
+edition = "2024"
+description = "wisp: Wisp Paper's libraries from the command line and over MCP, without the window"
+license = "MIT"
+
+[[bin]]
+name = "wisp"
+path = "src/main.rs"
+
+[dependencies]
+wisp_core = { path = "../core" }
+serde_json = "1"
+
+[lints]
+workspace = true

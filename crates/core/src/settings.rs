@@ -31,6 +31,24 @@ impl Default for Settings {
     }
 }
 
+/// `WISP_PAPER_HOME` keeps the data and the settings of tests and
+/// side-by-side builds in one folder of their own.
+fn home_override() -> Option<PathBuf> {
+    std::env::var("WISP_PAPER_HOME").ok().filter(|home| !home.trim().is_empty()).map(PathBuf::from)
+}
+
+/// Where the libraries live unless the settings name another folder.
+pub fn default_root() -> PathBuf {
+    home_override().unwrap_or_else(|| dirs::document_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("WispPaper"))
+}
+
+pub fn settings_file() -> PathBuf {
+    match home_override() {
+        Some(home) => home.join("settings.json"),
+        None => dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("WispPaper").join("settings.json"),
+    }
+}
+
 impl Settings {
     /// A missing file is the defaults; a broken one is an error, so it is
     /// never silently overwritten with defaults.
