@@ -19,7 +19,7 @@ use wisp_core::lookup::{self, Identifier};
 use wisp_core::model::*;
 pub(crate) use wisp_core::settings::default_root;
 use wisp_core::settings::{Settings, settings_file};
-use wisp_core::store::{Store, TrashEntry};
+use wisp_core::store::{ImportBatch, SavedSearch, Store, TrashEntry};
 use wisp_core::{export, fulltext, import, time, tools};
 
 /// What the middle of an open library shows.
@@ -29,6 +29,8 @@ pub enum Page {
     /// 文献库提问: questions over the current list.
     Ask,
     Trash,
+    /// 检索与导入: saved searches for the literature databases and what they brought in.
+    Sources,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +137,19 @@ pub enum Cmd {
     Suggest(bool, String),
     NewChat(bool),
     GotoSource(String, Option<usize>),
+    // Searches and imports
+    NewSearch,
+    EditSearch(String),
+    AskRemoveSearch(String),
+    RemoveSearch(String),
+    /// Run a saved search without importing, to see what it finds.
+    TrySearch(String),
+    CloseTrial,
+    RunSearch(String),
+    RunAllSearches,
+    AskUndoImport(String),
+    UndoImport(String),
+    PickSource(String),
     // Dialogs
     CloseModal,
     SubmitModal,
@@ -221,6 +236,7 @@ pub enum Modal {
     AddById { input: Entity<TextInput>, busy: bool },
     Paper(Box<PaperForm>),
     Fields { editing: Option<String>, name: Entity<TextInput>, options: Entity<TextInput>, kind: FieldKind, in_table: bool },
+    Search { editing: Option<String>, kind: String, name: Entity<TextInput>, query: Entity<TextInput>, max: Entity<TextInput> },
     Confirm { title: String, message: String, action: String, cmd: Cmd },
 }
 
@@ -248,6 +264,13 @@ pub struct Library {
     pub detail_scroll: ScrollHandle,
     /// Files whose text is being extracted.
     pub extracting: HashSet<String>,
+    pub searches: Vec<SavedSearch>,
+    /// The latest import batches, newest first.
+    pub batches: Vec<ImportBatch>,
+    /// The trial run on show: which search, and what it found once it is back.
+    pub trial: Option<(String, Option<Result<Value, String>>)>,
+    /// Searches being run right now.
+    pub running: HashSet<String>,
     /// How many dropped or picked files are still being read.
     pub importing: usize,
     _subscriptions: Vec<Subscription>,
@@ -338,6 +361,8 @@ impl Library {
         self.fields = self.store.list_fields()?;
         self.files = self.store.list_files()?;
         self.trash = self.store.list_trash()?;
+        self.searches = self.store.list_searches()?;
+        self.batches = self.store.list_batches(30)?;
         // Filters on a field that no longer exists would hide everything.
         let known: HashSet<&str> = self.fields.iter().map(|f| f.id.as_str()).collect();
         self.filters.fields.retain(|id, _| known.contains(id.as_str()));
@@ -732,6 +757,72 @@ impl Workspace {
                 }
             }
 
+            Cmd::NewSearch => self.search_dialog(None, window, cx),
+            Cmd::EditSearch(id) => self.search_dialog(Some(id), window, cx),
+            Cmd::AskRemoveSearch(id) => {
+                let Some(search) = self.lib.as_ref().and_then(|l| l.searches.iter().find(|s| s.id == id)) else { return };
+                self.modal_error.clear();
+                self.modal = Some(Modal::Confirm { title: format!("删除检索式「{}」？", search.name), message: "它导入过的文献和运行记录都会保留，只是不再运行这个检索式。".into(), action: "删除".into(), cmd: Cmd::RemoveSearch(id) });
+            }
+            Cmd::RemoveSearch(id) => {
+                self.change(cx, |lib| lib.store.remove_search(&id));
+                self.run(Cmd::CloseModal, window, cx);
+            }
+            Cmd::TrySearch(id) => {
+                let Some(lib) = self.lib.as_mut() else { return };
+                let Some(search) = lib.searches.iter().find(|s| s.id == id) else { return };
+                let args = serde_json::json!({"source": search.kind, "query": search.query, "limit": 20});
+                lib.trial = Some((id.clone(), None));
+                self.library_tool("search_online", args, cx, move |this, result, _| {
+                    // Only when this trial is still the one on show.
+                    if let Some(lib) = this.lib.as_mut() && let Some((shown, found)) = lib.trial.as_mut() && *shown == id { *found = Some(result) }
+                });
+            }
+            Cmd::CloseTrial => {
+                if let Some(lib) = self.lib.as_mut() { lib.trial = None }
+            }
+            Cmd::RunSearch(id) => {
+                let Some(lib) = self.lib.as_mut() else { return };
+                if !lib.running.insert(id.clone()) { return }
+                self.library_tool("run_search", serde_json::json!({"id": id}), cx, move |this, result, cx| {
+                    if let Some(lib) = this.lib.as_mut() { lib.running.remove(&id); }
+                    // The run wrote through its own connection, failed runs included.
+                    this.change(cx, |_| Ok(()));
+                    match result {
+                        Ok(run) => this.say(format!("{}：新增 {} 篇，跳过已有的 {} 篇", run["search"].as_str().unwrap_or("检索"), run["added"], run["skipped"]), cx),
+                        Err(err) => this.fail(err, cx),
+                    }
+                });
+            }
+            Cmd::RunAllSearches => {
+                let ids: Vec<String> = self.lib.as_ref().map(|l| l.searches.iter().filter(|s| s.enabled).map(|s| s.id.clone()).collect()).unwrap_or_default();
+                for id in ids {
+                    self.run(Cmd::RunSearch(id), window, cx);
+                }
+            }
+            Cmd::AskUndoImport(id) => {
+                let Some(batch) = self.lib.as_ref().and_then(|l| l.batches.iter().find(|b| b.id == id)) else { return };
+                self.modal_error.clear();
+                self.modal = Some(Modal::Confirm {
+                    title: "撤销这次导入？".into(),
+                    message: format!("{}\n\n这次导入新增的 {} 篇文献里，还没有处理过的会被删除；已经做过收录判断、读过、收藏、写过笔记、加过标签或附件的会保留。", batch.label, batch.added),
+                    action: "撤销导入".into(),
+                    cmd: Cmd::UndoImport(id),
+                });
+            }
+            Cmd::UndoImport(id) => {
+                let mut undone = None;
+                if self.change(cx, |lib| lib.store.undo_batch(&id).map(|done| undone = Some(done)))
+                    && let Some(done) = undone
+                {
+                    self.say(if done.kept.is_empty() { format!("已撤销：删除了 {} 篇", done.removed) } else { format!("已撤销：删除了 {} 篇，保留了处理过的 {} 篇", done.removed, done.kept.len()) }, cx);
+                }
+                self.run(Cmd::CloseModal, window, cx);
+            }
+            Cmd::PickSource(value) => {
+                if let Some(Modal::Search { kind, .. }) = self.modal.as_mut() { *kind = value }
+            }
+
             Cmd::CloseModal => {
                 self.modal = None;
                 self.modal_subscriptions.clear();
@@ -856,6 +947,10 @@ impl Workspace {
             table_scroll: UniformListScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
             extracting: HashSet::new(),
+            searches: vec![],
+            batches: vec![],
+            trial: None,
+            running: HashSet::new(),
             importing: 0,
             _subscriptions: subscriptions,
         };
@@ -993,7 +1088,7 @@ impl Workspace {
                     .spawn(async move {
                         let pages = fulltext::file_pages(&file);
                         let doi = pages.as_ref().ok().and_then(|pages| lookup::find_doi(&pages.iter().take(2).cloned().collect::<Vec<_>>().join("\n")));
-                        let found = doi.and_then(|doi| crate::net::lookup_paper(&Identifier::Doi(doi)).ok());
+                        let found = doi.and_then(|doi| wisp_net::lookup_paper(&Identifier::Doi(doi)).ok());
                         (pages, found)
                     })
                     .await;
@@ -1214,7 +1309,7 @@ impl Workspace {
 
         let (sender, events) = async_channel::unbounded();
         let protocol = profile.protocol;
-        cx.background_executor().spawn(async move { crate::net::stream_chat(request, protocol, sender) }).detach();
+        cx.background_executor().spawn(async move { wisp_net::stream_chat(request, protocol, sender) }).detach();
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let alive = this.update(cx, |this, cx| {
@@ -1279,6 +1374,8 @@ impl Workspace {
         let sources = chat.ctx.as_ref().map(|ctx| ctx.sources.clone()).unwrap_or_default();
         let generation = chat.generation;
         let first = chat.messages.len();
+        // A tool that changed the library on its own connection: the window reads it again afterwards.
+        let wrote = calls.iter().any(|call| tools::catalog().iter().any(|t| t.name == call.name && t.writes));
         let mut prepared = vec![];
         for call in calls {
             chat.messages.push(ChatItem::Tool { call: tools::describe_call(&call.name, call.args.as_ref().unwrap_or(&Value::Null)), result: None });
@@ -1297,7 +1394,7 @@ impl Workspace {
             let mut done = vec![];
             for (id, name, args) in prepared {
                 let result = match (&mut store, args) {
-                    (Ok(store), Ok(args)) => tools::call_in(store, &info, &name, &args).map(|mut value| {
+                    (Ok(store), Ok(args)) => tools::call_in(store, &info, &name, &args, &wisp_net::get_text).map(|mut value| {
                         ai::add_labels(&mut value, &sources);
                         value
                     }),
@@ -1324,6 +1421,7 @@ impl Workspace {
                 }
                 let results: Vec<(String, String, bool)> = done.into_iter().map(|(id, output, failed, _)| (id, output, failed)).collect();
                 chat.wire.extend(ai::tool_results(protocol, &results));
+                if wrote && let Err(err) = lib.reload() { this.fail(format!("{err:#}"), cx) }
                 this.chat_step(about_paper, cx);
                 cx.notify();
             })
@@ -1406,6 +1504,40 @@ impl Workspace {
         self.modal = Some(Modal::Fields { editing, name, options, kind: field.kind, in_table: field.in_table });
     }
 
+    fn search_dialog(&mut self, editing: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.modal_subscriptions.clear();
+        self.modal_error.clear();
+        let search = editing.as_ref().and_then(|id| self.lib.as_ref()?.searches.iter().find(|s| &s.id == id).cloned()).unwrap_or(SavedSearch { kind: "pubmed".into(), max_results: 50, enabled: true, ..Default::default() });
+        let name = self.modal_input("名称，例如：根尖单细胞（可以留空）", &search.name, false, window, cx);
+        let query = self.modal_input("检索式", &search.query, true, window, cx);
+        let max = self.modal_input("50", &search.max_results.to_string(), false, window, cx);
+        self.modal = Some(Modal::Search { editing, kind: search.kind, name, query, max });
+    }
+
+    /// Run a library tool off the main thread, on a connection of its own
+    /// and with the network, and hand the result back if the same library
+    /// is still open.
+    fn library_tool(&mut self, name: &'static str, args: Value, cx: &mut Context<Self>, done: impl FnOnce(&mut Self, Result<Value, String>, &mut Context<Self>) + 'static) {
+        let Some(lib) = self.lib.as_ref() else { return };
+        let info = lib.info.clone();
+        let library = info.id.clone();
+        cx.notify();
+        let work = cx.background_executor().spawn(async move {
+            let mut store = Store::open(&info.dir).map_err(|e| format!("{e:#}"))?;
+            tools::call_in(&mut store, &info, name, &args, &wisp_net::get_text)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                if this.lib.as_ref().is_none_or(|l| l.info.id != library) { return }
+                done(this, result, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn submit_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = |input: &Entity<TextInput>, cx: &App| input.read(cx).text().trim().to_string();
         self.modal_error.clear();
@@ -1451,7 +1583,7 @@ impl Workspace {
                 *busy = true;
                 let library = self.lib.as_ref().map(|l| l.info.id.clone()).unwrap_or_default();
                 cx.spawn_in(window, async move |this, cx| {
-                    let found = cx.background_executor().spawn(async move { crate::net::lookup_paper(&id) }).await;
+                    let found = cx.background_executor().spawn(async move { wisp_net::lookup_paper(&id) }).await;
                     this.update_in(cx, |this, window, cx| {
                         if !matches!(this.modal, Some(Modal::AddById { .. })) || this.lib.as_ref().is_none_or(|l| l.info.id != library) { return }
                         if let Some(Modal::AddById { busy, .. }) = this.modal.as_mut() { *busy = false }
@@ -1524,6 +1656,25 @@ impl Workspace {
                     Err(err) => self.modal_error = format!("{err:#}"),
                 }
             }
+            Modal::Search { editing, kind, name, query, max } => {
+                let Ok(max_results) = text(max, cx).parse::<usize>() else {
+                    self.modal_error = "每次取回的篇数应为数字，例如 50。".into();
+                    return;
+                };
+                let Some(lib) = self.lib.as_mut() else { return };
+                // An edited search keeps whether it is enabled.
+                let enabled = editing.as_ref().and_then(|id| lib.searches.iter().find(|s| &s.id == id)).is_none_or(|s| s.enabled);
+                let mut search = SavedSearch { id: editing.clone().unwrap_or_default(), kind: kind.clone(), name: text(name, cx), query: text(query, cx), max_results, enabled, ..Default::default() };
+                match lib.store.save_search(&mut search) {
+                    Ok(()) => {
+                        // What the old query found says nothing about the new one.
+                        lib.trial = None;
+                        self.change(cx, |_| Ok(()));
+                        self.run(Cmd::CloseModal, window, cx);
+                    }
+                    Err(err) => self.modal_error = format!("{err:#}"),
+                }
+            }
         }
         cx.notify();
     }
@@ -1541,7 +1692,9 @@ impl Workspace {
                 "open" => self.libraries.get(arg.parse::<usize>().unwrap_or(0)).map(|l| Cmd::OpenLibrary(l.id.clone())),
                 "select" => self.lib.as_ref().and_then(|l| l.shown.get(arg.parse::<usize>().unwrap_or(0)).map(|&i| Cmd::Select(l.papers[i].id.clone()))),
                 "tab" => Some(Cmd::SetTab(match arg { "pdf" => Tab::Pdf, "ask" => Tab::Ask, _ => Tab::Info })),
-                "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, _ => Page::Papers })),
+                "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, "sources" => Page::Sources, _ => Page::Papers })),
+                // `try:0` runs the first saved search as a trial.
+                "try" => self.lib.as_ref().and_then(|l| l.searches.get(arg.parse::<usize>().unwrap_or(0)).map(|s| Cmd::TrySearch(s.id.clone()))),
                 "wide" => Some(Cmd::ToggleWide),
                 "menu" => {
                     let kind = match arg { "sort" => MenuKind::Sort, "year" => MenuKind::Filter(FilterKey::Year), _ => MenuKind::Add };
@@ -1576,6 +1729,7 @@ impl Workspace {
                     "fields" => Some(Cmd::ManageFields),
                     "library" => Some(Cmd::NewLibrary),
                     "add" => Some(Cmd::AddById),
+                    "search" => Some(Cmd::NewSearch),
                     "paper" => self.lib.as_ref().and_then(|l| l.selected.clone()).map(Cmd::EditPaper),
                     _ => None,
                 },

@@ -292,7 +292,7 @@ impl Workspace {
         // WISP_PAPER_UPDATE_URL points the check elsewhere (testing).
         let url = std::env::var("WISP_PAPER_UPDATE_URL").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(update::latest_url);
         cx.spawn(async move |this, cx| {
-            let found = cx.background_executor().spawn(async move { crate::net::latest_release(&url) }).await;
+            let found = cx.background_executor().spawn(async move { wisp_net::latest_release(&url) }).await;
             this.update(cx, |this, cx| {
                 match found {
                     Ok(Some(release)) if update::newer(&release.version, env!("CARGO_PKG_VERSION")) => {

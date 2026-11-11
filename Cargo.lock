@@ -7431,6 +7431,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "wisp_core",
+ "wisp_net",
 ]
 
 [[package]]
@@ -7448,6 +7449,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp_net"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "serde_json",
+ "ureq",
+ "wisp_core",
+]
+
+[[package]]
 name = "wisp_paper"
 version = "0.1.0"
 dependencies = [
@@ -7460,9 +7471,9 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-segmentation",
- "ureq",
  "winresource",
  "wisp_core",
+ "wisp_net",
 ]
 
 [[package]]

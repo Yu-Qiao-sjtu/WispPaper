@@ -20,7 +20,7 @@ pub fn parse_identifier(value: &str) -> Option<Identifier> {
     (!pmid.is_empty() && pmid.len() <= 9 && pmid.bytes().all(|b| b.is_ascii_digit())).then_some(Identifier::Pmid(pmid))
 }
 
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     let mut out = String::new();
     for b in value.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { out.push(b as char) } else { out.push_str(&format!("%{b:02X}")) }
@@ -54,7 +54,11 @@ fn first(v: &Value) -> String {
 
 /// A Crossref `/works/{doi}` response.
 pub fn crossref_paper(body: &Value) -> Option<Paper> {
-    let work = body.get("message")?;
+    crossref_work(body.get("message")?)
+}
+
+/// One Crossref work record.
+pub fn crossref_work(work: &Value) -> Option<Paper> {
     let title = strip_markup(&first(&work["title"]));
     if title.is_empty() { return None }
     let authors: Vec<String> = work["author"]
@@ -96,7 +100,11 @@ pub fn crossref_paper(body: &Value) -> Option<Paper> {
 
 /// The first hit of a Europe PMC search response.
 pub fn europepmc_paper(body: &Value) -> Option<Paper> {
-    let hit = body["resultList"]["result"].as_array()?.first()?;
+    europepmc_hit(body["resultList"]["result"].as_array()?.first()?)
+}
+
+/// One Europe PMC search hit.
+pub fn europepmc_hit(hit: &Value) -> Option<Paper> {
     let title = strip_markup(&text(&hit["title"])).trim_end_matches('.').to_string();
     if title.is_empty() { return None }
     let mut authors: Vec<String> = hit["authorList"]["author"].as_array().map(|list| list.iter().map(|a| text(&a["fullName"])).filter(|n| !n.is_empty()).collect()).unwrap_or_default();

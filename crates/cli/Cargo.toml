@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 wisp_core = { path = "../core" }
+wisp_net = { path = "../net" }
 serde_json = "1"
 
 [lints]

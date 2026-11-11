@@ -7,6 +7,7 @@ use crate::theme::{self, Theme};
 use crate::ui;
 use gpui::{prelude::FluentBuilder, *};
 use wisp_core::model::FieldKind;
+use wisp_core::sources;
 
 /// A choice among a few: the chosen one filled with the accent.
 fn option_chip(id: impl Into<ElementId>, label: impl Into<SharedString>, chosen: bool) -> Stateful<Div> {
@@ -126,6 +127,21 @@ impl Workspace {
                     )
                     .child(footer("保存", false, self, cx))
             }
+
+            Modal::Search { editing, kind, name, query, max } => ui::dialog(560.)
+                .child(ui::dialog_title(if editing.is_some() { "修改检索式" } else { "新建检索式" }))
+                .child(
+                    body()
+                        .child(ui::form_row("来源", div().flex().flex_wrap().gap(px(6.)).children(sources::KINDS.iter().map(|(key, label)| option_chip(*key, *label, key == kind).on_click(self.on(Cmd::PickSource(key.to_string()), cx))))))
+                        .child(ui::form_row("检索式", ui::field(query, window, cx)))
+                        // Each database reads a query its own way.
+                        .child(div().text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_tertiary()).child(sources::syntax(kind)))
+                        .child(ui::form_row("名称", ui::field(name, window, cx)))
+                        .child(ui::form_row("每次取回", div().flex().items_center().gap(px(8.)).child(ui::field(max, window, cx).w(px(90.))).child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child(format!("篇最新的记录（最多 {}）", sources::MAX_RESULTS)))))
+                        .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("保存后先「试检索」看看命中的是不是想要的文献，再「运行」导入。检索式会发送给所选的数据库。"))
+                        .child(error),
+                )
+                .child(footer("保存", false, self, cx)),
 
             Modal::Fields { editing, name, options, kind, in_table } => {
                 let lib = self.lib.as_ref()?;

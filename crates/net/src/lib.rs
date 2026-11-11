@@ -1,5 +1,6 @@
-//! The network: metadata lookups and the streamed chat request. Everything
-//! here blocks, so it runs on the background executor.
+//! The network: metadata lookups, literature searches, the streamed chat
+//! request and the update check. Shared by the app and `wisp`. Everything
+//! here blocks, so the app runs it on the background executor.
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
@@ -34,6 +35,19 @@ fn get_json(url: &str) -> Result<Option<Value>, String> {
     if status == 404 { return Ok(None) }
     if !(200..300).contains(&status) { return Err(format!("服务返回 HTTP {status}：{url}")) }
     response.body_mut().read_json::<Value>().map(Some).map_err(|e| format!("无法解析返回内容：{e}"))
+}
+
+/// GET a document as text: what `wisp_core::sources` asks the literature
+/// databases for (JSON from most, XML from PubMed and arXiv).
+pub fn get_text(url: &str) -> Result<String, String> {
+    let mut response = agent(Some(Duration::from_secs(60))).get(url).call().map_err(network_error)?;
+    let status = response.status().as_u16();
+    let host = url.split('/').nth(2).unwrap_or(url);
+    match status {
+        200..300 => response.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| format!("无法读取 {host} 的返回内容：{e}")),
+        429 => Err(format!("{host} 限制了请求频率，请稍后再试。")),
+        _ => Err(format!("{host} 返回 HTTP {status}。")),
+    }
 }
 
 /// The paper behind a DOI or PMID: Crossref first for a DOI, completed by
