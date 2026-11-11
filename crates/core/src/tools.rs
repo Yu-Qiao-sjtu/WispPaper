@@ -10,7 +10,8 @@ use crate::filter::{Filters, filter_papers};
 use crate::fulltext::{file_pages, terms};
 use crate::libraries::{self, LibraryInfo};
 use crate::model::{FULLTEXTS, Paper, READINGS, SCREENINGS, one_of};
-use crate::store::Store;
+use crate::sources::{self, Fetch};
+use crate::store::{SavedSearch, Store};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -23,12 +24,17 @@ pub struct ToolDef {
     pub description: &'static str,
     /// JSON Schema of the arguments object.
     pub input_schema: Value,
+    /// Whether it changes the library; the others only read.
+    pub writes: bool,
 }
 
 /// A tool that works inside one library: it also takes `library`.
+/// The tools that change the library.
+const WRITING: [&str; 4] = ["save_search", "remove_search", "run_search", "undo_import"];
+
 fn scoped(name: &'static str, title: &'static str, description: &'static str, mut properties: Value, required: &[&str]) -> ToolDef {
     properties["library"] = json!({"type": "string", "description": "文献库的 ID 或名称；只有一个文献库时可以省略。"});
-    ToolDef { name, title, description, input_schema: json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false}) }
+    ToolDef { name, title, description, input_schema: json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false}), writes: WRITING.contains(&name) }
 }
 
 /// The stored values of a status table, for a schema's `enum`.
@@ -43,6 +49,7 @@ pub fn catalog() -> Vec<ToolDef> {
             title: "列出文献库",
             description: "列出所有文献库：ID、名称、主题和文献数量。其他工具用 library 参数指定其中一个。",
             input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            writes: false,
         },
         scoped("library_status", "文献库概况", "一个文献库的概况：主题、文献数量、收录判断和阅读状态的分布、自定义词条，以及各状态值在界面上的显示名称。", json!({}), &[]),
         scoped(
@@ -94,6 +101,48 @@ pub fn catalog() -> Vec<ToolDef> {
                 "perSentence": {"type": "integer", "description": "每句最多几篇候选，默认 3，最大 10。"},
             }),
             &["text"],
+        ),
+        scoped(
+            "search_online",
+            "试检索",
+            "在文献数据库里试运行一个检索式，不向文献库写入任何内容。返回数据库的命中总数和最新的若干条记录，并标出每条是否已在文献库中、用户对它的收录判断，用来判断检索式是否靠谱。各来源的检索语法不同：pubmed 和 europepmc 支持布尔运算符和字段，arxiv 用 ti: / abs: / cat: 前缀，crossref 只按词语匹配。",
+            json!({
+                "source": {"type": "string", "enum": sources::KINDS.iter().map(|(key, _)| *key).collect::<Vec<_>>(), "description": "文献数据库。"},
+                "query": {"type": "string", "description": "按该来源的语法写的检索式。"},
+                "limit": {"type": "integer", "description": "取回多少条最新记录，默认 20，最大 100。"},
+            }),
+            &["source", "query"],
+        ),
+        scoped("list_searches", "已保存的检索式", "列出文献库保存的检索式：来源、检索式、每次取回的篇数，以及最近一次运行的结果。", json!({}), &[]),
+        scoped(
+            "save_search",
+            "保存检索式",
+            "新建或修改一个保存的检索式。不带 id 时新建，必须给出 source 和 query；带 id 时只改动给出的项。保存不会运行它。",
+            json!({
+                "id": {"type": "string", "description": "要修改的检索式的 ID；新建时省略。"},
+                "source": {"type": "string", "enum": sources::KINDS.iter().map(|(key, _)| *key).collect::<Vec<_>>(), "description": "文献数据库。"},
+                "query": {"type": "string", "description": "按该来源的语法写的检索式。"},
+                "name": {"type": "string", "description": "给人看的名称；省略时用来源的名字。"},
+                "maxResults": {"type": "integer", "description": "每次运行取回多少条最新记录，默认 50，最大 200。"},
+                "enabled": {"type": "boolean", "description": "是否参与「全部运行」和定时更新，默认是。"},
+            }),
+            &[],
+        ),
+        scoped("remove_search", "删除检索式", "删除一个保存的检索式。它导入过的文献和运行记录都保留。", json!({"id": {"type": "string", "description": "检索式的 ID。"}}), &["id"]),
+        scoped(
+            "run_search",
+            "运行检索式",
+            "运行一个保存的检索式，把取回的记录导入文献库：已有的文献（按 DOI、PMID、题目识别，回收站里的也算）被跳过。新文献的收录判断都是「待判断」。返回批次号，可以用 undo_import 整批撤销。",
+            json!({"id": {"type": "string", "description": "检索式的 ID。"}}),
+            &["id"],
+        ),
+        scoped("list_imports", "导入记录", "最近的导入批次：哪个检索式、何时运行、数据库命中总数、取回、新增和跳过的篇数，以及失败原因。", json!({"limit": {"type": "integer", "description": "最多返回多少条，默认 20。"}}), &[]),
+        scoped(
+            "undo_import",
+            "撤销导入",
+            "撤销一个导入批次：删除它新增的、还没有人处理过的文献。已经做过收录判断、读过、收藏、写过笔记、加过标签或附件的文献保留，并在结果里列出。",
+            json!({"batchId": {"type": "string", "description": "run_search 或 list_imports 给出的批次号。"}}),
+            &["batchId"],
         ),
     ]
 }
@@ -173,7 +222,7 @@ pub fn describe_result(result: &Result<Value, String>) -> String {
 
 /// Run a tool against the data folder `root`. The error is a sentence for
 /// whoever called: a person at a terminal or a model.
-pub fn call(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
+pub fn call(root: &Path, name: &str, args: &Value, fetch: Fetch) -> Result<Value, String> {
     checked(name, args)?;
     if name == "list_libraries" {
         let all: Vec<Value> = libraries::list(root).iter().map(|l| json!({"id": l.id, "name": l.name, "topic": l.topic, "papers": l.paper_count})).collect();
@@ -181,14 +230,25 @@ pub fn call(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
     }
     let info = find_library(root, args["library"].as_str().unwrap_or(""))?;
     let mut store = Store::open(&info.dir).map_err(|e| format!("{e:#}"))?;
-    call_in(&mut store, &info, name, args)
+    call_in(&mut store, &info, name, args, fetch)
 }
 
 /// Run a library tool on a library that is already open.
-pub fn call_in(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value) -> Result<Value, String> {
+pub fn call_in(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fetch: Fetch) -> Result<Value, String> {
     checked(name, args)?;
+    dispatch(store, info, name, args, fetch).map_err(|e| format!("{e:#}"))
+}
+
+fn dispatch(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fetch: Fetch) -> Result<Value> {
     match name {
         "find_citations" => find_citations(store, args),
+        "search_online" => search_online(store, args, fetch),
+        "list_searches" => Ok(json!({"searches": store.list_searches()?})),
+        "save_search" => save_search(store, args),
+        "remove_search" => store.remove_search(text(args, "id")?).map(|()| json!({"removed": true})),
+        "run_search" => run_search(store, text(args, "id")?, fetch),
+        "list_imports" => Ok(json!({"imports": store.list_batches(number(args, "limit", 20, 200)?)?})),
+        "undo_import" => undo_import(store, args),
         "library_status" => library_status(store, info),
         "list_papers" => list_papers(store, info, args),
         "get_paper" => get_paper(store, args),
@@ -196,7 +256,6 @@ pub fn call_in(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value) 
         "read_fulltext" => read_fulltext(store, args),
         _ => Err(anyhow!("没有这个工具：{name}")),
     }
-    .map_err(|e| format!("{e:#}"))
 }
 
 /// The library `wanted` names by id or by name; the only one when it is empty.
@@ -493,6 +552,78 @@ fn find_citations(store: &mut Store, args: &Value) -> Result<Value> {
     }))
 }
 
+// ---- searching the literature databases
+
+fn truth(args: &Value, key: &str, default: bool) -> Result<bool> {
+    match &args[key] {
+        Value::Null => Ok(default),
+        Value::Bool(value) => Ok(*value),
+        _ => bail!("参数 {key} 应为 true 或 false。"),
+    }
+}
+
+fn search_online(store: &mut Store, args: &Value, fetch: Fetch) -> Result<Value> {
+    let (kind, query) = (text(args, "source")?, text(args, "query")?);
+    let found = sources::search(kind, query, number(args, "limit", 20, 100)?.max(1), fetch).map_err(|e| anyhow!(e))?;
+    let mut known = 0;
+    let mut results = vec![];
+    for mut paper in found.papers {
+        paper.normalize();
+        // What the library already holds for this record, and what its owner decided about it.
+        let existing = match store.existing_paper(&paper)? {
+            Some(id) => {
+                known += 1;
+                let held = store.get_paper(&id)?;
+                json!({"id": held.id, "screening": held.screening, "inTrash": store.list_trash()?.iter().any(|entry| entry.paper.id == held.id)})
+            }
+            None => Value::Null,
+        };
+        let summary: String = paper.abstract_text.chars().take(400).collect();
+        results.push(json!({"title": paper.title, "authors": paper.short_authors(), "year": paper.year, "journal": paper.journal, "doi": paper.doi, "pmid": paper.pmid, "abstract": summary, "inLibrary": existing}));
+    }
+    Ok(json!({"source": kind, "query": query, "total": found.total, "fetched": results.len(), "new": results.len() - known, "inLibrary": known, "results": results}))
+}
+
+fn save_search(store: &mut Store, args: &Value) -> Result<Value> {
+    let id = text(args, "id")?;
+    let mut search = if id.is_empty() {
+        if text(args, "source")?.is_empty() || text(args, "query")?.is_empty() { bail!("新建检索式需要 source 和 query。") }
+        SavedSearch { max_results: 50, enabled: true, ..Default::default() }
+    } else {
+        store.list_searches()?.into_iter().find(|s| s.id == id).ok_or_else(|| anyhow!("检索式不存在：{id}"))?
+    };
+    if !args["source"].is_null() { search.kind = text(args, "source")?.into() }
+    if !args["query"].is_null() { search.query = text(args, "query")?.into() }
+    if !args["name"].is_null() { search.name = text(args, "name")?.into() }
+    search.max_results = number(args, "maxResults", search.max_results, usize::MAX)?;
+    search.enabled = truth(args, "enabled", search.enabled)?;
+    store.save_search(&mut search)?;
+    Ok(serde_json::to_value(&search)?)
+}
+
+/// Run a saved search and import what it brings back as one batch. A run
+/// that fails is recorded too, so the search shows what went wrong.
+fn run_search(store: &mut Store, id: &str, fetch: Fetch) -> Result<Value> {
+    let search = store.list_searches()?.into_iter().find(|s| s.id == id).ok_or_else(|| anyhow!("检索式不存在：{id}"))?;
+    let kind_name = sources::KINDS.iter().find(|(key, _)| *key == search.kind).map_or(search.kind.as_str(), |(_, name)| name);
+    let label = format!("{kind_name}：{}", search.query);
+    let found = match sources::search(&search.kind, &search.query, search.max_results, fetch) {
+        Ok(found) => found,
+        Err(error) => {
+            store.record_failed_run(&search.id, &label, &error)?;
+            bail!(error)
+        }
+    };
+    let (batch, result) = store.import_batch(&search.id, &label, found.total, found.papers)?;
+    let added: Vec<Value> = result.added.iter().take(50).map(|p| json!({"id": p.id, "title": p.title, "year": p.year})).collect();
+    Ok(json!({"batchId": batch.id, "search": search.name, "total": batch.remote_total, "fetched": batch.fetched, "added": batch.added, "skipped": batch.skipped, "addedPapers": added}))
+}
+
+fn undo_import(store: &mut Store, args: &Value) -> Result<Value> {
+    let undone = store.undo_batch(text(args, "batchId")?)?;
+    Ok(json!({"removed": undone.removed, "kept": undone.kept.iter().map(|(id, title)| json!({"id": id, "title": title})).collect::<Vec<_>>()}))
+}
+
 // ---- the command line
 
 /// `paperId` as a flag: `paper-id`.
@@ -559,6 +690,15 @@ pub fn usage(tool: &ToolDef) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// No tool in these tests may reach the network.
+    pub(crate) fn offline(url: &str) -> Result<String, String> {
+        Err(format!("测试中不应联网：{url}"))
+    }
+
+    fn call(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
+        super::call(root, name, args, &offline)
+    }
+
     use super::*;
     use crate::model::{FieldDef, new_id};
     use std::path::PathBuf;
@@ -678,6 +818,56 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A PubMed that knows two records, one of which the sample library holds by title.
+    fn pubmed(url: &str) -> Result<String, String> {
+        if url.contains("esearch") { return Ok(r#"{"esearchresult":{"count":"88","idlist":["1","2"]}}"#.into()) }
+        Ok("<PubmedArticleSet>\
+<PubmedArticle><MedlineCitation><PMID>1</PMID><Article><Journal><JournalIssue><PubDate><Year>2024</Year></PubDate></JournalIssue><Title>Plant Cell</Title></Journal><ArticleTitle>Root stem cell niche.</ArticleTitle></Article></MedlineCitation></PubmedArticle>\
+<PubmedArticle><MedlineCitation><PMID>2</PMID><Article><Journal><JournalIssue><PubDate><Year>2025</Year></PubDate></JournalIssue><Title>Nature Plants</Title></Journal><ArticleTitle>A new root atlas</ArticleTitle><Abstract><AbstractText>Cells of the root.</AbstractText></Abstract></Article></MedlineCitation></PubmedArticle>\
+</PubmedArticleSet>"
+            .into())
+    }
+
+    #[test]
+    fn searches_from_trial_to_undo() {
+        let (root, id) = sample();
+        let online = |name: &str, args: Value| super::call(&root, name, &args, &pubmed);
+        // A trial writes nothing and says what the library already holds.
+        let trial = online("search_online", json!({"source": "pubmed", "query": "root[Title]", "limit": 5})).unwrap();
+        assert_eq!((trial["total"].as_u64(), trial["fetched"].as_u64(), trial["new"].as_u64(), trial["inLibrary"].as_u64()), (Some(88), Some(2), Some(1), Some(1)));
+        assert_eq!((trial["results"][0]["inLibrary"]["id"].as_str(), trial["results"][0]["inLibrary"]["screening"].as_str()), (Some(id.as_str()), Some("pending")));
+        assert_eq!((trial["results"][1]["inLibrary"].clone(), trial["results"][1]["abstract"].as_str()), (Value::Null, Some("Cells of the root.")));
+        assert_eq!(call(&root, "list_papers", &json!({})).unwrap()["total"], 1);
+        assert!(call(&root, "search_online", &json!({"source": "pubmed", "query": "x"})).unwrap_err().contains("不应联网"));
+
+        assert!(online("save_search", json!({"query": "x"})).unwrap_err().contains("source 和 query"));
+        let saved = online("save_search", json!({"source": "pubmed", "query": "root[Title]", "maxResults": 10})).unwrap();
+        let search = saved["id"].as_str().unwrap().to_string();
+        assert_eq!((saved["name"].as_str(), saved["maxResults"].as_u64(), saved["enabled"].as_bool()), (Some("PubMed"), Some(10), Some(true)));
+        // Changing one thing leaves the rest.
+        let renamed = online("save_search", json!({"id": search, "name": "根", "enabled": false})).unwrap();
+        assert_eq!((renamed["name"].as_str(), renamed["query"].as_str(), renamed["enabled"].as_bool()), (Some("根"), Some("root[Title]"), Some(false)));
+
+        let run = online("run_search", json!({"id": search})).unwrap();
+        assert_eq!((run["total"].as_u64(), run["fetched"].as_u64(), run["added"].as_u64(), run["skipped"].as_u64()), (Some(88), Some(2), Some(1), Some(1)));
+        assert_eq!(run["addedPapers"][0]["title"], "A new root atlas");
+        let added = call(&root, "list_papers", &json!({"query": "atlas"})).unwrap();
+        assert_eq!((added["papers"][0]["screening"].as_str(), added["papers"][0]["pmid"].as_str()), (Some("pending"), Some("2")));
+        // A failed run is on the record of the search.
+        assert!(call(&root, "run_search", &json!({"id": search})).unwrap_err().contains("不应联网"));
+        let listed = call(&root, "list_searches", &json!({})).unwrap();
+        assert!(listed["searches"][0]["lastRun"]["error"].as_str().unwrap().contains("不应联网"));
+        let imports = call(&root, "list_imports", &json!({})).unwrap();
+        assert_eq!((imports["imports"].as_array().unwrap().len(), imports["imports"][1]["label"].as_str()), (2, Some("PubMed：root[Title]")));
+
+        let undone = call(&root, "undo_import", &json!({"batchId": run["batchId"]})).unwrap();
+        assert_eq!((undone["removed"].as_u64(), undone["kept"].as_array().map(Vec::len)), (Some(1), Some(0)));
+        assert_eq!(call(&root, "list_papers", &json!({})).unwrap()["total"], 1);
+        assert_eq!(call(&root, "remove_search", &json!({"id": search})).unwrap()["removed"], true);
+        assert!(catalog().iter().filter(|t| t.writes).map(|t| t.name).eq(WRITING));
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn what_the_window_shows() {
         assert_eq!(describe_call("search_fulltext", &json!({"query": "10x  Genomics", "limit": 5})), "检索全文：10x Genomics · limit 5");
@@ -743,8 +933,8 @@ pub(crate) mod tests {
         let (root, _) = sample();
         for tool in catalog() {
             assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
-            // A missing argument is reported by `call` itself; anything else means the name is not wired up.
-            if let Err(error) = call(&root, tool.name, &json!({})) { assert!(error.contains("需要参数"), "{}: {error}", tool.name) }
+            // An empty call may be refused for what it lacks, but never because the name leads nowhere.
+            if let Err(error) = call(&root, tool.name, &json!({})) { assert!(!error.contains("没有这个工具"), "{}: {error}", tool.name) }
         }
         std::fs::remove_dir_all(root).ok();
     }

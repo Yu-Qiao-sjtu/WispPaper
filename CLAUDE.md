@@ -8,7 +8,7 @@ Wisp Paper is a local-first literature library desktop app (collect papers, orga
 
 ```sh
 cargo run --release                     # run the app
-cargo test                              # all three crates (workspace default-members)
+cargo test                              # all four crates (workspace default-members)
 cargo run -p wisp_cli -- help           # the `wisp` command line; `-- mcp` is the MCP server
 cargo test -p wisp_core                 # engine only; no GPUI build, much faster
 cargo test -p wisp_core store::         # one module's tests
@@ -28,11 +28,11 @@ cargo clippy --all-targets              # expected to be warning-free
 
 ## Architecture
 
-A Cargo workspace of three crates. Dependencies point one way only: the app and the command line depend on core.
+A Cargo workspace of four crates. Dependencies point one way only: `wisp_net` depends on core, the app and the command line depend on both.
 
 ### `crates/core` (`wisp_core`): the engine, no GPUI
 
-Everything that can be decided without a window or a socket lives here, and it is where nearly all tests are. That includes the pure halves of networked features: `lookup` builds Crossref / Europe PMC URLs and turns their JSON into a `Paper`; `ai` builds the context, the request body for both protocols (Anthropic and OpenAI-compatible) and parses stream lines into `StreamEvent`s. The actual HTTP (blocking `ureq`) is in the app's `src/net.rs`, whose tests serve canned responses from a local port.
+Everything that can be decided without a window or a socket lives here, and it is where nearly all tests are. That includes the pure halves of networked features: `lookup` builds Crossref / Europe PMC URLs and turns their JSON into a `Paper`; `ai` builds the context, the request body for both protocols (Anthropic and OpenAI-compatible) and parses stream lines into `StreamEvent`s. The actual HTTP (blocking `ureq`) is in `crates/net` (`wisp_net`), shared by the app and `wisp`; its tests serve canned responses from a local port. Code in core that needs the network takes the fetching function as an argument (`sources::Fetch`), so core tests pass a closure.
 
 On-disk layout: the data root holds one folder per library, each with `library.json` (`libraries`), `wisp-paper.sqlite` and `papers/` (`store`). Attachment paths in the database are relative to the library folder so a folder can be copied elsewhere. Removing a library or attachment moves it to `removed/`; nothing is deleted.
 
@@ -45,7 +45,8 @@ On-disk layout: the data root holds one folder per library, each with `library.j
 `tools.rs` is the one table of what an agent can do with a library; the command line, MCP and (next) the in-app assistant all end in `tools::call`, so a rule belongs there and not in a front end. `ai.rs` holds the model side of the loop: the request with tool definitions for both protocols, `TurnReader` (one streamed turn → text, tool calls, the message to send back), `tool_results`, and the slash commands (`SLASH`, prompt templates behind `/search` and `/cite`).
 - A new tool is an entry in `catalog()` (name, Chinese description, JSON Schema) and an arm in `call_in`. Nothing else: `wisp <tool>` reads its flags off the schema (`cli_args`), and `mcp::handle` lists and calls whatever the catalog holds. The test `every_tool_is_callable` fails when an entry has no arm.
 - Tools take `library` (id or name, optional when there is one library) and return JSON; an error is a Chinese sentence for the caller, person or model.
-- All tools so far only read. When write tools arrive, the screening decision stays the person's: an agent may propose, never set `screening`.
+- `ToolDef::writes` marks the tools that change a library (the `WRITING` list); `wisp mcp --read-only` leaves them out, and the chat reloads the library after one ran. The screening decision stays the person's: an agent may propose, never set `screening`.
+- `sources.rs` searches PubMed, Europe PMC, Crossref and arXiv (PubMed and arXiv answer in XML, read by the small `elements` helper). A saved search is a `searches` row; each run is an `import_batches` row with its papers in `batch_papers`, which is what `undo_batch` removes (untouched papers only).
 
 ### `crates/cli` (`wisp_cli`): the `wisp` binary
 
@@ -72,4 +73,4 @@ A thin shell over `tools` and `mcp`: argument words in, JSON out; `wisp mcp` is 
 
 ## Scope
 
-Ported from BiblioCell, without its datasets and web version. Being added step by step: the tool layer with CLI and MCP (done, read-only tools), the chat as an agent loop over the tools with `/search` and `/cite` (done), search sources with trial queries and batch import, a guide page for a new library that starts from a search, AI screening suggestions that the person confirms (鲸吞法: import broadly by query, let the agent judge, the person decides), scheduled source sync, and jumping to the quoted sentence in the PDF. API keys are stored in plain text in `settings.json`; when empty, `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are read from the environment.
+Ported from BiblioCell, without its datasets and web version. Being added step by step: the tool layer with CLI and MCP (done, read-only tools), the chat as an agent loop over the tools with `/search` and `/cite` (done), search sources with trial queries and batch import (done: 检索与导入 page, `src/searches.rs`), a guide page for a new library that starts from a search, AI screening suggestions that the person confirms (鲸吞法: import broadly by query, let the agent judge, the person decides), scheduled source sync, and jumping to the quoted sentence in the PDF. API keys are stored in plain text in `settings.json`; when empty, `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are read from the environment.

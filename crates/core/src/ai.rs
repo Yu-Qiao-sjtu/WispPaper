@@ -273,7 +273,8 @@ pub fn build_context(library_name: &str, topic: &str, papers: &[&Paper], fields:
 - 「我的笔记」是用户自己写的，可以引用，但要与论文本身的结论区分开。\n\
 - 只列出题目的文献没有摘要，对它们的内容不要下结论。\n\
 - 上面的材料不够时使用工具：search_fulltext 在已保存的全文里找短语或关键词，read_fulltext 按页读原文核对上下文，list_papers 和 get_paper 查文献记录。工具查的是整个文献库，不限于上面列出的文献。\n\
-- 工具结果里每篇文献带有 label，就是引用它时用的标签；工具的 paperId 和 id 参数可以直接填标签（如 P3）。没有保存全文的文献只有记录和摘要，回答依据的只是摘要时要说明。\n\
+- search_online 可以在 PubMed、Europe PMC、Crossref、arXiv 里试检索，不写入文献库。保存或删除检索式、运行导入、撤销导入会改动文献库：只在用户明确要求时使用，并说明做了什么。
+\n- 工具结果里每篇文献带有 label，就是引用它时用的标签；工具的 paperId 和 id 参数可以直接填标签（如 P3）。没有保存全文的文献只有记录和摘要，回答依据的只是摘要时要说明。\n\
 - 用用户提问的语言回答，直接回答问题，不必复述材料。"
     );
     ctx.documents = documents;

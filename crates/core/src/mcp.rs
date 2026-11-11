@@ -2,6 +2,7 @@
 //! JSON-RPC message. The transport (lines on stdin and stdout) is the `wisp`
 //! binary's; nothing here reads or writes a stream.
 
+use crate::sources::Fetch;
 use crate::tools;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -11,11 +12,18 @@ const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INSTRUCTIONS: &str = "Wisp Paper 的本地文献库。先用 list_libraries 看有哪些文献库，再用 library 参数指定其中一个。\
 查出处时先 search_fulltext，再用 read_fulltext 读命中的页面核对上下文；没有保存全文的文献只有书目信息和摘要。\
-收录判断（screening）由用户本人决定；它的存储值不等于界面上的名称（excluded 显示为「相关」），名称见 library_status 的 labels。";
+收录判断（screening）由用户本人决定；它的存储值不等于界面上的名称（excluded 显示为「相关」），名称见 library_status 的 labels。\nsearch_online 只是试检索，不写入；save_search、run_search、undo_import 会改动文献库，新导入的文献都是「待判断」。";
+
+/// How this server runs: how its tools reach the network, and whether the
+/// tools that change a library are offered at all.
+pub struct Server<'a> {
+    pub fetch: Fetch<'a>,
+    pub read_only: bool,
+}
 
 /// The reply to a message, or `None` when it asks for none (a notification,
 /// or a response to something this server never sent).
-pub fn handle(root: &Path, message: &Value) -> Option<Value> {
+pub fn handle(root: &Path, message: &Value, server: &Server) -> Option<Value> {
     let method = message["method"].as_str()?;
     let id = message.get("id").filter(|id| !id.is_null())?.clone();
     let params = &message["params"];
@@ -30,14 +38,16 @@ pub fn handle(root: &Path, message: &Value) -> Option<Value> {
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools::catalog().iter().map(|t| json!({"name": t.name, "title": t.title, "description": t.description, "inputSchema": t.input_schema})).collect::<Vec<_>>()})),
+        "tools/list" => Ok(json!({"tools": tools::catalog().iter().filter(|t| !(server.read_only && t.writes)).map(|t| json!({"name": t.name, "title": t.title, "description": t.description, "inputSchema": t.input_schema, "annotations": {"readOnlyHint": !t.writes}})).collect::<Vec<_>>()})),
         "tools/call" => match params["name"].as_str() {
             None => Err((-32602, "tools/call needs the name of a tool".to_string())),
             Some(name) => {
                 let empty = json!({});
                 let args = if params["arguments"].is_null() { &empty } else { &params["arguments"] };
                 // A failed tool is a result the model reads and recovers from, not a protocol error.
-                Ok(match tools::call(root, name, args) {
+                let refused = server.read_only && tools::catalog().iter().any(|t| t.name == name && t.writes);
+                let outcome = if refused { Err(format!("这个 MCP 服务以只读方式启动，不能使用 {name}。")) } else { tools::call(root, name, args, server.fetch) };
+                Ok(match outcome {
                     Ok(value) => json!({"content": [{"type": "text", "text": value.to_string()}], "structuredContent": value, "isError": false}),
                     Err(error) => json!({"content": [{"type": "text", "text": error}], "isError": true}),
                 })
@@ -63,7 +73,8 @@ mod tests {
     #[test]
     fn a_session() {
         let (root, id) = tools::tests::sample();
-        let ask = |message: Value| handle(&root, &message);
+        let server = Server { fetch: &tools::tests::offline, read_only: false };
+        let ask = |message: Value| handle(&root, &message, &server);
         let hello = ask(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})).unwrap();
         assert_eq!((hello["id"].as_i64(), hello["result"]["protocolVersion"].as_str()), (Some(1), Some("2025-03-26")));
         assert!(hello["result"]["capabilities"]["tools"].is_object());
@@ -89,6 +100,17 @@ mod tests {
         assert_eq!(ask(json!({"id": 7, "method": "tools/call", "params": {}})).unwrap()["error"]["code"], -32602);
         assert_eq!(ask(json!({"id": 8, "method": "resources/list"})).unwrap()["error"]["code"], -32601);
         assert_eq!(parse_error("x")["error"]["code"], -32700);
+
+        // Read-only: the tools that change a library are neither listed nor callable.
+        let annotated = listed["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "run_search").unwrap();
+        assert_eq!(annotated["annotations"]["readOnlyHint"], false);
+        let reader = Server { fetch: &tools::tests::offline, read_only: true };
+        let listed = handle(&root, &json!({"id": 9, "method": "tools/list"}), &reader).unwrap();
+        let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"search_online") && !names.contains(&"run_search") && !names.contains(&"save_search"));
+        let refused = handle(&root, &json!({"id": 10, "method": "tools/call", "params": {"name": "save_search", "arguments": {"source": "pubmed", "query": "x"}}}), &reader).unwrap();
+        assert_eq!(refused["result"]["isError"], true);
+        assert!(refused["result"]["content"][0]["text"].as_str().unwrap().contains("只读"));
         std::fs::remove_dir_all(root).ok();
     }
 }

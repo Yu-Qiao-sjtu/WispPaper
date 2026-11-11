@@ -19,6 +19,9 @@
   - 回收站：删除的文献可恢复，并继续阻止同一篇被重复导入。
   - 导出 BibTeX、CSV（当前列表）。
 - **PDF 预览**：在详情面板里直接看 PDF，可展开成阅读宽度。渲染用纯 Rust 的 [hayro](https://github.com/LaurenzV/hayro)，不依赖系统 PDF 库。
+- **检索与导入**
+  - 为 PubMed、Europe PMC、Crossref、arXiv 保存检索式；「试检索」显示数据库命中总数和最新的记录，并标出哪些已在库中。
+  - 「运行并导入」把新文献加入文献库（都是「待判断」），已有的跳过；每次导入可以整批撤销，处理过的文献会保留。
 - **提问**
   - 向文献库提问：范围是当前列表（受视图、搜索、筛选影响），模型读到每篇的记录、笔记，以及已存 PDF 中与问题相关的页面。
   - 就单篇文献提问：模型读到该文献的记录和全文。
@@ -43,7 +46,7 @@
 
 数据目录可以在「设置 › 通用」里更改。环境变量 `WISP_PAPER_HOME` 可把数据和设置一起指到别处（测试用）。
 
-**会离开本机的数据**：DOI / PMID 查询会把编号发给 Crossref 和 Europe PMC；检查更新会向 GitHub 请求本项目的 `releases/latest`，只读取它跳转到的版本号，不下载、不上传任何内容（可在「设置 › 通用」关闭，新版本需要自己到发布页下载安装）；提问会把问题和相关文献的记录、笔记、全文页面发给你配置的模型服务。API Key 以明文保存在 `settings.json`，留空则读取环境变量 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`。
+**会离开本机的数据**：DOI / PMID 查询会把编号发给 Crossref 和 Europe PMC；试检索和运行检索式会把检索式发给所选的数据库（PubMed、Europe PMC、Crossref 或 arXiv）；检查更新会向 GitHub 请求本项目的 `releases/latest`，只读取它跳转到的版本号，不下载、不上传任何内容（可在「设置 › 通用」关闭，新版本需要自己到发布页下载安装）；提问会把问题和相关文献的记录、笔记、全文页面发给你配置的模型服务。API Key 以明文保存在 `settings.json`，留空则读取环境变量 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`。
 
 ## 命令行与 MCP
 
@@ -63,7 +66,7 @@ wisp search_fulltext --help             # 一个工具的参数
 
 输出是 JSON；出错时信息写到 stderr，退出码为 1。只有一个文献库时可以省略 `-l`；`--data-dir 文件夹` 指定另一个数据目录。
 
-目前的工具都是只读的：
+工具：
 
 | 工具 | 用途 |
 |---|---|
@@ -74,10 +77,14 @@ wisp search_fulltext --help             # 一个工具的参数
 | `search_fulltext` | 在已保存的全文里找短语或关键词，返回页码和逐字片段 |
 | `read_fulltext` | 按页读取全文，一次最多 8 页 |
 | `find_citations` | 为一段文字逐句找出库里可能支持它的文献（按词语匹配的候选） |
+| `search_online` | 在 PubMed、Europe PMC、Crossref 或 arXiv 试运行一个检索式，不写入；标出每条结果是否已在库中 |
+| `list_searches` / `save_search` / `remove_search` | 查看、保存、删除检索式（后两个会改动文献库） |
+| `run_search` | 运行一个保存的检索式并导入，已有的文献跳过，返回批次号（会改动文献库） |
+| `list_imports` / `undo_import` | 导入记录；整批撤销一次导入，处理过的文献保留（撤销会改动文献库） |
 
 全文检索第一次用到某个 PDF 时会提取它的文字并缓存到库里，之后即时返回。
 
-把 `wisp mcp` 配置给 AI 客户端，它就能通过 MCP（标准输入输出）使用同一组工具：
+把 `wisp mcp` 配置给 AI 客户端，它就能通过 MCP（标准输入输出）使用同一组工具；`wisp mcp --read-only` 不提供会改动文献库的工具：
 
 ```json
 {
@@ -107,7 +114,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 
 ## 代码结构
 
-仓库是一个 Cargo workspace，分三个 crate，应用和命令行都只依赖 core：
+仓库是一个 Cargo workspace，分四个 crate：core 不依赖其他三个，net 只依赖 core，应用和命令行依赖这两个：
 
 - **`crates/core`（`wisp_core`）**：文献库引擎，不依赖 GPUI，可以单独编译和测试。
 
@@ -119,12 +126,15 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
   | `filter` | 搜索、筛选、排序、侧栏计数 |
   | `import` / `export` | BibTeX、RIS 读入；BibTeX、CSV 写出 |
   | `lookup` | Crossref / Europe PMC 返回值 → 文献 |
+  | `sources` | 文献数据库检索：要请求的地址，以及从返回内容读出的记录 |
   | `fulltext` | PDF 逐页文字提取 |
   | `ai` | 提问的上下文组装、两种协议的请求体（含工具定义）、流式返回和工具调用的解析、斜杠命令 |
   | `settings` | settings.json，以及它和数据目录的位置 |
   | `tools` | agent 能对文献库做的事：命令行、MCP 和应用内助手共用的一张工具表 |
   | `mcp` | 这些工具的 MCP（JSON-RPC）应答 |
   | `update` | 最新发布的版本号，是否比当前版本新 |
+
+- **`crates/net`（`wisp_net`）**：HTTP 请求（阻塞的 ureq）：元数据查询、文献检索、流式对话、检查更新。
 
 - **`crates/cli`（`wisp_cli`）**：可执行文件 `wisp`。把命令行参数按工具的 schema 转成调用，`wisp mcp` 在标准输入输出上收发 MCP 消息。
 
@@ -138,14 +148,14 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
   | `shortcuts` | 快捷键的默认值、改键规则和显示 |
   | `input` | 文本输入框（单行 / 多行，支持输入法） |
   | `pdf` | PDF 预览：后台线程渲染，虚拟化列表显示 |
-  | `net` | 元数据查询、流式对话和检查更新的 HTTP 请求 |
+  | `searches` | 「检索与导入」页面：检索式、试检索结果、导入记录 |
   | `theme` / `ui` | 浅色 / 深色两套颜色与通用控件；窗口标题栏 |
 
 调试构建下，`WISP_PAPER_DEV=open:0,select:0,tab:pdf` 可以让窗口启动后直接进入某个状态（如 `settings:ai`、`theme:dark`，见 `app.rs` 末尾）。`WISP_PAPER_UPDATE_URL` 可把检查更新指向别的地址（测试用）。
 
 ## 第一版的范围
 
-BiblioCell 的数据集和网页版没有移植。工具目前都是只读的；检索来源、定时跟踪和 AI 辅助筛选正在逐步加入。提问的对话不保存，关闭文献库即清空。界面目前只有中文。
+BiblioCell 的数据集和网页版没有移植。建库向导、定时跟踪和 AI 辅助筛选正在逐步加入。提问的对话不保存，关闭文献库即清空。界面目前只有中文。
 
 ## 许可
 

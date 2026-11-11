@@ -6,6 +6,7 @@ use crate::model::*;
 use crate::time::now_iso;
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -95,6 +96,38 @@ CREATE TABLE IF NOT EXISTS trashed_papers (
     paper_id TEXT PRIMARY KEY NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
     deleted_at TEXT NOT NULL
 );
+
+-- 检索式: a query saved for one literature database, run by hand or on a schedule.
+CREATE TABLE IF NOT EXISTS searches (
+    id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    query TEXT NOT NULL CHECK (length(trim(query)) > 0),
+    max_results INTEGER NOT NULL DEFAULT 50,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    created_at TEXT NOT NULL
+);
+
+-- One run of a search, or any other import that can be undone as a whole.
+-- search_id is not a reference: the record outlives the search.
+CREATE TABLE IF NOT EXISTS import_batches (
+    id TEXT PRIMARY KEY NOT NULL,
+    search_id TEXT NOT NULL DEFAULT '',
+    label TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    remote_total INTEGER,
+    fetched INTEGER NOT NULL DEFAULT 0,
+    added INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    undone_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_batches_search ON import_batches(search_id, started_at);
+CREATE TABLE IF NOT EXISTS batch_papers (
+    batch_id TEXT NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    PRIMARY KEY (batch_id, paper_id)
+);
 "#;
 
 const PAPER_COLUMNS: &str = "id, title, abstract, authors_json, journal, year, publication_state, url, source, \
@@ -118,6 +151,68 @@ pub struct ImportResult {
 pub struct TrashEntry {
     pub paper: Paper,
     pub deleted_at: String,
+}
+
+/// 检索式: a query saved for one literature database (`sources::KINDS`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSearch {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub query: String,
+    /// How many of the newest records one run brings back.
+    pub max_results: usize,
+    /// Whether "run all" and the schedule include it.
+    pub enabled: bool,
+    pub created_at: String,
+    /// Its latest run, read with the search.
+    pub last_run: Option<ImportBatch>,
+}
+
+/// One run of a search: what was asked, what came back, what was added.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportBatch {
+    pub id: String,
+    pub search_id: String,
+    /// The database and query at the time, for the record.
+    pub label: String,
+    pub started_at: String,
+    /// How many records the database holds for the query, when it said.
+    pub remote_total: Option<u64>,
+    pub fetched: usize,
+    pub added: usize,
+    pub skipped: usize,
+    /// Why the run failed; empty when it did not.
+    pub error: String,
+    /// When the batch was undone; empty when it was not.
+    pub undone_at: String,
+}
+
+/// What undoing a batch did.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Undone {
+    pub removed: usize,
+    /// (id, title) of the papers left in place because someone has worked on them.
+    pub kept: Vec<(String, String)>,
+}
+
+const BATCH_COLUMNS: &str = "id, search_id, label, started_at, remote_total, fetched, added, skipped, error, undone_at";
+
+fn row_to_batch(r: &rusqlite::Row) -> rusqlite::Result<ImportBatch> {
+    Ok(ImportBatch {
+        id: r.get(0)?,
+        search_id: r.get(1)?,
+        label: r.get(2)?,
+        started_at: r.get(3)?,
+        remote_total: r.get::<_, Option<i64>>(4)?.map(|n| n as u64),
+        fetched: r.get::<_, i64>(5)? as usize,
+        added: r.get::<_, i64>(6)? as usize,
+        skipped: r.get::<_, i64>(7)? as usize,
+        error: r.get(8)?,
+        undone_at: r.get(9)?,
+    })
 }
 
 pub struct Store {
@@ -454,6 +549,109 @@ impl Store {
         }
     }
 
+    // ---- saved searches and import batches
+
+    pub fn list_searches(&self) -> Result<Vec<SavedSearch>> {
+        let mut stmt = self.db.prepare("SELECT id, kind, name, query, max_results, enabled, created_at FROM searches ORDER BY created_at, id")?;
+        let mut searches = stmt
+            .query_map([], |r| Ok(SavedSearch { id: r.get(0)?, kind: r.get(1)?, name: r.get(2)?, query: r.get(3)?, max_results: r.get::<_, i64>(4)? as usize, enabled: r.get::<_, i32>(5)? == 1, created_at: r.get(6)?, last_run: None }))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for search in &mut searches {
+            search.last_run = self.db.query_row(&format!("SELECT {BATCH_COLUMNS} FROM import_batches WHERE search_id = ?1 ORDER BY rowid DESC LIMIT 1"), [&search.id], row_to_batch).optional()?;
+        }
+        Ok(searches)
+    }
+
+    /// Create (empty id) or update a saved search.
+    pub fn save_search(&mut self, search: &mut SavedSearch) -> Result<()> {
+        search.query = search.query.trim().to_string();
+        search.name = search.name.trim().to_string();
+        let Some((_, kind_name)) = crate::sources::KINDS.iter().find(|(key, _)| *key == search.kind) else { bail!("不支持的来源：{}", search.kind) };
+        if search.query.is_empty() { bail!("请填写检索式。") }
+        if search.query.chars().count() > 4000 { bail!("检索式不能超过 4000 个字符。") }
+        if search.name.chars().count() > 60 { bail!("名称不能超过 60 个字符。") }
+        if !(1..=crate::sources::MAX_RESULTS).contains(&search.max_results) { bail!("每次取回的篇数应在 1 到 {} 之间。", crate::sources::MAX_RESULTS) }
+        if search.name.is_empty() { search.name = kind_name.to_string() }
+        if search.id.is_empty() {
+            search.id = new_id("S");
+            search.created_at = now_iso();
+            self.db.execute(
+                "INSERT INTO searches(id, kind, name, query, max_results, enabled, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![search.id, search.kind, search.name, search.query, search.max_results as i64, search.enabled as i32, search.created_at],
+            )?;
+        } else {
+            let changed = self.db.execute("UPDATE searches SET kind = ?2, name = ?3, query = ?4, max_results = ?5, enabled = ?6 WHERE id = ?1", params![search.id, search.kind, search.name, search.query, search.max_results as i64, search.enabled as i32])?;
+            if changed == 0 { bail!("检索式不存在：{}", search.id) }
+        }
+        Ok(())
+    }
+
+    /// Forget a saved search. The papers it brought in and the record of its runs stay.
+    pub fn remove_search(&mut self, id: &str) -> Result<()> {
+        if self.db.execute("DELETE FROM searches WHERE id = ?1", [id])? == 0 { bail!("检索式不存在：{id}") }
+        Ok(())
+    }
+
+    /// Import what a search brought back as one batch that can be undone.
+    pub fn import_batch(&mut self, search_id: &str, label: &str, remote_total: Option<u64>, papers: Vec<Paper>) -> Result<(ImportBatch, ImportResult)> {
+        let fetched = papers.len();
+        let result = self.import_papers(papers)?;
+        let batch = ImportBatch { id: new_id("B"), search_id: search_id.into(), label: label.into(), started_at: now_iso(), remote_total, fetched, added: result.added.len(), skipped: result.skipped.len(), ..Default::default() };
+        let tx = self.db.transaction()?;
+        write_batch(&tx, &batch)?;
+        for paper in &result.added {
+            tx.execute("INSERT INTO batch_papers(batch_id, paper_id) VALUES (?1, ?2)", params![batch.id, paper.id])?;
+        }
+        tx.commit()?;
+        Ok((batch, result))
+    }
+
+    /// Keep the record of a run that failed, so the search shows why.
+    pub fn record_failed_run(&mut self, search_id: &str, label: &str, error: &str) -> Result<ImportBatch> {
+        let batch = ImportBatch { id: new_id("B"), search_id: search_id.into(), label: label.into(), started_at: now_iso(), error: error.into(), ..Default::default() };
+        let tx = self.db.transaction()?;
+        write_batch(&tx, &batch)?;
+        tx.commit()?;
+        Ok(batch)
+    }
+
+    /// The latest runs, newest first.
+    pub fn list_batches(&self, limit: usize) -> Result<Vec<ImportBatch>> {
+        let mut stmt = self.db.prepare(&format!("SELECT {BATCH_COLUMNS} FROM import_batches ORDER BY rowid DESC LIMIT ?1"))?;
+        Ok(stmt.query_map([limit as i64], row_to_batch)?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Take back what a batch added. A paper someone has since worked on
+    /// (a screening decision, reading progress, a star, notes, tags, field
+    /// values, a file, or a place in the trash) stays and is reported; the
+    /// others are removed for good, so a later run can bring them in again.
+    pub fn undo_batch(&mut self, id: &str) -> Result<Undone> {
+        let undone_at: Option<String> = self.db.query_row("SELECT undone_at FROM import_batches WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+        match undone_at {
+            None => bail!("没有这个导入批次：{id}"),
+            Some(at) if !at.is_empty() => bail!("这个批次已经撤销过了。"),
+            _ => {}
+        }
+        let ids: Vec<String> = {
+            let mut stmt = self.db.prepare("SELECT paper_id FROM batch_papers WHERE batch_id = ?1")?;
+            stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut undone = Undone::default();
+        for paper_id in ids {
+            let paper = self.get_paper(&paper_id)?;
+            let trashed = self.db.query_row("SELECT 1 FROM trashed_papers WHERE paper_id = ?1", [&paper_id], |_| Ok(())).optional()?.is_some();
+            let touched = paper.screening != "pending" || paper.reading != "unread" || paper.starred || !paper.notes.trim().is_empty() || !paper.tags.is_empty() || !paper.fields.is_empty() || trashed || !self.paper_files(&paper_id)?.is_empty();
+            if touched {
+                undone.kept.push((paper.id, paper.title));
+            } else {
+                self.delete_paper(&paper_id)?;
+                undone.removed += 1;
+            }
+        }
+        self.db.execute("UPDATE import_batches SET undone_at = ?2 WHERE id = ?1", params![id, now_iso()])?;
+        Ok(undone)
+    }
+
     // ---- full text
 
     /// The cached page text of a file: `None` until it has been extracted,
@@ -568,6 +766,14 @@ fn write_paper(tx: &Transaction, p: &Paper) -> Result<()> {
     Ok(())
 }
 
+fn write_batch(tx: &Transaction, batch: &ImportBatch) -> Result<()> {
+    tx.execute(
+        &format!("INSERT INTO import_batches({BATCH_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
+        params![batch.id, batch.search_id, batch.label, batch.started_at, batch.remote_total.map(|n| n as i64), batch.fetched as i64, batch.added as i64, batch.skipped as i64, batch.error, batch.undone_at],
+    )?;
+    Ok(())
+}
+
 fn copy_hashed(source: &Path, target: &Path) -> Result<(u64, String)> {
     let mut input = std::fs::File::open(source)?;
     let mut output = std::fs::File::create(target)?;
@@ -662,6 +868,49 @@ mod tests {
         assert_eq!(store.list_fields().unwrap()[0].name, "方法");
         store.delete_field(&species.id).unwrap();
         assert_eq!(store.get_paper(&p.id).unwrap().fields.len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn searches_and_batches() {
+        let dir = temp_dir("batches");
+        let mut store = Store::in_memory(&dir).unwrap();
+        let mut search = SavedSearch { kind: "pubmed".into(), query: "  root[Title] ".into(), max_results: 50, enabled: true, ..Default::default() };
+        store.save_search(&mut search).unwrap();
+        assert_eq!((search.name.as_str(), search.query.as_str()), ("PubMed", "root[Title]"));
+        for bad in [SavedSearch { kind: "scholar".into(), query: "x".into(), max_results: 5, ..Default::default() }, SavedSearch { kind: "pubmed".into(), max_results: 5, ..Default::default() }, SavedSearch { kind: "pubmed".into(), query: "x".into(), max_results: 0, ..Default::default() }] {
+            assert!(store.save_search(&mut bad.clone()).is_err(), "{bad:?}");
+        }
+        search.name = "根".into();
+        search.enabled = false;
+        store.save_search(&mut search).unwrap();
+        assert!(store.list_searches().unwrap()[0].last_run.is_none());
+
+        let existing = store.add_paper(paper("Known", "10.1000/known")).unwrap();
+        let (batch, result) = store.import_batch(&search.id, "PubMed: root[Title]", Some(120), vec![paper("One", "10.1000/1"), paper("Two", "10.1000/2"), paper("Known again", "10.1000/known")]).unwrap();
+        assert_eq!((batch.remote_total, batch.fetched, batch.added, batch.skipped, result.added.len()), (Some(120), 3, 2, 1, 2));
+        store.record_failed_run(&search.id, "PubMed: root[Title]", "网络请求失败").unwrap();
+        let listed = store.list_searches().unwrap();
+        assert_eq!((listed.len(), listed[0].name.as_str(), listed[0].enabled, listed[0].last_run.as_ref().unwrap().error.as_str()), (1, "根", false, "网络请求失败"));
+        assert_eq!(store.list_batches(10).unwrap().len(), 2);
+        assert_eq!(store.list_batches(1).unwrap()[0].error, "网络请求失败");
+
+        // Undo removes what nobody touched and keeps what someone has decided on.
+        let mut two = result.added[1].clone();
+        two.decide("included", "");
+        store.save_paper(&mut two).unwrap();
+        let undone = store.undo_batch(&batch.id).unwrap();
+        assert_eq!((undone.removed, undone.kept.clone()), (1, vec![(two.id.clone(), "Two".to_string())]));
+        let left: Vec<String> = store.list_papers().unwrap().into_iter().map(|p| p.id).collect();
+        assert!(left.contains(&existing.id) && left.contains(&two.id) && left.len() == 2);
+        // Removed for good: the same record can come in again.
+        assert_eq!(store.import_papers(vec![paper("One", "10.1000/1")]).unwrap().added.len(), 1);
+        assert!(store.undo_batch(&batch.id).unwrap_err().to_string().contains("已经撤销"));
+        assert!(store.undo_batch("B-none").is_err());
+
+        store.remove_search(&search.id).unwrap();
+        assert!(store.list_searches().unwrap().is_empty() && store.list_batches(10).unwrap().len() == 2);
+        assert!(store.remove_search(&search.id).is_err());
         std::fs::remove_dir_all(dir).ok();
     }
 

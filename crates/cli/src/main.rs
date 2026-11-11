@@ -51,7 +51,7 @@ fn run(root: &Path, words: &[String]) -> Result<String, String> {
             let Some(tool) = catalog.iter().find(|t| t.name == name) else { return Err(format!("没有这个命令：{command}。运行 wisp help 查看可用的命令。")) };
             if words[1..].iter().any(|w| w == "--help" || w == "-h") { return Ok(tools::usage(tool)) }
             let args = tools::cli_args(&tool.input_schema, &words[1..])?;
-            tools::call(root, tool.name, &args).map(|value| pretty(&value))
+            tools::call(root, tool.name, &args, &wisp_net::get_text).map(|value| pretty(&value))
         }
     }
 }
@@ -63,12 +63,12 @@ fn pretty(value: &serde_json::Value) -> String {
 }
 
 /// MCP over a pair of streams: one JSON-RPC message per line, each way.
-fn serve(root: &Path, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+fn serve(root: &Path, server: &mcp::Server, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
     for line in input.lines() {
         let line = line?;
         if line.trim().is_empty() { continue }
         let reply = match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(message) => mcp::handle(root, &message),
+            Ok(message) => mcp::handle(root, &message, server),
             Err(err) => Some(mcp::parse_error(&err.to_string())),
         };
         if let Some(reply) = reply {
@@ -83,7 +83,9 @@ fn main() {
     let mut words: Vec<String> = std::env::args().skip(1).collect();
     let result = take_data_dir(&mut words).and_then(data_root).and_then(|root| {
         if words.first().map(String::as_str) == Some("mcp") {
-            serve(&root, std::io::stdin().lock(), std::io::stdout().lock()).map(|()| String::new()).map_err(|e| format!("MCP 连接中断：{e}"))
+            // `wisp mcp --read-only` leaves out the tools that change a library.
+            let server = mcp::Server { fetch: &wisp_net::get_text, read_only: words.iter().any(|w| w == "--read-only") };
+            serve(&root, &server, std::io::stdin().lock(), std::io::stdout().lock()).map(|()| String::new()).map_err(|e| format!("MCP 连接中断：{e}"))
         } else {
             run(&root, &words)
         }
@@ -160,7 +162,7 @@ mod tests {
         ]
         .join("\n");
         let mut output = vec![];
-        serve(&root, input.as_bytes(), &mut output).unwrap();
+        serve(&root, &mcp::Server { fetch: &wisp_net::get_text, read_only: false }, input.as_bytes(), &mut output).unwrap();
         let replies: Vec<Value> = String::from_utf8(output).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         // One line per reply; the notification and the blank line get none.
         assert_eq!(replies.len(), 3);
