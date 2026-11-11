@@ -53,6 +53,7 @@ impl Workspace {
                             .child(div().flex_1())
                             .child(ui::secondary_button(("try-search", i), "试检索").on_click(self.on(Cmd::TrySearch(search.id.clone()), cx)))
                             .child(ui::primary_button(("run-search", i), if running { "运行中…" } else { "运行并导入" }).when(running, |d| d.opacity(0.5)).on_click(self.on(Cmd::RunSearch(search.id.clone()), cx)))
+                            .child(ui::ghost_button(("toggle-search", i), None, Some(if search.enabled { "停用".into() } else { "启用".into() })).on_click(self.on(Cmd::ToggleSearch(search.id.clone()), cx)))
                             .child(ui::ghost_button(("edit-search", i), Some("pen-line"), None).on_click(self.on(Cmd::EditSearch(search.id.clone()), cx)))
                             .child(ui::ghost_button(("remove-search", i), Some("bin"), None).on_click(self.on(Cmd::AskRemoveSearch(search.id.clone()), cx))),
                     )
@@ -86,6 +87,35 @@ impl Workspace {
             .collect();
 
         let empty = cards.is_empty();
+        // How often the enabled searches run on their own.
+        let hours = lib.info.auto_sync_hours;
+        let auto = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .px(px(16.))
+            .pb(px(12.))
+            .child(div().pr(px(4.)).text_size(px(13.)).text_color(Theme::text_secondary()).child("自动更新"))
+            .children([(0, "关闭"), (6, "每 6 小时"), (24, "每天"), (168, "每周")].into_iter().map(|(value, name)| {
+                let on = hours == value;
+                div()
+                    .id(("auto-sync", value as usize))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(26.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if on { Theme::accent() } else { Theme::line() })
+                    .when(on, |d| d.bg(Theme::accent_soft()).text_color(Theme::accent()))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .child(name)
+                    .on_click(self.on(Cmd::SetAutoSync(value), cx))
+            }))
+            .child(div().pl(px(6.)).min_w_0().truncate().text_size(px(12.)).text_color(Theme::text_tertiary()).child(if hours == 0 { "只在点「运行并导入」时访问数据库。" } else { "应用开着时按这个间隔运行已启用的检索式；关着时错过的，下次打开时补上。" }));
         div()
             .flex()
             .flex_col()
@@ -112,6 +142,7 @@ impl Workspace {
                     .child(ui::secondary_button("open-guide", "让助手拟检索式").on_click(self.on(Cmd::OpenGuide(false), cx)))
                     .child(ui::primary_button("new-search", "新建检索式").on_click(self.on(Cmd::NewSearch, cx))),
             )
+            .when(!empty, |d| d.child(auto))
             .child(if empty {
                 ui::empty_state("search", "还没有检索式", "检索式是写给 PubMed、Europe PMC、Crossref 或 arXiv 的查询。保存后可以反复运行，把新发表的文献带进文献库。").into_any_element()
             } else {

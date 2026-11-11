@@ -30,7 +30,7 @@ pub struct ToolDef {
 
 /// A tool that works inside one library: it also takes `library`.
 /// The tools that change the library.
-const WRITING: [&str; 5] = ["save_search", "remove_search", "run_search", "undo_import", "suggest_screening"];
+const WRITING: [&str; 6] = ["save_search", "remove_search", "run_search", "undo_import", "suggest_screening", "sync_searches"];
 
 fn scoped(name: &'static str, title: &'static str, description: &'static str, mut properties: Value, required: &[&str]) -> ToolDef {
     properties["library"] = json!({"type": "string", "description": "文献库的 ID 或名称；只有一个文献库时可以省略。"});
@@ -50,6 +50,16 @@ pub fn catalog() -> Vec<ToolDef> {
             description: "列出所有文献库：ID、名称、主题和文献数量。其他工具用 library 参数指定其中一个。",
             input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
             writes: false,
+        },
+        ToolDef {
+            name: "sync_searches",
+            title: "更新检索式",
+            description: "运行到期的检索式并导入新文献。只处理开启了自动更新的文献库，其中已启用、且距上次运行超过设定间隔的检索式（上次失败的最多一小时后重试）。force 为 true 时不看间隔，运行所有已启用的检索式。不指定 library 时处理所有文献库。适合交给系统的计划任务定期执行。",
+            input_schema: json!({"type": "object", "properties": {
+                "library": {"type": "string", "description": "只更新这一个文献库（ID 或名称）；省略时更新所有文献库。"},
+                "force": {"type": "boolean", "description": "不看更新间隔和是否开启自动更新，运行所有已启用的检索式。"},
+            }, "additionalProperties": false}),
+            writes: true,
         },
         scoped("library_status", "文献库概况", "一个文献库的概况：主题、文献数量、收录判断和阅读状态的分布、自定义词条，以及各状态值在界面上的显示名称。", json!({}), &[]),
         scoped(
@@ -164,7 +174,8 @@ pub fn catalog() -> Vec<ToolDef> {
 /// The tools of the assistant inside an open library: no choosing a library.
 pub fn library_catalog() -> Vec<ToolDef> {
     let mut tools = catalog();
-    tools.retain(|t| t.name != "list_libraries");
+    // The tools that range over every library have no place inside one.
+    tools.retain(|t| t.name != "list_libraries" && t.name != "sync_searches");
     for tool in &mut tools {
         if let Some(properties) = tool.input_schema["properties"].as_object_mut() { properties.remove("library"); }
     }
@@ -238,8 +249,9 @@ pub fn describe_result(result: &Result<Value, String>) -> String {
 /// whoever called: a person at a terminal or a model.
 pub fn call(root: &Path, name: &str, args: &Value, fetch: Fetch) -> Result<Value, String> {
     checked(name, args)?;
+    if name == "sync_searches" { return sync_searches(root, args, fetch, crate::time::now_millis()).map_err(|e| format!("{e:#}")) }
     if name == "list_libraries" {
-        let all: Vec<Value> = libraries::list(root).iter().map(|l| json!({"id": l.id, "name": l.name, "topic": l.topic, "papers": l.paper_count})).collect();
+        let all: Vec<Value> = libraries::list(root).iter().map(|l| json!({"id": l.id, "name": l.name, "topic": l.topic, "papers": l.paper_count, "autoSyncHours": l.auto_sync_hours})).collect();
         return Ok(json!({"libraries": all}));
     }
     let info = find_library(root, args["library"].as_str().unwrap_or(""))?;
@@ -644,6 +656,56 @@ fn undo_import(store: &mut Store, args: &Value) -> Result<Value> {
     Ok(json!({"removed": undone.removed, "kept": undone.kept.iter().map(|(id, title)| json!({"id": id, "title": title})).collect::<Vec<_>>()}))
 }
 
+// ---- scheduled updates
+
+const HOUR_MS: i64 = 3_600_000;
+
+/// The searches whose turn it is: enabled, and never run or last run at
+/// least `hours` ago. One that failed is tried again after an hour at most.
+pub fn due_searches(searches: &[SavedSearch], hours: u32, now_ms: i64) -> Vec<&SavedSearch> {
+    if hours == 0 { return vec![] }
+    searches
+        .iter()
+        .filter(|search| search.enabled)
+        .filter(|search| match &search.last_run {
+            None => true,
+            Some(run) => {
+                let wait = if run.error.is_empty() { hours as i64 } else { (hours as i64).min(1) };
+                now_ms - crate::time::millis(&run.started_at) >= wait * HOUR_MS
+            }
+        })
+        .collect()
+}
+
+/// Run what is due in every library that updates on its own (or in the one
+/// named), or everything enabled when forced.
+fn sync_searches(root: &Path, args: &Value, fetch: Fetch, now_ms: i64) -> Result<Value> {
+    let force = truth(args, "force", false)?;
+    let wanted = text(args, "library")?;
+    let all = if wanted.is_empty() { libraries::list(root) } else { vec![find_library(root, wanted).map_err(|e| anyhow!(e))?] };
+    let mut runs = vec![];
+    let (mut added, mut failed) = (0, 0);
+    for info in all.iter().filter(|info| force || info.auto_sync_hours > 0) {
+        let mut store = Store::open(&info.dir)?;
+        let searches = store.list_searches()?;
+        let due: Vec<String> = if force { searches.iter().filter(|s| s.enabled).map(|s| s.id.clone()).collect() } else { due_searches(&searches, info.auto_sync_hours, now_ms).iter().map(|s| s.id.clone()).collect() };
+        for id in due {
+            // One search failing does not stop the others.
+            match run_search(&mut store, &id, fetch) {
+                Ok(run) => {
+                    added += run["added"].as_u64().unwrap_or(0);
+                    runs.push(json!({"library": info.name, "libraryId": info.id, "search": run["search"], "added": run["added"], "skipped": run["skipped"], "batchId": run["batchId"]}));
+                }
+                Err(error) => {
+                    failed += 1;
+                    runs.push(json!({"library": info.name, "libraryId": info.id, "searchId": id, "error": format!("{error:#}")}));
+                }
+            }
+        }
+    }
+    Ok(json!({"runs": runs, "added": added, "failed": failed}))
+}
+
 // ---- screening
 
 /// Record what an agent thinks the screening decision should be. The
@@ -924,7 +986,59 @@ pub(crate) mod tests {
         assert_eq!((undone["removed"].as_u64(), undone["kept"].as_array().map(Vec::len)), (Some(1), Some(0)));
         assert_eq!(call(&root, "list_papers", &json!({})).unwrap()["total"], 1);
         assert_eq!(call(&root, "remove_search", &json!({"id": search})).unwrap()["removed"], true);
-        assert!(catalog().iter().filter(|t| t.writes).map(|t| t.name).eq(WRITING));
+        // Exactly the tools on the list are marked as writing.
+        let (mut marked, mut listed): (Vec<&str>, Vec<&str>) = (catalog().iter().filter(|t| t.writes).map(|t| t.name).collect(), WRITING.to_vec());
+        marked.sort();
+        listed.sort();
+        assert_eq!(marked, listed);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn updates_run_what_is_due() {
+        use crate::store::ImportBatch;
+        let hour = HOUR_MS;
+        let now = crate::time::millis("2026-11-11T12:00:00.000Z");
+        let search = |name: &str, enabled: bool, ran: Option<(&str, &str)>| SavedSearch {
+            name: name.into(),
+            enabled,
+            last_run: ran.map(|(at, error)| ImportBatch { started_at: at.into(), error: error.into(), ..Default::default() }),
+            ..Default::default()
+        };
+        let searches = [
+            search("never", true, None),
+            search("off", false, None),
+            search("fresh", true, Some(("2026-11-11T06:00:00.000Z", ""))),
+            search("old", true, Some(("2026-11-10T11:00:00.000Z", ""))),
+            search("failed lately", true, Some(("2026-11-11T11:30:00.000Z", "x"))),
+            search("failed a while ago", true, Some(("2026-11-11T10:30:00.000Z", "x"))),
+        ];
+        let names = |hours: u32| due_searches(&searches, hours, now).iter().map(|s| s.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names(24), ["never", "old", "failed a while ago"]);
+        assert_eq!(names(6), ["never", "fresh", "old", "failed a while ago"]);
+        assert!(names(0).is_empty());
+        assert_eq!(now - crate::time::millis("2026-11-11T06:00:00.000Z"), 6 * hour);
+
+        // In a data folder: only libraries that update on their own, unless forced.
+        let (root, _) = sample();
+        let online = |args: Value| super::call(&root, "sync_searches", &args, &pubmed);
+        super::call(&root, "save_search", &json!({"source": "pubmed", "query": "root[Title]"}), &pubmed).unwrap();
+        assert_eq!(online(json!({})).unwrap(), json!({"runs": [], "added": 0, "failed": 0}));
+        let mut info = find_library(&root, "").unwrap();
+        info.auto_sync_hours = 24;
+        libraries::save(&info).unwrap();
+        let first = online(json!({})).unwrap();
+        assert_eq!((first["added"].as_u64(), first["runs"][0]["library"].as_str(), first["runs"][0]["added"].as_u64()), (Some(1), Some("根"), Some(1)));
+        // Just run: not due again. Forced: runs, and finds nothing new.
+        assert_eq!(online(json!({})).unwrap()["runs"], json!([]));
+        let forced = online(json!({"library": "根", "force": true})).unwrap();
+        assert_eq!((forced["added"].as_u64(), forced["runs"][0]["skipped"].as_u64()), (Some(0), Some(2)));
+        // A failure is reported beside the rest, not instead of it.
+        let failed = call(&root, "sync_searches", &json!({"force": true})).unwrap();
+        assert_eq!(failed["failed"], 1);
+        assert!(failed["runs"][0]["error"].as_str().unwrap().contains("不应联网"));
+        assert_eq!(call(&root, "list_libraries", &json!({})).unwrap()["libraries"][0]["autoSyncHours"], 24);
+        assert!(library_catalog().iter().all(|t| t.name != "sync_searches"));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -964,7 +1078,7 @@ pub(crate) mod tests {
         // Inside a library there is no library to choose.
         let inside = library_catalog();
         assert!(inside.iter().all(|t| t.name != "list_libraries" && t.input_schema["properties"].get("library").is_none()));
-        assert_eq!(inside.len(), catalog().len() - 1);
+        assert_eq!(inside.len(), catalog().len() - 2);
     }
 
     #[test]
