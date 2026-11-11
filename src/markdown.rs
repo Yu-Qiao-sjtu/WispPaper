@@ -117,12 +117,15 @@ pub fn text_between(text: &str, from: Place, to: Place) -> String {
     out.join("\n")
 }
 
-/// The part of the piece now being drawn that is selected.
-fn selected_in(draw: &Draw, len: usize) -> Option<std::ops::Range<usize>> {
+/// The part of the piece now being drawn that is selected. The ends are
+/// moved back to the start of a character: an answer still being written
+/// may have changed under a selection made a moment ago.
+fn selected_in(draw: &Draw, piece: &str) -> Option<std::ops::Range<usize>> {
     let (from, to) = draw.selected?;
     let at = draw.layouts.len();
     if at < from.0 || at > to.0 { return None }
-    let (start, end) = (if at == from.0 { from.1.min(len) } else { 0 }, if at == to.0 { to.1.min(len) } else { len });
+    let whole = |byte: usize| (0..=byte.min(piece.len())).rev().find(|byte| piece.is_char_boundary(*byte)).unwrap_or(0);
+    let (start, end) = (if at == from.0 { whole(from.1) } else { 0 }, if at == to.0 { whole(to.1) } else { piece.len() });
     (start < end).then_some(start..end)
 }
 
@@ -190,7 +193,7 @@ fn block(block: &Block, links: &mut Draw) -> AnyElement {
                 .into_any_element()
         }
         Block::Code { text, .. } => {
-            let code = StyledText::new(text.clone()).with_highlights(with_selection(vec![], selected_in(links, text.len())));
+            let code = StyledText::new(text.clone()).with_highlights(with_selection(vec![], selected_in(links, text)));
             links.layouts.push(code.layout().clone());
             div().px(px(12.)).py(px(10.)).rounded(px(6.)).border_1().border_color(Theme::line()).bg(Theme::bg_sunken()).font_family(theme::MONO_FONT).text_size(px(12.5)).line_height(px(19.)).child(code).into_any_element()
         }
@@ -257,7 +260,7 @@ fn rich(rich: &Rich, draw: &mut Draw) -> AnyElement {
         }
     }
     highlights.sort_by_key(|(range, _)| range.start);
-    let text = StyledText::new(rich.text.clone()).with_highlights(with_selection(highlights, selected_in(draw, rich.text.len())));
+    let text = StyledText::new(rich.text.clone()).with_highlights(with_selection(highlights, selected_in(draw, &rich.text)));
     draw.layouts.push(text.layout().clone());
     if targets.is_empty() { return text.into_any_element() }
     draw.links += 1;
