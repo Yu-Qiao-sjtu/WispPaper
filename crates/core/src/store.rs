@@ -156,6 +156,28 @@ CREATE TABLE IF NOT EXISTS translations (
     author TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+
+-- 历史对话: what was asked of the library (paper_id empty) or of one paper,
+-- and what was answered. body is an `ai::Transcript` as JSON. paper_id is
+-- not a reference: `delete_paper` removes a paper's conversations itself.
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY NOT NULL,
+    paper_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    questions INTEGER NOT NULL DEFAULT 0,
+    body TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_paper ON conversations(paper_id, updated_at);
+-- The pictures that went with a conversation's questions, as they were sent.
+CREATE TABLE IF NOT EXISTS conversation_images (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (conversation_id, id)
+);
 "#;
 
 const PAPER_COLUMNS: &str = "id, title, abstract, authors_json, journal, year, publication_state, url, source, \
@@ -216,6 +238,27 @@ pub struct ImportBatch {
     pub error: String,
     /// When the batch was undone; empty when it was not.
     pub undone_at: String,
+}
+
+/// A conversation with the library or with one paper, as it is kept.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Conversation {
+    /// Empty until it is first saved.
+    pub id: String,
+    /// The paper it is about; empty for a conversation with the library.
+    pub paper_id: String,
+    pub transcript: crate::ai::Transcript,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A conversation as the history lists it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConversationInfo {
+    pub id: String,
+    pub title: String,
+    pub questions: usize,
+    pub updated_at: String,
 }
 
 /// What an assistant thinks the screening decision for a paper should be.
@@ -457,6 +500,7 @@ impl Store {
     pub fn delete_paper(&mut self, id: &str) -> Result<()> {
         let files = self.paper_files(id)?;
         self.db.execute("DELETE FROM papers WHERE id = ?1", [id])?;
+        self.db.execute("DELETE FROM conversations WHERE paper_id = ?1", [id])?;
         for file in files {
             self.set_aside(&file.local_path);
         }
@@ -747,6 +791,57 @@ impl Store {
         if text.is_empty() { bail!("译文是空的。") }
         self.db.execute("INSERT INTO translations(cache_key, translated_text, author, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(cache_key) DO NOTHING", params![key, text, author, now_iso()])?;
         Ok(())
+    }
+
+    // ---- conversations
+
+    /// Keep a conversation: a new one gets its id here, a known one is
+    /// replaced. `paper_id` is empty for a conversation with the library.
+    pub fn save_conversation(&mut self, conversation: &mut Conversation) -> Result<()> {
+        if conversation.id.is_empty() { conversation.id = new_id("C") }
+        if conversation.created_at.is_empty() { conversation.created_at = now_iso() }
+        conversation.updated_at = now_iso();
+        let body = serde_json::to_string(&conversation.transcript)?;
+        self.db.execute(
+            "INSERT INTO conversations(id, paper_id, title, questions, body, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(id) DO UPDATE SET title = excluded.title, questions = excluded.questions, body = excluded.body, updated_at = excluded.updated_at",
+            params![conversation.id, conversation.paper_id, conversation.transcript.title(), conversation.transcript.questions() as i64, body, conversation.created_at, conversation.updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// The conversations with the library (`paper_id` empty) or with one
+    /// paper, the latest first, without what was said in them.
+    pub fn list_conversations(&self, paper_id: &str) -> Result<Vec<ConversationInfo>> {
+        let mut stmt = self.db.prepare("SELECT id, title, questions, updated_at FROM conversations WHERE paper_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT 200")?;
+        Ok(stmt.query_map([paper_id], |r| Ok(ConversationInfo { id: r.get(0)?, title: r.get(1)?, questions: r.get::<_, i64>(2)? as usize, updated_at: r.get(3)? }))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn conversation(&self, id: &str) -> Result<Option<Conversation>> {
+        Ok(self
+            .db
+            .query_row("SELECT id, paper_id, body, created_at, updated_at FROM conversations WHERE id = ?1", [id], |r| {
+                // A body this build cannot read shows as an empty conversation, not as an error.
+                Ok(Conversation { id: r.get(0)?, paper_id: r.get(1)?, transcript: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(), created_at: r.get(3)?, updated_at: r.get(4)? })
+            })
+            .optional()?)
+    }
+
+    /// Forget a conversation and its pictures.
+    pub fn remove_conversation(&mut self, id: &str) -> Result<()> {
+        self.db.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Keep a picture of a conversation under an id of the caller's choosing; one already kept stays.
+    pub fn save_conversation_image(&mut self, conversation_id: &str, id: &str, media_type: &str, data: &[u8]) -> Result<()> {
+        self.db.execute("INSERT INTO conversation_images(conversation_id, id, media_type, data) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING", params![conversation_id, id, media_type, data])?;
+        Ok(())
+    }
+
+    /// A picture of a conversation: its media type and bytes.
+    pub fn conversation_image(&self, conversation_id: &str, id: &str) -> Result<Option<(String, Vec<u8>)>> {
+        Ok(self.db.query_row("SELECT media_type, data FROM conversation_images WHERE conversation_id = ?1 AND id = ?2", [conversation_id, id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
     }
 
     /// The pages of a paper's stored full text, when its text has been extracted.
@@ -1048,6 +1143,41 @@ mod tests {
         store.delete_paper(&p.id).unwrap();
         assert!(store.list_suggestions().unwrap().is_empty());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn conversations_are_kept() {
+        use crate::ai::{Said, Source, Transcript};
+        let dir = temp_dir("conversations");
+        let mut store = Store::in_memory(&dir).unwrap();
+        let paper = store.add_paper(Paper { title: "Alpha".into(), ..Default::default() }).unwrap();
+        let transcript = Transcript { items: vec![Said::User { text: "WOX5 做什么？".into(), images: vec!["I-1".into()] }, Said::Answer { text: "见 [P1]。".into() }], sources: vec![Source { label: "P1".into(), paper_id: paper.id.clone(), title: "Alpha".into() }] };
+        let mut with_library = Conversation { transcript: transcript.clone(), ..Default::default() };
+        store.save_conversation(&mut with_library).unwrap();
+        let mut with_paper = Conversation { paper_id: paper.id.clone(), transcript: Transcript { items: vec![Said::User { text: "总结一下".into(), images: vec![] }], sources: vec![] }, ..Default::default() };
+        store.save_conversation(&mut with_paper).unwrap();
+        assert!(with_library.id.starts_with("C-") && with_library.id != with_paper.id);
+        // Each side lists its own, with a title and the number of questions.
+        let listed = store.list_conversations("").unwrap();
+        assert_eq!(listed.iter().map(|c| (c.id.as_str(), c.title.as_str(), c.questions)).collect::<Vec<_>>(), [(with_library.id.as_str(), "WOX5 做什么？", 1)]);
+        assert_eq!(store.list_conversations(&paper.id).unwrap()[0].title, "总结一下");
+        assert_eq!(store.conversation(&with_library.id).unwrap().unwrap().transcript, transcript);
+        // Saved again it is the same conversation, with what was added.
+        let created = with_library.created_at.clone();
+        with_library.transcript.items.push(Said::User { text: "再说说 SCR".into(), images: vec![] });
+        store.save_conversation(&mut with_library).unwrap();
+        let again = store.conversation(&with_library.id).unwrap().unwrap();
+        assert_eq!((store.list_conversations("").unwrap().len(), again.transcript.questions(), again.created_at), (1, 2, created));
+        // A picture is kept once and goes with its conversation.
+        store.save_conversation_image(&with_library.id, "I-1", "image/png", &[1, 2, 3]).unwrap();
+        store.save_conversation_image(&with_library.id, "I-1", "image/png", &[9]).unwrap();
+        assert_eq!(store.conversation_image(&with_library.id, "I-1").unwrap(), Some(("image/png".to_string(), vec![1, 2, 3])));
+        store.remove_conversation(&with_library.id).unwrap();
+        assert!(store.conversation(&with_library.id).unwrap().is_none() && store.conversation_image(&with_library.id, "I-1").unwrap().is_none());
+        // A paper deleted for good takes its conversations with it.
+        store.trash_paper(&paper.id).unwrap();
+        store.delete_paper(&paper.id).unwrap();
+        assert!(store.list_conversations(&paper.id).unwrap().is_empty());
     }
 
     #[test]

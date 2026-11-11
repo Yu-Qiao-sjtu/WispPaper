@@ -10,7 +10,9 @@
 //! decides by one word; asked to translate, it hands the text back marked
 //! as translated. In a chat, asked a question, it calls `list_papers` and
 //! `library_status`; given their results, it answers and cites the first
-//! paper the search returned.
+//! paper the search returned, saying how many pictures came with the
+//! conversation. A question containing 「试试撤销」 makes it call
+//! `undo_import` instead, a tool the window asks the person about first.
 //!
 //! Requests are answered side by side, each after the given number of
 //! milliseconds (none by default), so a run of several screening requests
@@ -104,10 +106,19 @@ fn answer(mut stream: TcpStream, delay: u64) {
         } else if answered {
             let label = first_label(&request);
             events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
-            for piece in ["（假模型）我查了文献库的概况和匹配的文献。", &format!("最相关的一篇是 [{label}]。"), "这段话只用来演示工具调用的显示和引用的跳转。"] {
+            let pictures = request.matches("\"type\":\"image\"").count();
+            let seen = if pictures > 0 { format!("收到 {pictures} 张图片。") } else { String::new() };
+            for piece in ["（假模型）我查了文献库的概况和匹配的文献。", &seen, &format!("最相关的一篇是 [{label}]。"), "这段话只用来演示工具调用的显示和引用的跳转。"] {
                 events.push_str(&event(&format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{piece}"}}}}"#)));
             }
             events.push_str(&event(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#));
+        } else if request.rfind("试试撤销").is_some_and(|at| request.rfind("\"role\":\"user\"").is_some_and(|user| user < at)) {
+            // A tool that takes papers out of the library: the window asks the person before it runs.
+            events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
+            events.push_str(&event(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我来撤销那次导入。"}}"#));
+            events.push_str(&event(r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_3","name":"undo_import","input":{}}}"#));
+            events.push_str(&event(r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"id\": \"B-demo\"}"}}"#));
+            events.push_str(&event(r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#));
         } else {
             events.push_str(&event(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#));
             events.push_str(&event(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我先看看文献库里有什么。"}}"#));

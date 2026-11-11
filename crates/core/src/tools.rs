@@ -26,15 +26,22 @@ pub struct ToolDef {
     pub input_schema: Value,
     /// Whether it changes the library; the others only read.
     pub writes: bool,
+    /// Whether the assistant in the window asks the person before it runs:
+    /// the tools that bring papers in, take them out, or drop a saved search.
+    pub confirm: bool,
 }
 
 /// A tool that works inside one library: it also takes `library`.
 /// The tools that change the library.
 const WRITING: [&str; 6] = ["save_search", "remove_search", "run_search", "undo_import", "suggest_screening", "sync_searches"];
+/// Of those, the ones the window's assistant runs only with the person's
+/// consent. Saving a search or suggesting a screening decision changes
+/// nothing a person has not yet to act on, so they run as asked.
+const CONFIRMING: [&str; 3] = ["run_search", "undo_import", "remove_search"];
 
 fn scoped(name: &'static str, title: &'static str, description: &'static str, mut properties: Value, required: &[&str]) -> ToolDef {
     properties["library"] = json!({"type": "string", "description": "文献库的 ID 或名称；只有一个文献库时可以省略。"});
-    ToolDef { name, title, description, input_schema: json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false}), writes: WRITING.contains(&name) }
+    ToolDef { name, title, description, input_schema: json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false}), writes: WRITING.contains(&name), confirm: CONFIRMING.contains(&name) }
 }
 
 /// The stored values of a status table, for a schema's `enum`.
@@ -50,6 +57,7 @@ pub fn catalog() -> Vec<ToolDef> {
             description: "列出所有文献库：ID、名称、主题和文献数量。其他工具用 library 参数指定其中一个。",
             input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
             writes: false,
+            confirm: false,
         },
         ToolDef {
             name: "sync_searches",
@@ -60,6 +68,7 @@ pub fn catalog() -> Vec<ToolDef> {
                 "force": {"type": "boolean", "description": "不看更新间隔和是否开启自动更新，运行所有已启用的检索式。"},
             }, "additionalProperties": false}),
             writes: true,
+            confirm: false,
         },
         scoped("library_status", "文献库概况", "一个文献库的概况：主题、文献数量、收录判断和阅读状态的分布、自定义词条，以及各状态值在界面上的显示名称。", json!({}), &[]),
         scoped(
@@ -1130,7 +1139,10 @@ pub(crate) mod tests {
             assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
             // An empty call may be refused for what it lacks, but never because the name leads nowhere.
             if let Err(error) = call(&root, tool.name, &json!({})) { assert!(!error.contains("没有这个工具"), "{}: {error}", tool.name) }
+            // Only a tool that changes the library has anything to ask the person about.
+            assert!(tool.writes || !tool.confirm, "{}", tool.name);
         }
+        assert_eq!(library_catalog().iter().filter(|tool| tool.confirm).map(|tool| tool.name).collect::<Vec<_>>().len(), 3);
         std::fs::remove_dir_all(root).ok();
     }
 }
