@@ -416,11 +416,14 @@ impl Workspace {
     pub fn pick_protocol(&mut self, protocol: Protocol, cx: &mut Context<Self>) {
         let Some(view) = self.settings_view.as_mut() else { return };
         if view.protocol == protocol { return }
+        let same_service = view.protocol != Protocol::Anthropic && protocol != Protocol::Anthropic;
         view.protocol = protocol;
+        // Chat completions and Responses are two interfaces of one service: its address and model stay.
+        if same_service { return self.save_profile(cx) }
         // The other protocol's address and model would only fail: offer this one's defaults.
         let (url, model) = match protocol {
             Protocol::Anthropic => (ai::ANTHROPIC_BASE, ai::DEFAULT_MODEL),
-            Protocol::OpenAI => ("https://api.openai.com/v1", ""),
+            Protocol::OpenAI | Protocol::Responses => ("https://api.openai.com/v1", ""),
         };
         view.base_url.update(cx, |input, cx| input.set_text(url, cx));
         view.model.update(cx, |input, cx| input.set_text(model, cx));
@@ -613,6 +616,7 @@ impl Workspace {
         let profile = self.settings.profile_or_default();
         let (variable, privacy) = match view.protocol {
             Protocol::Anthropic => ("ANTHROPIC_API_KEY", "提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
+            Protocol::Responses => ("OPENAI_API_KEY", "OpenAI 的 Responses 接口（/responses），地址写到 /v1。对话不会保存在服务端：每次请求带上完整的对话，模型的推理内容以加密形式随之传回。提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
             Protocol::OpenAI => ("OPENAI_API_KEY", "适用于任何兼容 chat/completions 的服务，地址写到 /v1。提问时，问题和相关文献的记录、笔记、全文页面会发送给这个服务。API Key 以明文保存在本机的 settings.json 里。"),
         };
         let (state, colors) = if profile.key().is_empty() {
@@ -634,7 +638,7 @@ impl Workspace {
                 group(
                     Some("模型服务"),
                     vec![
-                        row("接口", None, segmented("protocol", vec![("Claude API", Cmd::PickProtocol(Protocol::Anthropic)), ("OpenAI 兼容", Cmd::PickProtocol(Protocol::OpenAI))], usize::from(view.protocol == Protocol::OpenAI), self, cx)).into_any_element(),
+                        row("接口", None, segmented("protocol", vec![("Claude API", Cmd::PickProtocol(Protocol::Anthropic)), ("OpenAI 兼容", Cmd::PickProtocol(Protocol::OpenAI)), ("OpenAI Responses", Cmd::PickProtocol(Protocol::Responses))], match view.protocol { Protocol::Anthropic => 0, Protocol::OpenAI => 1, Protocol::Responses => 2 }, self, cx)).into_any_element(),
                         row("服务地址", None, base_url).into_any_element(),
                         row("模型", None, model).into_any_element(),
                         row("API Key", Some(format!("留空则读取环境变量 {variable}。").into()), api_key).into_any_element(),
