@@ -6,6 +6,8 @@ use gpui::{BoxShadow, Hsla, hsla, point, px, rgb};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const UI_FONT: &str = if cfg!(target_os = "linux") { "Noto Sans" } else { ".SystemUIFont" };
+/// For code in an answer.
+pub const MONO_FONT: &str = if cfg!(target_os = "macos") { "Menlo" } else if cfg!(target_os = "windows") { "Consolas" } else { "DejaVu Sans Mono" };
 
 pub fn c(hex: u32) -> Hsla {
     rgb(hex).into()
