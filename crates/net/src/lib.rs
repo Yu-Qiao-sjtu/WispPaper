@@ -78,6 +78,20 @@ pub fn get_text(url: &str) -> Result<String, String> {
     Err(format!("{host} 限制了请求频率，请稍后再试。"))
 }
 
+/// The most a fetched file may be: a paper with its figures is a few megabytes, a book a few dozen.
+const MAX_DOWNLOAD: u64 = 120 << 20;
+
+/// GET a file as bytes: what `find_pdf` asks the open-access addresses
+/// for. Whether it is the PDF hoped for is the caller's to check; a page
+/// that asks to log in comes back with 200 as well.
+pub fn download(url: &str) -> Result<Vec<u8>, String> {
+    let host = url.split('/').nth(2).unwrap_or(url);
+    let mut response = agent(Some(Duration::from_secs(180)), "")?.get(url).header("Accept", "application/pdf,*/*;q=0.8").call().map_err(network_error)?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) { return Err(format!("{host} 返回 HTTP {status}。")) }
+    response.body_mut().with_config().limit(MAX_DOWNLOAD).read_to_vec().map_err(|e| format!("无法读取 {host} 的返回内容：{e}"))
+}
+
 /// NCBI allows three requests a second without a key, counted across
 /// everything this process sends: searches running side by side take turns,
 /// one every 400 ms. Other hosts are not held back.

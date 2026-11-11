@@ -10,6 +10,9 @@ use wisp_core::model::*;
 use wisp_core::store::translation_key;
 use wisp_core::{ai, time};
 
+/// The narrowest detail panel that shows a PDF and the paper's conversation side by side.
+pub const SPLIT_MIN: f32 = 760.;
+
 impl Workspace {
     pub fn render_detail(&mut self, width: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let lib = self.lib.as_ref().unwrap();
@@ -59,7 +62,15 @@ impl Workspace {
                     .child(tab_button("tab-pdf", if has_pdf { "PDF" } else { "PDF（无）" }, Tab::Pdf, self, cx))
                     .child(tab_button("tab-ask", "提问", Tab::Ask, self, cx)),
             );
+        // A citation followed from the paper's conversation: its PDF to the left, the conversation staying where it is.
+        let split = lib.split && tab == Tab::Ask && has_pdf && width >= SPLIT_MIN;
         let body = match tab {
+            Tab::Ask if split => {
+                let chat_width = (width * 0.42).clamp(340., 480.);
+                let pdf = self.render_pdf_tab(width - chat_width, cx);
+                let chat = self.render_chat(true, window, cx);
+                div().flex().size_full().child(div().flex_1().min_w_0().h_full().border_r_1().border_color(Theme::line()).child(pdf)).child(div().flex_none().w(px(chat_width)).h_full().child(chat)).into_any_element()
+            }
             Tab::Info => self.render_info(window, cx),
             Tab::Pdf => self.render_pdf_tab(width, cx),
             Tab::Ask => self.render_chat(true, window, cx),
@@ -195,12 +206,22 @@ impl Workspace {
                 let note = match &text {
                     _ if reading => "正在提取文字…".to_string(),
                     _ if by_eye => "模型正在读页面…".to_string(),
-                    Some(Ok(pages)) => match lib.writing.structures.get(&file.id).map(|info| info.text_by.as_str()).filter(|by| !by.is_empty()) {
-                        Some(by) => format!("{} 页文字可用于提问（由 {by} 读出）", pages.len()),
-                        None => format!("{} 页文字可用于提问", pages.len()),
-                    },
+                    Some(Ok(pages)) => {
+                        // How much of the file gave text: a page without any is a figure, or a page that could not be read.
+                        let with_text = pages.iter().filter(|page| !page.trim().is_empty()).count();
+                        let count = if with_text == pages.len() { format!("{} 页文字可用于提问", pages.len()) } else { format!("{} 页中 {with_text} 页有文字，可用于提问", pages.len()) };
+                        match lib.writing.structures.get(&file.id).map(|info| info.text_by.as_str()).filter(|by| !by.is_empty()) {
+                            Some(by) => format!("{count}（由 {by} 读出）"),
+                            None => count,
+                        }
+                    }
                     Some(Err(error)) => format!("没读出文字：{}", wisp_core::fulltext::failure_brief(error)),
                     None => String::new(),
+                };
+                // A fetched file says where it is from.
+                let note = match lib.origins.get(&file.id) {
+                    Some((_, source, version)) => format!("{note} · 来自 {}", [source.as_str(), wisp_core::openaccess::version_label(version)].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" ")),
+                    None => note,
                 };
                 let small = |id: (&'static str, usize), text: &'static str| ui::secondary_button(id, text).h(px(24.)).px(px(8.)).text_size(px(12.));
                 div()
@@ -313,10 +334,17 @@ impl Workspace {
         let lib = self.lib.as_ref().unwrap();
         let Some(p) = lib.selected_paper() else { return div().into_any_element() };
         let Some(file) = lib.pdf_file(&p.id) else {
-            return ui::empty_state("file-text", "这篇文献还没有 PDF", "添加后可以在这里预览，全文也会用于提问。").child(ui::primary_button("pdf-attach", "添加 PDF").on_click(self.on(Cmd::AttachPdf(p.id.clone()), cx))).size_full().into_any_element();
+            let looking = lib.fetching.as_ref().is_some_and(|run| run.running() && (run.working.contains(&p.id)));
+            let last = lib.fetching.as_ref().and_then(|run| run.rows.iter().rev().find(|row| row.paper_id == p.id)).map(|row| row.detail.clone()).filter(|detail| !detail.is_empty());
+            return ui::empty_state("file-text", "这篇文献还没有 PDF", "添加后可以在这里预览，全文也会用于提问。也可以替你找开放获取的版本：只取能免费合法获取的，查找时会把 DOI 或 PMID 发给 OpenAlex、Europe PMC 和出版商。")
+                .child(div().flex().gap(px(8.)).child(ui::primary_button("pdf-attach", "添加 PDF").on_click(self.on(Cmd::AttachPdf(p.id.clone()), cx))).child(if looking { ui::secondary_button("pdf-find", "正在查找…") } else { ui::secondary_button("pdf-find", "查找开放全文").on_click(self.on(Cmd::FindPdfs(Some(p.id.clone())), cx)) }))
+                .when_some(last, |d, detail| d.child(div().max_w(px(420.)).text_size(px(12.)).line_height(px(18.)).text_color(Theme::text_tertiary()).child(detail)))
+                .size_full()
+                .into_any_element();
         };
         let Some(pdf) = lib.pdf.clone() else { return div().into_any_element() };
         let (file_id, file_title) = (file.id.clone(), file.title.clone());
+        let beside = lib.split && lib.tab == Tab::Ask;
         pdf.update(cx, |pdf, _| pdf.set_width(width));
         let (page, count, percent, zoom) = {
             let view = pdf.read(cx);
@@ -360,7 +388,9 @@ impl Workspace {
                                 .child(tool("pdf-zoom-in", "plus").on_click(self.on(Cmd::PdfZoom(ZoomTo::In), cx))),
                         )
                     })
-                    .child(ui::ghost_button("pdf-open", Some("link"), (width >= 620.).then(|| "用系统应用打开".into())).h(px(24.)).on_click(self.on(Cmd::OpenFile(file_id), cx))),
+                    .child(ui::ghost_button("pdf-open", Some("link"), (width >= 620.).then(|| "用系统应用打开".into())).h(px(24.)).on_click(self.on(Cmd::OpenFile(file_id), cx)))
+                    // Beside the conversation: put the PDF away again.
+                    .when(beside, |d| d.child(tool("pdf-beside-close", "x").on_click(self.on(Cmd::SetTab(Tab::Ask), cx)))),
             )
             .child(div().flex_1().min_h_0().child(pdf))
             .into_any_element()

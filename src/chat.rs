@@ -49,6 +49,7 @@ fn tools_summary(calls: &[&str]) -> String {
 
 impl Workspace {
     pub fn render_chat(&mut self, about_paper: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(lib) = self.lib.as_mut() { lib.check_quotes(about_paper) }
         let lib = self.lib.as_ref().unwrap();
         let chat = lib.chat(about_paper);
         let profile = self.settings.profile_for_or_default(wisp_core::settings::Task::Chat);
@@ -102,6 +103,9 @@ impl Workspace {
         };
 
         let listing = chat.history.is_some();
+        // The papers behind the scope line can be looked through: in a conversation whose material was built, or before the first question.
+        let listable = !about_paper && !listing && (chat.ctx.is_some() || chat.messages.is_empty());
+        let materials = (listable && chat.materials_open).then(|| self.render_materials(chat, cx));
         div()
             .flex()
             .flex_col()
@@ -131,9 +135,11 @@ impl Workspace {
                                 (false, _) => scope,
                             })),
                     )
+                    .when(listable, |d| d.child(ui::ghost_button("chat-materials", Some(if chat.materials_open { "chevron-up" } else { "list" }), Some(if chat.materials_open { "收起".into() } else { "文献".into() })).on_click(self.on(Cmd::ToggleMaterials, cx))))
                     .child(ui::ghost_button(SharedString::from(format!("chat-history-{side}")), Some(if listing { "arrow-left" } else { "history" }), Some(if listing { "返回".into() } else { "历史".into() })).on_click(self.on(Cmd::ToggleHistory(about_paper), cx)))
                     .when(!chat.messages.is_empty() && !listing, |d| d.child(ui::ghost_button(SharedString::from(format!("chat-new-{side}")), Some("plus"), Some("新对话".into())).on_click(self.on(Cmd::NewChat(about_paper), cx)))),
             )
+            .children(materials)
             .child(body)
             .when(configured, |d| d.child(self.render_composer(about_paper, chat, &model, window, cx)))
             // An old conversation on show without a model: it can be read, and says what asking on needs.
@@ -157,11 +163,96 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The papers the library's questions are put to, to look through
+    /// without leaving the page: with the labels of this conversation and
+    /// what each was handed over as once the material is built; the papers
+    /// of the current list before that. A row opens the paper beside the
+    /// conversation; the scope stays what it is.
+    fn render_materials(&self, chat: &Chat, cx: &mut Context<Self>) -> AnyElement {
+        /// The rows drawn; a library of thousands is not a list to scroll through here.
+        const LISTED: usize = 300;
+        let lib = self.lib.as_ref().unwrap();
+        // (paper, its label in this conversation, how its record was given, pages of its text given)
+        let rows: Vec<(&wisp_core::model::Paper, String, &str, usize)> = match &chat.ctx {
+            Some(ctx) => ctx.given.iter().filter_map(|given| Some((lib.paper(&given.paper_id)?, ctx.sources.iter().find(|source| source.paper_id == given.paper_id).map(|source| source.label.clone()).unwrap_or_default(), given.record, given.pages))).collect(),
+            None => lib.shown.iter().map(|&i| (&lib.papers[i], String::new(), "", 0)).collect(),
+        };
+        let total = rows.len();
+        let note = if chat.ctx.is_some() {
+            "这次对话开始时交给模型的材料。助手还能用工具查到库里的其他文献；在这里点开一篇不会改变范围。"
+        } else {
+            "第一个问题会带上这些文献：范围就是文献列表现在的样子，由视图、搜索和筛选决定。点开一篇不会改变范围。"
+        };
+        let listed = rows.into_iter().take(LISTED).enumerate().map(|(n, (paper, label, record, pages))| {
+            let by = [paper.authors.split([';', ',']).next().unwrap_or("").trim().to_string(), paper.year.map(|year| year.to_string()).unwrap_or_default()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ");
+            // What the model has of it: the record, and how much of the text.
+            let mut state = vec![];
+            match record {
+                "full" => state.push("完整记录".to_string()),
+                "title" => state.push("仅题目".to_string()),
+                "omitted" => state.push("未提供".to_string()),
+                _ => {}
+            }
+            if pages > 0 { state.push(format!("{pages} 页全文")) }
+            let (text, color) = match paper.fulltext.as_str() {
+                "textless" => ("PDF 无文字", Theme::warning()),
+                "stored" => ("有全文", Theme::text_tertiary()),
+                _ => ("无全文", Theme::text_placeholder()),
+            };
+            let selected = lib.selected.as_deref() == Some(paper.id.as_str());
+            div()
+                .id(("material", n))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(30.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(selected, |d| d.bg(Theme::accent_soft()))
+                .when(!selected, |d| d.hover(|s| s.bg(Theme::hover())))
+                .on_click(self.on(Cmd::Select(paper.id.clone()), cx))
+                .when(!label.is_empty(), |d| d.child(div().flex_none().w(px(34.)).text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(Theme::accent()).child(label)))
+                .child(div().flex_1().min_w_0().truncate().child(paper.title.clone()))
+                .when(!by.is_empty(), |d| d.child(div().flex_none().max_w(px(150.)).truncate().text_size(px(12.)).text_color(Theme::text_tertiary()).child(by)))
+                .when(!state.is_empty(), |d| d.child(div().flex_none().text_size(px(12.)).text_color(if record == "full" { Theme::text_secondary() } else { Theme::warning() }).child(state.join(" · "))))
+                .child(div().flex_none().w(px(68.)).text_right().text_size(px(12.)).text_color(color).child(text))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .max_h(relative(0.45))
+            .border_b_1()
+            .border_color(Theme::line())
+            .bg(Theme::bg_sunken())
+            .child(div().flex_none().px(px(16.)).pt(px(8.)).pb(px(4.)).text_size(px(12.)).line_height(px(17.)).text_color(Theme::text_tertiary()).child(note))
+            .child(
+                div()
+                    .id("materials")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(8.))
+                    .pb(px(8.))
+                    .children(listed)
+                    .when(total > LISTED, |d| d.child(div().px(px(8.)).py(px(6.)).text_size(px(12.)).text_color(Theme::text_tertiary()).child(format!("另有 {} 篇没有列出；在文献列表里可以看到全部。", total - LISTED)))),
+            )
+            .into_any_element()
+    }
+
     /// What was said, in order: questions, the assistant's tool calls
     /// folded by run, the pieces of its answers with their sources.
     fn render_messages(&self, about_paper: bool, chat: &Chat, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let side = if about_paper { "paper" } else { "library" };
         let mut items: Vec<AnyElement> = vec![];
+        // A citation clicked where it stands in the text.
+        let workspace = cx.entity().downgrade();
+        let cite: crate::markdown::OnCite = std::rc::Rc::new(move |citation, window, cx| {
+            workspace.update(cx, |this, cx| this.run(Cmd::GotoCited(about_paper, citation.label.clone(), citation.page, citation.quote.clone()), window, cx)).ok();
+        });
         let mut i = 0;
         while i < chat.messages.len() {
             let content = match &chat.messages[i] {
@@ -221,15 +312,31 @@ impl Workspace {
                 .map(|(n, (source, page, quote))| {
                     let text = match page {
                         // A quoted sentence is what the click will look for in the PDF.
-                        Some(page) if !quote.is_empty() => format!("{} p.{page} · “{quote}”", source.label),
+                        _ if !quote.is_empty() => format!("{}{} · “{quote}”", source.label, page.map(|page| format!(" p.{page}")).unwrap_or_default()),
                         Some(page) => format!("{} p.{page} · {}", source.label, source.title),
                         None => format!("{} · {}", source.label, source.title),
                     };
-                    source_chip(SharedString::from(format!("cite-{side}-{i}-{n}")), if quote.is_empty() { 300. } else { 440. })
+                    // What looking the quotation up in the paper's text came to: said on the chip, not left to trust.
+                    let check = chat.checks.get(&(source.label.clone(), page, quote.clone()));
+                    let (mark, verdict, color) = match check {
+                        Some(ai::Quoted::Found) => ("check", "原文一致".to_string(), Theme::success()),
+                        Some(ai::Quoted::Elsewhere(at)) => ("info", format!("原文在 p.{at}"), Theme::warning()),
+                        Some(ai::Quoted::Begins(_, share)) => ("info", format!("只对上开头的 {:.0}%", share * 100.), Theme::warning()),
+                        Some(ai::Quoted::Missing) => ("x", "原文里没有这句".to_string(), Theme::danger()),
+                        Some(ai::Quoted::NoText) => ("info", "没有全文可核对".to_string(), Theme::text_tertiary()),
+                        None => ("file-text", String::new(), Theme::accent()),
+                    };
+                    // The click leads to where the sentence really is.
+                    let page = match check {
+                        Some(ai::Quoted::Elsewhere(at) | ai::Quoted::Begins(at, _)) => Some(*at),
+                        _ => page,
+                    };
+                    source_chip(SharedString::from(format!("cite-{side}-{i}-{n}")), if quote.is_empty() { 300. } else { 520. })
                         .text_color(Theme::text_secondary())
                         .on_click(self.on(Cmd::GotoSource(source.paper_id.clone(), page, quote), cx))
-                        .child(ui::icon("file-text", 12., Theme::accent()))
+                        .child(ui::icon(mark, 12., color))
                         .child(div().min_w_0().truncate().child(text))
+                        .when(!verdict.is_empty(), |d| d.child(div().flex_none().text_color(color).child(verdict)))
                         .into_any_element()
                 })
                 .collect();
@@ -252,7 +359,7 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .child(crate::markdown::render(&format!("answer-{side}-{i}"), content))
+                    .child(crate::markdown::render(&format!("answer-{side}-{i}"), content, Some(cite.clone())))
                     .when(!chips.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(6.)).children(chips)))
                     .when_some(whole, |d, (question, whole)| {
                         d.child(

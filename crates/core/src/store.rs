@@ -213,6 +213,15 @@ CREATE TABLE IF NOT EXISTS drafts (
     body TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+
+-- Where a file that was fetched came from: the address, who listed it, which version it is.
+CREATE TABLE IF NOT EXISTS file_origins (
+    resource_id TEXT PRIMARY KEY NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    version TEXT NOT NULL DEFAULT '',
+    fetched_at TEXT NOT NULL
+);
 "#;
 
 const PAPER_COLUMNS: &str = "id, title, abstract, authors_json, journal, year, publication_state, url, source, \
@@ -681,6 +690,29 @@ impl Store {
             return Err(err.into());
         }
         Ok(file)
+    }
+
+    /// Keep a fetched file with a paper: `bytes` as `name`, and where it came from.
+    pub fn import_fetched(&mut self, paper_id: &str, name: &str, bytes: &[u8], kind: &str, url: &str, source: &str, version: &str) -> Result<PaperFile> {
+        // Through a file of that name, so that it is stored the way a dropped one is.
+        let staging = self.root.join("papers").join(format!("fetching-{}", new_id("F")));
+        std::fs::create_dir_all(&staging)?;
+        let path = staging.join(name);
+        let stored = std::fs::write(&path, bytes).map_err(anyhow::Error::from).and_then(|()| self.import_file(paper_id, &path, kind));
+        let _ = std::fs::remove_dir_all(&staging);
+        let file = stored?;
+        self.db.execute(
+            "INSERT INTO file_origins(resource_id, url, source, version, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(resource_id) DO UPDATE SET url = excluded.url, source = excluded.source, version = excluded.version, fetched_at = excluded.fetched_at",
+            params![file.id, url, source, version, now_iso()],
+        )?;
+        Ok(file)
+    }
+
+    /// Where the fetched files came from, by file: (address, who listed it, version).
+    pub fn file_origins(&self) -> Result<BTreeMap<String, (String, String, String)>> {
+        let mut stmt = self.db.prepare("SELECT resource_id, url, source, version FROM file_origins")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?.collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        Ok(rows)
     }
 
     /// The absolute path of a stored file.

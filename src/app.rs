@@ -130,6 +130,11 @@ pub enum Cmd {
     ShowTextless,
     /// Open a paper named in the import's report.
     OpenImported(String),
+    /// Look for the open full text of one paper, or of every paper of the current list that has no PDF.
+    FindPdfs(Option<String>),
+    StopFetch,
+    ShowFetch,
+    CloseFetch,
     // The list
     SetView(View),
     SetPage(Page),
@@ -195,10 +200,14 @@ pub enum Cmd {
     CopyText(String),
     /// Make a note of the selected paper out of an answer about it: the question, and the answer.
     AnswerToNote(String, String),
+    /// Unfold or fold the list of the papers the library's questions are put to.
+    ToggleMaterials,
     /// Show every source of an answer (by its place in the conversation), or the first few again.
     ToggleSources(bool, usize),
     /// Open a paper; with a page, its PDF there; with a quoted sentence too, that sentence highlighted.
     GotoSource(String, Option<usize>, String),
+    /// The same for a citation as an answer writes it: the label of a conversation, a page, a quotation.
+    GotoCited(bool, String, Option<usize>, String),
     // Searches and imports
     NewSearch,
     EditSearch(String),
@@ -529,6 +538,53 @@ impl ImportRun {
     }
 }
 
+/// What looking for the open full text of one paper came to.
+pub struct FetchRow {
+    pub paper_id: String,
+    pub title: String,
+    /// `saved`, `not_found` or `failed`, as `find_pdf` says.
+    pub outcome: String,
+    /// Where the file came from and what of its text; or why there is none.
+    pub detail: String,
+    /// The file was saved, and no text came of it.
+    pub textless: bool,
+}
+
+/// A round of looking for open full texts: the papers still to ask about,
+/// those being asked about, and what came of the rest, until it is put away.
+#[derive(Default)]
+pub struct FetchRun {
+    pub total: usize,
+    todo: Vec<String>,
+    pub working: Vec<String>,
+    pub rows: Vec<FetchRow>,
+    /// Bumped when a round starts or is stopped, so what still arrives for an earlier one is dropped.
+    run: u64,
+}
+
+impl FetchRun {
+    pub fn running(&self) -> bool {
+        !self.todo.is_empty() || !self.working.is_empty()
+    }
+
+    pub fn count(&self, outcome: &str) -> usize {
+        self.rows.iter().filter(|row| row.outcome == outcome).count()
+    }
+
+    /// What came of the papers, in a line.
+    pub fn summary(&self) -> String {
+        let mut facts = vec![];
+        for (outcome, text) in [("saved", "已保存"), ("not_found", "没有开放全文"), ("failed", "没有取到")] {
+            let n = self.count(outcome);
+            if n > 0 { facts.push(format!("{text} {n}")) }
+        }
+        facts.join(" · ")
+    }
+}
+
+/// The papers asked about at the same time.
+const FETCH_WORKERS: usize = 2;
+
 /// One conversation: with the library (the current list) or with one paper.
 pub struct Chat {
     pub input: Entity<TextInput>,
@@ -577,6 +633,10 @@ pub struct Chat {
     running: Vec<String>,
     /// The groups of tool lines (by the place of their first) that are unfolded.
     pub tools_open: HashSet<usize>,
+    /// The list of what the model was (or will be) given is unfolded.
+    pub materials_open: bool,
+    /// The quotations of the answers looked up in the papers they name, by label, page and quotation.
+    pub checks: HashMap<(String, Option<usize>, String), ai::Quoted>,
     /// When the question being answered was asked.
     pub started: Option<Instant>,
 }
@@ -608,6 +668,8 @@ pub enum Modal {
     Confirm { title: String, message: String, action: String, cmd: Cmd },
     /// What came of each PDF of the last import (`Library::import`).
     ImportReport,
+    /// What came of looking for each paper's open full text (`Library::fetching`).
+    FetchReport,
     /// An answer about a paper, to be looked over before it joins that paper's notes.
     Note { paper_id: String, text: Entity<TextInput> },
 }
@@ -628,6 +690,8 @@ pub struct Library {
     pub tab: Tab,
     /// The detail panel takes most of the window (reading a PDF).
     pub wide: bool,
+    /// The paper's PDF is shown beside its conversation.
+    pub split: bool,
     pub notes: Entity<TextInput>,
     pub pdf: Option<Entity<PdfView>>,
     /// How large PDF pages are drawn; it stays from paper to paper.
@@ -656,6 +720,10 @@ pub struct Library {
     pub running: HashSet<String>,
     /// The PDFs being read in, or what came of the last lot until it is put away.
     pub import: Option<ImportRun>,
+    /// The round of looking for open full texts, likewise.
+    pub fetching: Option<FetchRun>,
+    /// Where the fetched files came from, by file: (address, who listed it, version).
+    pub origins: BTreeMap<String, (String, String, String)>,
     pub writing: Writing,
     _subscriptions: Vec<Subscription>,
 }
@@ -717,6 +785,8 @@ impl Chat {
             allow_changes: false,
             running: vec![],
             tools_open: Default::default(),
+            materials_open: false,
+            checks: HashMap::new(),
             started: None,
         }
     }
@@ -735,6 +805,8 @@ impl Chat {
     /// stay what they were: the answers already given use them.
     fn forget_context(&mut self) {
         if let Some(ctx) = self.ctx.take() { self.known = ctx.sources }
+        // The texts may have changed: the quotations are looked up again.
+        self.checks.clear();
     }
 
     /// An answer piece that never got any text leaves no empty bubble behind.
@@ -800,6 +872,7 @@ impl Chat {
         self.allow_changes = false;
         self.running.clear();
         self.tools_open.clear();
+        self.checks.clear();
         self.started = None;
         self.input.update(cx, |input, cx| {
             input.choosing = false;
@@ -871,6 +944,34 @@ impl Library {
         }
     }
 
+    /// Look up, in the papers they name, the quotations of the answers
+    /// that have not been looked up yet. An answer still being written is
+    /// left until it is whole.
+    pub fn check_quotes(&mut self, about_paper: bool) {
+        let chat = if about_paper { &self.paper_chat } else { &self.library_chat };
+        let finished = if chat.busy { chat.messages.len().saturating_sub(1) } else { chat.messages.len() };
+        let mut wanted: Vec<(ai::Citation, String)> = vec![];
+        for item in &chat.messages[..finished] {
+            let ChatItem::Answer(text) = item else { continue };
+            for citation in ai::citations(text) {
+                if citation.quote.is_empty() || chat.checks.contains_key(&(citation.label.clone(), citation.page, citation.quote.clone())) { continue }
+                let Some(source) = chat.sources().iter().find(|source| source.label == citation.label) else { continue };
+                wanted.push((citation, source.paper_id.clone()));
+            }
+        }
+        if wanted.is_empty() { return }
+        // Each paper's pages are read once, however often it is quoted.
+        let mut texts: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        let mut checks = vec![];
+        for (citation, paper_id) in wanted {
+            let Some(paper) = self.papers.iter().find(|paper| paper.id == paper_id) else { continue };
+            let pages = texts.entry(paper_id.clone()).or_insert_with(|| self.store.paper_pages(&paper_id).ok().flatten());
+            let found = ai::check_quote(&citation.quote, citation.page, paper, pages.as_deref());
+            checks.push(((citation.label, citation.page, citation.quote), found));
+        }
+        self.chat_mut(about_paper).checks.extend(checks);
+    }
+
     pub fn refilter(&mut self) {
         self.shown = filter::filter_papers(&self.papers, &self.filters, time::now_millis());
     }
@@ -885,6 +986,7 @@ impl Library {
         self.suggestions = self.store.list_suggestions()?.into_iter().map(|s| (s.paper_id.clone(), s)).collect();
         self.batches = self.store.list_batches(30)?;
         self.writing.structures = self.store.structures()?;
+        self.origins = self.store.file_origins()?;
         // Filters on a field that no longer exists would hide everything.
         let known: HashSet<&str> = self.fields.iter().map(|f| f.id.as_str()).collect();
         self.filters.fields.retain(|id, _| known.contains(id.as_str()));
@@ -1180,6 +1282,24 @@ impl Workspace {
                 if let Some(lib) = self.lib.as_mut() && matches!(lib.page, Page::Trash | Page::Sources | Page::Guide) { lib.page = Page::Papers }
                 self.select(Some(id), window, cx);
             }
+            Cmd::FindPdfs(only) => self.fetch_start(only, cx),
+            Cmd::StopFetch => {
+                if let Some(run) = self.lib.as_mut().and_then(|lib| lib.fetching.as_mut()) {
+                    run.run += 1;
+                    run.total = run.rows.len();
+                    run.todo.clear();
+                    run.working.clear();
+                }
+            }
+            Cmd::ShowFetch => {
+                self.modal_subscriptions.clear();
+                self.modal_error.clear();
+                self.modal = Some(Modal::FetchReport);
+            }
+            Cmd::CloseFetch => {
+                if let Some(lib) = self.lib.as_mut() && lib.fetching.as_ref().is_some_and(|run| !run.running()) { lib.fetching = None }
+                if matches!(self.modal, Some(Modal::FetchReport)) { self.run(Cmd::CloseModal, window, cx) }
+            }
             Cmd::ShowTextless => {
                 if matches!(self.modal, Some(Modal::ImportReport)) { self.run(Cmd::CloseModal, window, cx) }
                 if let Some(lib) = self.lib.as_mut() {
@@ -1320,6 +1440,7 @@ impl Workspace {
             Cmd::SetTab(tab) => {
                 if let Some(lib) = self.lib.as_mut() {
                     lib.tab = tab;
+                    lib.split = false;
                     if tab == Tab::Ask { lib.paper_chat.input.read(cx).focus(window) }
                 }
                 self.ensure_pdf(cx);
@@ -1328,7 +1449,7 @@ impl Workspace {
                 if let Some(lib) = self.lib.as_mut() { lib.wide = !lib.wide }
             }
             Cmd::PdfZoom(to) => {
-                if let Some(pdf) = self.lib.as_ref().filter(|lib| lib.tab == Tab::Pdf).and_then(|lib| lib.pdf.clone()) { pdf.update(cx, |pdf, cx| pdf.zoom_to(to, cx)) }
+                if let Some(pdf) = self.lib.as_ref().filter(|lib| lib.tab == Tab::Pdf || lib.split).and_then(|lib| lib.pdf.clone()) { pdf.update(cx, |pdf, cx| pdf.zoom_to(to, cx)) }
             }
             Cmd::ToggleTranslation => {
                 if let Some(lib) = self.lib.as_mut() { lib.show_translation = !lib.show_translation }
@@ -1474,16 +1595,39 @@ impl Workspace {
                 text.read(cx).focus(window);
                 self.modal = Some(Modal::Note { paper_id, text });
             }
+            Cmd::ToggleMaterials => {
+                if let Some(lib) = self.lib.as_mut() { lib.library_chat.materials_open = !lib.library_chat.materials_open }
+            }
             Cmd::ToggleSources(paper, at) => {
                 if let Some(lib) = self.lib.as_mut() {
                     let chat = if paper { &mut lib.paper_chat } else { &mut lib.library_chat };
                     if !chat.sources_open.remove(&at) { chat.sources_open.insert(at); }
                 }
             }
+            Cmd::GotoCited(paper, label, page, quote) => {
+                let Some(lib) = self.lib.as_ref() else { return };
+                let chat = lib.chat(paper);
+                let Some(id) = chat.sources().iter().find(|source| source.label == label).map(|source| source.paper_id.clone()) else { return self.fail(format!("这次对话里没有 {label} 这篇文献。"), cx) };
+                // Where the sentence was found, when it is not where the answer says.
+                let page = match chat.checks.get(&(label, page, quote.clone())) {
+                    Some(ai::Quoted::Elsewhere(at) | ai::Quoted::Begins(at, _)) => Some(*at),
+                    _ => page,
+                };
+                self.run(Cmd::GotoSource(id, page, quote), window, cx);
+            }
             Cmd::GotoSource(id, page, quote) => {
+                // Cited from the paper's own conversation: the PDF opens beside it, where the window has room.
+                let beside = self.lib.as_ref().is_some_and(|lib| lib.tab == Tab::Ask && lib.selected.as_deref() == Some(id.as_str()) && lib.pdf_file(&id).is_some()) && page.is_some();
                 self.select(Some(id), window, cx);
+                if beside && let Some(lib) = self.lib.as_mut() {
+                    lib.split = true;
+                    if self.detail_width(window) < crate::detail::SPLIT_MIN { self.lib.as_mut().unwrap().wide = true }
+                    // A window too small for the two side by side shows the PDF in the chat's place, as before.
+                    if self.detail_width(window) < crate::detail::SPLIT_MIN && let Some(lib) = self.lib.as_mut() { lib.split = false }
+                }
+                let beside = self.lib.as_ref().is_some_and(|lib| lib.split);
                 if let Some(page) = page && let Some(lib) = self.lib.as_mut() {
-                    lib.tab = Tab::Pdf;
+                    if !beside { lib.tab = Tab::Pdf }
                     self.ensure_pdf(cx);
                     if let Some(pdf) = self.lib.as_ref().and_then(|l| l.pdf.clone()) {
                         pdf.update(cx, |pdf, cx| if quote.is_empty() { pdf.go_to(page, cx) } else { pdf.find(page, &quote, cx) });
@@ -1804,6 +1948,7 @@ impl Workspace {
             selected: None,
             tab: Tab::Info,
             wide: false,
+            split: false,
             notes,
             pdf: None,
             zoom: Zoom::FitWidth,
@@ -1822,6 +1967,8 @@ impl Workspace {
             trial: None,
             running: HashSet::new(),
             import: None,
+            fetching: None,
+            origins: BTreeMap::new(),
             writing,
             _subscriptions: subscriptions,
         };
@@ -1843,6 +1990,7 @@ impl Workspace {
         let Some(lib) = self.lib.as_mut() else { return };
         lib.selected = id;
         lib.pdf = None;
+        lib.split = false;
         lib.paper_chat.reset(cx);
         lib.detail_scroll = ScrollHandle::new();
         match lib.selected_paper() {
@@ -1918,7 +2066,7 @@ impl Workspace {
     /// Open the PDF viewer when its tab is showing and the paper has a PDF.
     fn ensure_pdf(&mut self, cx: &mut Context<Self>) {
         let Some(lib) = self.lib.as_mut() else { return };
-        if lib.tab != Tab::Pdf || lib.pdf.is_some() { return }
+        if !(lib.tab == Tab::Pdf || lib.split) || lib.pdf.is_some() { return }
         let Some(path) = lib.selected.as_deref().and_then(|id| lib.pdf_file(id)).map(|f| lib.store.file_path(f)) else { return };
         let zoom = lib.zoom;
         lib.pdf = Some(cx.new(|cx| PdfView::new(&path, zoom, cx)));
@@ -2820,7 +2968,7 @@ impl Workspace {
             loop {
                 let Ok(root) = this.update(cx, |this, _| this.root.clone()) else { break };
                 // One look at a time: the next waits for this one's runs to end.
-                let outcome = cx.background_executor().spawn(async move { tools::call(&root, "sync_searches", &serde_json::json!({}), &wisp_net::get_text) }).await;
+                let outcome = cx.background_executor().spawn(async move { tools::call(&root, "sync_searches", &serde_json::json!({}), &wisp_net::get_text, &wisp_net::download) }).await;
                 let alive = this.update(cx, |this, cx| {
                     let Ok(outcome) = outcome else { return };
                     let runs = outcome["runs"].as_array().cloned().unwrap_or_default();
@@ -3133,6 +3281,76 @@ impl Workspace {
         .detach();
     }
 
+    /// Look for the open full text of one paper, or of the papers of the
+    /// current list that have no PDF and a number to be looked up by. A
+    /// round under way takes more papers in.
+    fn fetch_start(&mut self, only: Option<String>, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut() else { return };
+        let known = wisp_core::openaccess::lookable;
+        let lacking = |paper: &Paper| matches!(paper.fulltext.as_str(), "missing" | "linked");
+        let wanted: Vec<String> = match &only {
+            Some(id) => lib.paper(id).filter(|paper| lacking(paper)).map(|paper| paper.id.clone()).into_iter().collect(),
+            None => lib.shown.iter().map(|&i| &lib.papers[i]).filter(|paper| lacking(paper) && known(paper)).map(|paper| paper.id.clone()).collect(),
+        };
+        if let Some(paper) = only.as_deref().and_then(|id| lib.paper(id)) && !known(paper) { return self.fail("这篇文献没有 DOI、PMID 或 arXiv 编号，无从查起。先在「编辑信息与词条」里补上编号。", cx) }
+        if wanted.is_empty() { return self.say("当前列表里没有可以查找的文献：要么已经有 PDF，要么没有 DOI、PMID 或 arXiv 编号。", cx) }
+        let fresh = lib.fetching.as_ref().is_none_or(|run| !run.running());
+        if fresh { lib.fetching = Some(FetchRun { run: lib.fetching.as_ref().map_or(0, |run| run.run) + 1, ..Default::default() }) }
+        let run = lib.fetching.as_mut().unwrap();
+        let mut added = 0;
+        for id in wanted.into_iter().rev() {
+            if run.todo.contains(&id) || run.working.contains(&id) || run.rows.iter().any(|row| row.paper_id == id) { continue }
+            run.todo.insert(0, id);
+            added += 1;
+        }
+        run.total += added;
+        let id = run.run;
+        for _ in run.working.len()..FETCH_WORKERS {
+            self.fetch_next(id, cx);
+        }
+        cx.notify();
+    }
+
+    /// Ask about the next paper of the round, and about the one after it once this is answered.
+    fn fetch_next(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut() else { return };
+        let Some(run) = lib.fetching.as_mut().filter(|run| run.run == id) else { return };
+        let Some(paper_id) = run.todo.pop() else { return };
+        run.working.push(paper_id.clone());
+        let title = lib.paper(&paper_id).map(|paper| paper.title.clone()).unwrap_or_default();
+        self.library_tool("find_pdf", serde_json::json!({"paperId": paper_id}), cx, move |this, result, cx| {
+            let Some(lib) = this.lib.as_mut() else { return };
+            let Some(run) = lib.fetching.as_mut().filter(|run| run.run == id) else { return };
+            run.working.retain(|working| *working != paper_id);
+            let found = result.as_ref().ok().map(|value| value["papers"][0].clone()).unwrap_or_default();
+            let outcome = found["outcome"].as_str().unwrap_or("failed").to_string();
+            let textless = found["textReason"].is_string();
+            let detail = match (&result, outcome.as_str()) {
+                (Err(err), _) => err.clone(),
+                (_, "saved") => {
+                    let version = wisp_core::openaccess::version_label(found["version"].as_str().unwrap_or(""));
+                    let from = [found["source"].as_str().unwrap_or(""), version].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ");
+                    match found["textReason"].as_str() {
+                        Some(reason) => format!("来自 {from}。没读出文字：{reason}"),
+                        None => format!("来自 {from}，读出 {} 页文字", found["pages"].as_u64().unwrap_or(0)),
+                    }
+                }
+                // Nothing found and nothing gone wrong: the outcome says it all.
+                (_, "not_found") => found["reason"].as_str().filter(|reason| !reason.starts_with("没有找到开放获取的全文")).unwrap_or("").to_string(),
+                _ => found["reason"].as_str().unwrap_or("").to_string(),
+            };
+            run.rows.push(FetchRow { paper_id: paper_id.clone(), title, outcome: outcome.clone(), detail, textless });
+            if outcome == "saved" {
+                // The paper has a PDF now: the list, the detail panel and the next question see it.
+                let _ = lib.reload();
+                lib.texts_changed();
+                if lib.selected.as_deref() == Some(paper_id.as_str()) { lib.pdf = None }
+                this.ensure_pdf(cx);
+            }
+            this.fetch_next(id, cx);
+        });
+    }
+
     /// Run a library tool off the main thread, on a connection of its own
     /// and with the network, and hand the result back if the same library
     /// is still open.
@@ -3143,7 +3361,7 @@ impl Workspace {
         cx.notify();
         let work = cx.background_executor().spawn(async move {
             let mut store = Store::open(&info.dir).map_err(|e| format!("{e:#}"))?;
-            tools::call_in(&mut store, &info, name, &args, &wisp_net::get_text)
+            tools::call_in(&mut store, &info, name, &args, &wisp_net::get_text, &wisp_net::download)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -3167,6 +3385,7 @@ impl Workspace {
                 self.run(cmd, window, cx);
             }
             Modal::ImportReport => self.run(Cmd::CloseImport, window, cx),
+            Modal::FetchReport => self.run(Cmd::CloseFetch, window, cx),
             Modal::Library { editing, name, topic, color } => {
                 let (name, topic, color) = (text(name, cx), text(topic, cx), color.clone());
                 let mut created = None;
@@ -3335,7 +3554,7 @@ fn run_tool(info: &LibraryInfo, sources: &[ai::Source], call: PreparedCall, allo
     }
     let result = call.args.and_then(|args| {
         let mut store = Store::open(&info.dir).map_err(|e| format!("{e:#}"))?;
-        let mut value = tools::call_in(&mut store, info, &call.name, &args, &wisp_net::get_text)?;
+        let mut value = tools::call_in(&mut store, info, &call.name, &args, &wisp_net::get_text, &wisp_net::download)?;
         ai::add_labels(&mut value, sources);
         Ok(value)
     });
@@ -3434,6 +3653,11 @@ impl Workspace {
                 }
                 // `click:<command>` for what has no step of its own.
                 "textless" => Some(Cmd::ShowTextless),
+                // `findpdf` asks about the papers of the list on show, `findpdf:one` about the selected paper; `fetched` shows what came of it.
+                "findpdf" => Some(Cmd::FindPdfs(if arg == "one" { self.lib.as_ref().and_then(|lib| lib.selected.clone()) } else { None })),
+                "fetched" => Some(Cmd::ShowFetch),
+                "view" => Some(Cmd::SetView(match arg { "nopdf" => View::NoPdf, "unread" => View::Unread, _ => View::All })),
+                "materials" => Some(Cmd::ToggleMaterials),
                 "history-paper" => Some(Cmd::ToggleHistory(true)),
                 "newchat" => Some(Cmd::NewChat(arg == "paper")),
                 "note" => {

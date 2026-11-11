@@ -10,7 +10,8 @@ use crate::filter::{Filters, filter_papers};
 use crate::fulltext::{self, terms};
 use crate::libraries::{self, LibraryInfo};
 use crate::model::{FULLTEXTS, Paper, READINGS, SCREENINGS, one_of};
-use crate::sources::{self, Fetch};
+use crate::openaccess;
+use crate::sources::{self, Download, Fetch};
 use crate::store::{SavedSearch, Store, Suggestion};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
@@ -33,11 +34,11 @@ pub struct ToolDef {
 
 /// A tool that works inside one library: it also takes `library`.
 /// The tools that change the library.
-const WRITING: [&str; 6] = ["save_search", "remove_search", "run_search", "undo_import", "suggest_screening", "sync_searches"];
+const WRITING: [&str; 7] = ["save_search", "remove_search", "run_search", "undo_import", "suggest_screening", "sync_searches", "find_pdf"];
 /// Of those, the ones the window's assistant runs only with the person's
 /// consent. Saving a search or suggesting a screening decision changes
 /// nothing a person has not yet to act on, so they run as asked.
-const CONFIRMING: [&str; 3] = ["run_search", "undo_import", "remove_search"];
+const CONFIRMING: [&str; 4] = ["run_search", "undo_import", "remove_search", "find_pdf"];
 
 fn scoped(name: &'static str, title: &'static str, description: &'static str, mut properties: Value, required: &[&str]) -> ToolDef {
     properties["library"] = json!({"type": "string", "description": "文献库的 ID 或名称；只有一个文献库时可以省略。"});
@@ -176,6 +177,17 @@ pub fn catalog() -> Vec<ToolDef> {
             &["batchId"],
         ),
         scoped(
+            "find_pdf",
+            "查找开放全文",
+            "为还没有 PDF 的文献查找开放获取的全文，下载后附到原来的条目上，并读出文字。只找可以免费合法获取的版本：arXiv、OpenAlex 和 Europe PMC 列出的开放获取文件、以及 Springer / BMC、Nature、Frontiers 的开放获取文章；不登录，不绕过付费墙，找不到就如实说没有。给出 paperId 时只处理这一篇，否则处理文献库里没有 PDF 的文献，一次最多 limit 篇。会把文献的 DOI 或 PMID 发给 OpenAlex、Europe PMC 和出版商。",
+            json!({
+                "paperId": {"type": "string", "description": "只为这一篇文献查找；省略时处理文献库里没有 PDF 的文献。"},
+                "limit": {"type": "integer", "description": "省略 paperId 时一次最多处理几篇，默认 10，最多 50。"},
+                "lookOnly": {"type": "boolean", "description": "只查找、不下载：返回每篇文献的候选地址。"},
+            }),
+            &[],
+        ),
+        scoped(
             "suggest_screening",
             "提出收录建议",
             "为一篇文献提出收录判断的建议，供用户在筛选页确认。这不会改变文献的收录判断：判断只由用户本人做出。同一篇文献的新建议会替换旧的。建议前先读这篇文献的记录（get_paper），有全文时读全文（read_fulltext）。",
@@ -268,7 +280,7 @@ pub fn describe_result(result: &Result<Value, String>) -> String {
 
 /// Run a tool against the data folder `root`. The error is a sentence for
 /// whoever called: a person at a terminal or a model.
-pub fn call(root: &Path, name: &str, args: &Value, fetch: Fetch) -> Result<Value, String> {
+pub fn call(root: &Path, name: &str, args: &Value, fetch: Fetch, download: Download) -> Result<Value, String> {
     checked(name, args)?;
     if name == "sync_searches" { return sync_searches(root, args, fetch, crate::time::now_millis()).map_err(|e| format!("{e:#}")) }
     if name == "list_libraries" {
@@ -277,17 +289,18 @@ pub fn call(root: &Path, name: &str, args: &Value, fetch: Fetch) -> Result<Value
     }
     let info = find_library(root, args["library"].as_str().unwrap_or(""))?;
     let mut store = Store::open(&info.dir).map_err(|e| format!("{e:#}"))?;
-    call_in(&mut store, &info, name, args, fetch)
+    call_in(&mut store, &info, name, args, fetch, download)
 }
 
 /// Run a library tool on a library that is already open.
-pub fn call_in(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fetch: Fetch) -> Result<Value, String> {
+pub fn call_in(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fetch: Fetch, download: Download) -> Result<Value, String> {
     checked(name, args)?;
-    dispatch(store, info, name, args, fetch).map_err(|e| format!("{e:#}"))
+    dispatch(store, info, name, args, fetch, download).map_err(|e| format!("{e:#}"))
 }
 
-fn dispatch(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fetch: Fetch) -> Result<Value> {
+fn dispatch(store: &mut Store, info: &LibraryInfo, name: &str, args: &Value, fetch: Fetch, download: Download) -> Result<Value> {
     match name {
+        "find_pdf" => find_pdf(store, args, fetch, download),
         "find_citations" => find_citations(store, args),
         "find_sentences" => find_sentences(store, args),
         "search_online" => search_online(store, args, fetch),
@@ -602,6 +615,93 @@ fn read_fulltext(store: &mut Store, args: &Value) -> Result<Value> {
     Ok(json!({"paperId": paper.id, "title": paper.title, "pageCount": pages.len(), "pages": read}))
 }
 
+/// A name for a fetched file: how the paper is cited, as a file name.
+fn file_name(paper: &Paper) -> String {
+    let base = if paper.authors.trim().is_empty() { paper.title.clone() } else { paper.citation() };
+    let name: String = base.chars().map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { ' ' } else { c }).collect();
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{}.pdf", if name.is_empty() { "全文".to_string() } else { name.chars().take(80).collect() })
+}
+
+/// Look for an open-access full text of one paper and keep it with the paper.
+fn fetch_pdf(store: &mut Store, paper: &Paper, look_only: bool, fetch: Fetch, download: Download) -> Result<Value> {
+    let (candidates, mut failures) = openaccess::candidates(paper, fetch);
+    let listed: Vec<Value> = candidates.iter().map(|c| json!({"url": c.url, "source": c.source, "version": c.version})).collect();
+    let mut row = json!({"paperId": paper.id, "title": paper.title});
+    if look_only {
+        row["outcome"] = json!(if candidates.is_empty() { "not_found" } else { "candidates" });
+        row["candidates"] = json!(listed);
+        if !failures.is_empty() { row["reason"] = json!(failures.join("；")) }
+        return Ok(row);
+    }
+    for candidate in &candidates {
+        match download(&candidate.url) {
+            Ok(bytes) if openaccess::is_pdf(&bytes) => {
+                let file = store.import_fetched(&paper.id, &file_name(paper), &bytes, "fulltext", &candidate.url, &candidate.source, candidate.version)?;
+                // Saved is not yet readable: the text is read at once, and what came of it said.
+                let pages = fulltext::file_pages(&store.file_path(&file));
+                store.save_fulltext_pages(&file.id, &pages)?;
+                row["outcome"] = json!("saved");
+                row["source"] = json!(candidate.source);
+                row["version"] = json!(candidate.version);
+                row["url"] = json!(candidate.url);
+                row["sizeBytes"] = json!(file.size_bytes);
+                match pages {
+                    Ok(pages) => row["pages"] = json!(pages.len()),
+                    Err(reason) => {
+                        row["textKind"] = json!(fulltext::failure_kind(&reason));
+                        row["textReason"] = json!(reason);
+                    }
+                }
+                return Ok(row);
+            }
+            Ok(_) => failures.push(format!("{}：返回的不是 PDF，多半是登录页或验证页", candidate.source)),
+            Err(err) => failures.push(format!("{}：{err}", candidate.source)),
+        }
+    }
+    row["outcome"] = json!(if candidates.is_empty() { "not_found" } else { "failed" });
+    // A file is listed and was not handed out: some publishers give it to a browser only.
+    if !candidates.is_empty() { failures.push("这些地址不向程序提供文件时，可以在浏览器里打开文献的链接下载，再把 PDF 拖进窗口".into()) }
+    if candidates.is_empty() && failures.is_empty() { failures.push("没有找到开放获取的全文。可以打开文献的链接自己下载，再把 PDF 拖进窗口：它会附到这一条上。".into()) }
+    row["reason"] = json!(failures.join("；"));
+    Ok(row)
+}
+
+fn find_pdf(store: &mut Store, args: &Value, fetch: Fetch, download: Download) -> Result<Value> {
+    let only = text(args, "paperId")?;
+    let limit = number(args, "limit", 10, 50)?.max(1);
+    let look_only = args["lookOnly"].as_bool().unwrap_or(false);
+    let known = openaccess::lookable;
+    let (todo, remaining, nameless) = if only.is_empty() {
+        let lacking: Vec<Paper> = store.list_papers()?.into_iter().filter(|p| matches!(p.fulltext.as_str(), "missing" | "linked")).collect();
+        let nameless = lacking.iter().filter(|p| !known(p)).count();
+        let mut todo: Vec<Paper> = lacking.into_iter().filter(|p| known(p)).collect();
+        let remaining = todo.len().saturating_sub(limit);
+        todo.truncate(limit);
+        (todo, remaining, nameless)
+    } else {
+        let paper = store.get_paper(only)?;
+        if matches!(paper.fulltext.as_str(), "stored" | "textless") { bail!("「{}」已经有 PDF 了。", paper.title) }
+        if !known(&paper) { bail!("「{}」没有 DOI、PMID 或 arXiv 编号，无从查起。先补全它的编号。", paper.title) }
+        (vec![paper], 0, 0)
+    };
+    let mut rows = vec![];
+    for paper in &todo {
+        rows.push(fetch_pdf(store, paper, look_only, fetch, download)?);
+    }
+    let count = |outcome: &str| rows.iter().filter(|row| row["outcome"] == outcome).count();
+    Ok(json!({
+        "checked": rows.len(),
+        "saved": count("saved"),
+        "notFound": count("not_found"),
+        "failed": count("failed"),
+        // Papers without a PDF this call did not get to, and those with no number to look them up by.
+        "remaining": remaining,
+        "withoutIdentifier": nameless,
+        "papers": rows,
+    }))
+}
+
 /// The sentences of a text: full stops of either script, question and
 /// exclamation marks, semicolons and line breaks end one. A Latin full stop
 /// only does when a space follows, so "0.05" and "e.g.x" stay whole.
@@ -909,8 +1009,12 @@ pub(crate) mod tests {
         Err(format!("测试中不应联网：{url}"))
     }
 
+    pub(crate) fn no_download(url: &str) -> Result<Vec<u8>, String> {
+        Err(format!("测试中不应联网：{url}"))
+    }
+
     fn call(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
-        super::call(root, name, args, &offline)
+        super::call(root, name, args, &offline, &no_download)
     }
 
     use super::*;
@@ -1066,6 +1170,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn open_full_texts_are_fetched() {
+        let (root, id) = sample();
+        // The indexes, as they answer for the two papers; the publisher hands a PDF out, a login page elsewhere.
+        let index = |url: &str| -> Result<String, String> {
+            if url.contains("openalex") && url.contains("root") {
+                Ok(json!({"open_access": {"is_oa": true}, "best_oa_location": {"is_oa": true, "pdf_url": "https://repo.example/login.pdf", "version": "acceptedVersion"}, "locations": []}).to_string())
+            } else if url.contains("openalex") {
+                Ok(json!({"open_access": {"is_oa": false}, "best_oa_location": null, "locations": []}).to_string())
+            } else {
+                Ok(json!({"resultList": {"result": []}}).to_string())
+            }
+        };
+        let files = |url: &str| -> Result<Vec<u8>, String> { if url.contains("repo.example") { Ok(b"<html>Sign in</html>".to_vec()) } else { Ok(b"%PDF-1.4 not really a pdf".to_vec()) } };
+        let find = |args: Value| super::call(&root, "find_pdf", &args, &index, &files);
+        // A paper that has its PDF is not looked for again.
+        assert!(find(json!({"paperId": id})).unwrap_err().contains("已经有 PDF"));
+        // The paper without a number cannot be looked up; said, not skipped in silence.
+        let leaf = call(&root, "list_papers", &json!({"screening": "irrelevant"})).unwrap()["papers"][0]["id"].as_str().unwrap().to_string();
+        assert!(find(json!({"paperId": leaf})).unwrap_err().contains("无从查起"));
+        let all = find(json!({})).unwrap();
+        assert_eq!((all["checked"].as_u64(), all["withoutIdentifier"].as_u64()), (Some(0), Some(1)));
+        // A third paper: open access at a publisher this knows, a manuscript behind a login elsewhere.
+        let mut store = Store::open(&libraries::list(&root)[0].dir).unwrap();
+        let soil = store.add_paper(Paper { title: "Soil and root".into(), authors: "Zhu, Mo; Lee, An".into(), year: Some(2021), doi: "10.1186/root-soil-1".into(), ..Default::default() }).unwrap();
+        let closed = store.add_paper(Paper { title: "Behind a wall".into(), doi: "10.1016/closed".into(), ..Default::default() }).unwrap();
+        drop(store);
+        let looked = find(json!({"paperId": soil.id, "lookOnly": true})).unwrap();
+        assert_eq!(looked["papers"][0]["candidates"].as_array().unwrap().iter().map(|c| c["source"].as_str().unwrap()).collect::<Vec<_>>(), ["Springer", "OpenAlex"]);
+        assert_eq!(call(&root, "get_paper", &json!({"id": soil.id})).unwrap()["fulltext"], "linked");
+        let found = find(json!({})).unwrap();
+        assert_eq!((found["checked"].as_u64(), found["saved"].as_u64(), found["notFound"].as_u64(), found["failed"].as_u64()), (Some(2), Some(1), Some(1), Some(0)));
+        let saved = found["papers"].as_array().unwrap().iter().find(|row| row["paperId"] == soil.id.as_str()).unwrap();
+        // Kept under the paper, named after it, with where it came from; its text could not be read, and that is said.
+        assert_eq!((saved["outcome"].as_str(), saved["source"].as_str(), saved["version"].as_str(), saved["textKind"].as_str()), (Some("saved"), Some("Springer"), Some("published"), Some("parser")));
+        let store = Store::open(&libraries::list(&root)[0].dir).unwrap();
+        let file = store.paper_files(&soil.id).unwrap().remove(0);
+        assert_eq!((file.title.as_str(), file.kind.as_str()), ("Zhu and Lee, 2021.pdf", "fulltext"));
+        assert_eq!(store.file_origins().unwrap()[&file.id], ("https://link.springer.com/content/pdf/10.1186/root-soil-1.pdf".to_string(), "Springer".to_string(), "published".to_string()));
+        assert!(found["papers"].as_array().unwrap().iter().any(|row| row["paperId"] == closed.id.as_str() && row["outcome"] == "not_found"));
+        // What stands in for a PDF is not kept as one.
+        let walled = |_: &str| -> Result<Vec<u8>, String> { Ok(b"<html>Sign in</html>".to_vec()) };
+        let again = store.paper_files(&closed.id).unwrap().len();
+        drop(store);
+        let mut store = Store::open(&libraries::list(&root)[0].dir).unwrap();
+        let third = store.add_paper(Paper { title: "Another".into(), doi: "10.1186/root-soil-2".into(), ..Default::default() }).unwrap();
+        drop(store);
+        let open = |_: &str| -> Result<String, String> { Ok(json!({"open_access": {"is_oa": true}, "best_oa_location": null, "locations": [], "resultList": {"result": []}}).to_string()) };
+        let failed = super::call(&root, "find_pdf", &json!({"paperId": third.id}), &open, &walled).unwrap();
+        assert_eq!((failed["failed"].as_u64(), again), (Some(1), 0));
+        assert!(failed["papers"][0]["reason"].as_str().unwrap().contains("返回的不是 PDF"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn citations_for_a_text() {
         let (root, id) = sample();
         assert_eq!(sentences("Roots grow (p < 0.05). 根尖有干细胞。WOX5 is key;\nDone"), ["Roots grow (p < 0.05).", "根尖有干细胞。", "WOX5 is key;", "Done"]);
@@ -1096,7 +1254,7 @@ pub(crate) mod tests {
     #[test]
     fn searches_from_trial_to_undo() {
         let (root, id) = sample();
-        let online = |name: &str, args: Value| super::call(&root, name, &args, &pubmed);
+        let online = |name: &str, args: Value| super::call(&root, name, &args, &pubmed, &no_download);
         // A trial writes nothing and says what the library already holds.
         let trial = online("search_online", json!({"source": "pubmed", "query": "root[Title]", "limit": 5})).unwrap();
         assert_eq!((trial["total"].as_u64(), trial["fetched"].as_u64(), trial["new"].as_u64(), trial["inLibrary"].as_u64()), (Some(88), Some(2), Some(1), Some(1)));
@@ -1164,8 +1322,8 @@ pub(crate) mod tests {
 
         // In a data folder: only libraries that update on their own, unless forced.
         let (root, _) = sample();
-        let online = |args: Value| super::call(&root, "sync_searches", &args, &pubmed);
-        super::call(&root, "save_search", &json!({"source": "pubmed", "query": "root[Title]"}), &pubmed).unwrap();
+        let online = |args: Value| super::call(&root, "sync_searches", &args, &pubmed, &no_download);
+        super::call(&root, "save_search", &json!({"source": "pubmed", "query": "root[Title]"}), &pubmed, &no_download).unwrap();
         assert_eq!(online(json!({})).unwrap(), json!({"runs": [], "added": 0, "failed": 0}));
         let mut info = find_library(&root, "").unwrap();
         info.auto_sync_hours = 24;
@@ -1276,7 +1434,7 @@ pub(crate) mod tests {
             // Only a tool that changes the library has anything to ask the person about.
             assert!(tool.writes || !tool.confirm, "{}", tool.name);
         }
-        assert_eq!(library_catalog().iter().filter(|tool| tool.confirm).map(|tool| tool.name).collect::<Vec<_>>().len(), 3);
+        assert_eq!(library_catalog().iter().filter(|tool| tool.confirm).map(|tool| tool.name).collect::<Vec<_>>().len(), 4);
         std::fs::remove_dir_all(root).ok();
     }
 }
