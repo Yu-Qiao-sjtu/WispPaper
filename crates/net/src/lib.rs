@@ -342,6 +342,44 @@ data: [DONE]\n\n",
     }
 
     #[test]
+    fn writing_intent_then_original_sentence_translation() {
+        let (base, server) = serve(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"english\\\":\\\"The mechanism remains unclear.\\\",\\\"keywords\\\":[\\\"mechanism\\\",\\\"unclear\\\"]}\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n",
+        );
+        let profile = Profile { protocol: Protocol::OpenAI, base_url: base, api_key: "test-key".into(), model: "mock-intent".into(), ..Default::default() };
+        let request = ai::plain_request(&profile, wisp_core::writing::INTENT_SYSTEM, "想表达机制尚不明确").unwrap();
+        let translated = complete(request, profile.protocol).unwrap();
+        assert!(server.join().unwrap().contains("想表达机制尚不明确"));
+        let intent = wisp_core::writing::SearchIntent::parse(&translated).unwrap();
+        let texts = ["The mechanism remains unclear.", "A separate topic about measurement."];
+        let ranked = wisp_core::structure::rank(&texts, &["a", "b"], &intent.query(), 1);
+        assert_eq!(ranked[0].0, 0);
+        let (base, server) = serve(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"该机制尚不明确。\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n",
+        );
+        let profile = Profile { base_url: base, ..profile };
+        let text = wisp_core::writing::sentence_translation_input("Synthetic title", texts[ranked[0].0]);
+        let prompt = wisp_core::writing::SENTENCE_TRANSLATION;
+        let translated = complete(ai::translate_request(&profile, prompt, &text).unwrap(), profile.protocol).unwrap();
+        assert_eq!(translated, "该机制尚不明确。");
+        let sent = server.join().unwrap();
+        assert!(sent.contains("The mechanism remains unclear."));
+        assert!(!sent.contains("A separate topic"));
+        let mut store = wisp_core::store::Store::in_memory(std::path::Path::new(".")).unwrap();
+        let key = wisp_core::store::translation_key(&text, prompt);
+        store.save_translation(&key, &translated, "mock-intent").unwrap();
+        assert_eq!(store.translation(&key).unwrap().as_deref(), Some("该机制尚不明确。"));
+        let other = wisp_core::store::translation_key(&wisp_core::writing::sentence_translation_input("Other paper", texts[0]), prompt);
+        assert!(store.translation(&other).unwrap().is_none());
+    }
+
+    #[test]
     fn tool_round_trip() {
         let (base, server) = serve(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
