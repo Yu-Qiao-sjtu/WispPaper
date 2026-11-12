@@ -4,8 +4,8 @@
 //! nothing about the user is sent. (The JSON API would say the same, but it
 //! is rate-limited per address and fails behind a shared one.)
 
-pub const PROJECT_URL: &str = "https://github.com/xuzhougeng/WispPaper";
-pub const RELEASES_URL: &str = "https://github.com/xuzhougeng/WispPaper/releases";
+pub const PROJECT_URL: &str = "https://github.com/Yu-Qiao-sjtu/WispPaper";
+pub const RELEASES_URL: &str = "https://github.com/Yu-Qiao-sjtu/WispPaper/releases";
 
 /// The address whose redirect names the newest release.
 pub fn latest_url() -> String {
@@ -56,11 +56,11 @@ mod tests {
 
     #[test]
     fn redirects() {
-        let release = release_from_location("https://github.com/xuzhougeng/WispPaper/releases/tag/v0.2.0").unwrap();
-        assert_eq!((release.version.as_str(), release.url.as_str()), ("0.2.0", "https://github.com/xuzhougeng/WispPaper/releases/tag/v0.2.0"));
-        assert_eq!(release_from_location("https://github.com/xuzhougeng/WispPaper/releases/tag/1.3").unwrap().version, "1.3");
+        let release = release_from_location("https://github.com/Yu-Qiao-sjtu/WispPaper/releases/tag/v0.2.0").unwrap();
+        assert_eq!((release.version.as_str(), release.url.as_str()), ("0.2.0", "https://github.com/Yu-Qiao-sjtu/WispPaper/releases/tag/v0.2.0"));
+        assert_eq!(release_from_location("https://github.com/Yu-Qiao-sjtu/WispPaper/releases/tag/1.3").unwrap().version, "1.3");
         // No release yet, another project, a tag that is not a version.
-        for location in ["https://github.com/xuzhougeng/WispPaper/releases", "https://github.com/someone/else/releases/tag/v9.0.0", "https://github.com/xuzhougeng/WispPaper/releases/tag/nightly", "https://github.com/xuzhougeng/WispPaper/releases/tag/v1.0/../../x", ""] {
+        for location in ["https://github.com/xuzhougeng/WispPaper/releases/tag/v9.9.9", "https://github.com/Yu-Qiao-sjtu/WispPaper/releases", "https://github.com/someone/else/releases/tag/v9.0.0", "https://github.com/Yu-Qiao-sjtu/WispPaper/releases/tag/nightly", "https://github.com/Yu-Qiao-sjtu/WispPaper/releases/tag/v1.0/../../x", ""] {
             assert_eq!(release_from_location(location), None, "{location}");
         }
     }

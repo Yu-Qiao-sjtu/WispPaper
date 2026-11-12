@@ -12,10 +12,13 @@
 # Environment: CARGO_TARGET_DIR is where cargo builds (default: target).
 
 param(
-    [switch]$Sign
+    [switch]$Sign,
+    # The fork's explicitly unsigned community package, with an in-package notice.
+    [switch]$ForkRelease
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Sign -and $ForkRelease) { throw 'Choose signed packaging or an explicitly unsigned fork package.' }
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
@@ -36,6 +39,14 @@ $name = "WispPaper-v$version-windows-x64"
 $dist = Join-Path $root 'dist'
 $folder = Join-Path $dist $name
 $zip = Join-Path $dist "$name.zip"
+# Every recursive cleanup target must stay inside this checkout's dist directory.
+$distAbsolute = [IO.Path]::GetFullPath($dist).TrimEnd([IO.Path]::DirectorySeparatorChar)
+foreach ($destination in @($folder, $zip)) {
+    $resolved = [IO.Path]::GetFullPath($destination)
+    if (-not $resolved.StartsWith($distAbsolute + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Packaging output escapes dist: $resolved"
+    }
+}
 if (Test-Path -LiteralPath $folder) { Remove-Item -LiteralPath $folder -Recurse -Force }
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 New-Item -ItemType Directory -Force -Path $folder | Out-Null
@@ -46,6 +57,28 @@ $cli = Join-Path $folder 'wisp.exe'
 Copy-Item -LiteralPath (Join-Path $release 'wisp_paper.exe') -Destination $app
 Copy-Item -LiteralPath (Join-Path $release 'wisp.exe') -Destination $cli
 Copy-Item -LiteralPath 'LICENSE', 'THIRD_PARTY.md', 'README.md' -Destination $folder
+if ($ForkRelease) {
+    $guide = Join-Path $folder 'docs'
+    New-Item -ItemType Directory -Path $guide | Out-Null
+    Copy-Item -LiteralPath 'docs/AI-WRITING.md', 'docs/DATA.md' -Destination $guide
+    $notice = @"
+Wisp Paper Fork v$version — Windows x64
+
+This is the Yu-Qiao-sjtu community fork, not an upstream signed build.
+WispPaper.exe and wisp.exe do not have an Authenticode signature.
+Download and verify SHA256SUMS from:
+https://github.com/Yu-Qiao-sjtu/WispPaper/releases/tag/v$version
+
+Extract the whole folder and run WispPaper.exe. The CLI is wisp.exe.
+Back up your literature library before first use. Settings and libraries
+use the existing WispPaper locations; WISP_PAPER_HOME can isolate a copy.
+
+Usage: docs/AI-WRITING.md
+Source and issues: https://github.com/Yu-Qiao-sjtu/WispPaper
+Upstream author/project: https://github.com/xuzhougeng/WispPaper
+"@
+    [IO.File]::WriteAllText((Join-Path $folder 'FORK-NOTICE.txt'), $notice, [Text.UTF8Encoding]::new($false))
+}
 
 if ($Sign) {
     $signer = Join-Path $PSScriptRoot 'sign-windows-esigner.ps1'

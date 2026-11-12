@@ -4,6 +4,8 @@
 
 <h1 align="center">Wisp Paper</h1>
 
+> **Yu-Qiao-sjtu Fork**：新增中文写作意图检索、原文与译文对照，以及可审阅的 AI 草稿写作。本 fork 的 v0.5.0 提供 **Windows x64 未签名便携包**，下载与反馈请使用[本仓库发布页](https://github.com/Yu-Qiao-sjtu/WispPaper/releases/latest)和[本仓库 Issues](https://github.com/Yu-Qiao-sjtu/WispPaper/issues)。原项目与作者见 [xuzhougeng/WispPaper](https://github.com/xuzhougeng/WispPaper)。
+
 <p align="center">
   <b>本地优先的文献库：收集、筛选、阅读，向你的文献提问。</b><br>
   用 Rust + GPUI 原生绘制。文献和 PDF 留在你的电脑上，每个文献库就是一个文件夹。
@@ -32,7 +34,7 @@
 </p>
 
 > [!NOTE]
-> Wisp Paper 还在早期，变化很快。界面只有中文。第一次用，可以跟着[教程](docs/TUTORIAL.md)从零建一个文献库。遇到问题或有想法，欢迎[提 issue](https://github.com/xuzhougeng/WispPaper/issues)，更欢迎直接发 pull request。
+> Wisp Paper 还在早期，变化很快。界面只有中文。第一次用，可以跟着[教程](docs/TUTORIAL.md)从零建一个文献库。本 fork 的问题与建议请[提 issue](https://github.com/Yu-Qiao-sjtu/WispPaper/issues)，也欢迎 pull request。
 
 ## 为什么是 Wisp Paper
 
@@ -46,21 +48,19 @@
 
 ## 安装
 
-从[发布页](https://github.com/xuzhougeng/WispPaper/releases/latest)下载：
+从[本 fork 发布页](https://github.com/Yu-Qiao-sjtu/WispPaper/releases/latest)下载：
 
 | 平台 | 文件 | 说明 |
 |---|---|---|
-| **macOS**，Apple 芯片 | `WispPaper-v<版本>-macos-arm64.dmg` | Developer ID 签名并经 Apple 公证。打开后把 Wisp Paper 拖进「应用程序」 |
-| **macOS**，Intel | `WispPaper-v<版本>-macos-x64.dmg` | 同上 |
-| **Windows** 10 / 11（x64） | `WispPaper-v<版本>-windows-x64.zip` | 解压后运行 `WispPaper.exe`，带 Authenticode 签名 |
-| **Linux**（x64） | `WispPaper-v<版本>-linux-x64.tar.gz` | 解压后运行 `wisp-paper`；没有签名，也没有在真机上测试过 |
+| **Windows** 10 / 11（x64） | `WispPaper-v0.5.0-windows-x64.zip` | 本 fork 构建，**没有 Authenticode 签名**；校验 SHA256SUMS，解压整个文件夹后运行 `WispPaper.exe` |
+| **macOS / Linux** | 本版未提供本 fork 安装包 | 上游发行版不包含本 fork 新增的写作功能；也可自行从本 fork 源码构建 |
 
 命令行工具 `wisp` 随包附带：Windows 和 Linux 在主程序旁边，macOS 在 `Wisp Paper.app/Contents/MacOS/wisp`。
 
 从源码构建需要 Rust（版本见 `rust-toolchain.toml`，rustup 会自动安装）；Windows 上还需要 MSVC 构建工具。
 
 ```sh
-git clone https://github.com/xuzhougeng/WispPaper
+git clone https://github.com/Yu-Qiao-sjtu/WispPaper
 cd WispPaper
 cargo run --release
 ```

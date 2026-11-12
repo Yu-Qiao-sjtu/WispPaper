@@ -901,7 +901,7 @@ impl Workspace {
             .child(group(
                 None,
                 vec![
-                    row("项目主页", Some("github.com/xuzhougeng/WispPaper".into()), open("about-project", "打开", update::PROJECT_URL.to_string(), self, cx)).into_any_element(),
+                    row("项目主页（Fork）", Some("github.com/Yu-Qiao-sjtu/WispPaper".into()), open("about-project", "打开", update::PROJECT_URL.to_string(), self, cx)).into_any_element(),
                     row("开源许可", Some("Wisp Paper 以 MIT 协议发布；随附的第三方组件见 THIRD_PARTY.md。".into()), open("about-license", "查看", format!("{}/blob/main/THIRD_PARTY.md", update::PROJECT_URL), self, cx)).into_any_element(),
                 ],
             ))

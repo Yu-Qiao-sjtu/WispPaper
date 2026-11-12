@@ -57,6 +57,8 @@ env:
 jobs:
   check:
     name: Version and signing secrets
+    # Fork releases use their own documented packaging route, never upstream credentials.
+    if: github.repository == 'xuzhougeng/WispPaper' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
