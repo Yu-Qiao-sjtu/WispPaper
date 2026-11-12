@@ -21,7 +21,7 @@ use wisp_core::model::*;
 pub(crate) use wisp_core::settings::default_root;
 use wisp_core::settings::{Settings, Task, settings_file};
 use wisp_core::store::{Conversation, ConversationInfo, ImportBatch, SavedSearch, Store, StructureInfo, Suggestion, TrashEntry, translation_key};
-use wisp_core::{export, fulltext, import, structure, time, tools, zotero};
+use wisp_core::{export, fulltext, import, structure, time, tools, writing, zotero};
 
 /// What the middle of an open library shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +276,11 @@ pub enum Cmd {
     /// Have the model sort the full texts into parts (false), or read the pages of the files that gave no text (true).
     WriteRun(bool),
     WriteStop,
+    /// Rewrite the current draft, then review before applying.
+    WriteGenerate,
+    WriteCancelGeneration,
+    WriteApplyProposal,
+    WriteRestoreOriginal,
     // Dialogs
     CloseModal,
     SubmitModal,
@@ -403,6 +408,10 @@ pub struct Writing {
     /// The part being written, a key of `structure::SECTIONS`.
     pub section: String,
     pub editor: Entity<TextInput>,
+    pub rules: Entity<TextInput>,
+    pub proposal: Option<writing::Proposal>,
+    pub generation: Option<String>,
+    pub generation_error: String,
     /// Words to look for, instead of what is being written.
     pub find: Entity<TextInput>,
     /// What the candidates on show were looked for: the part and the words.
@@ -1427,8 +1436,12 @@ impl Workspace {
                 }
             }
             Cmd::WriteSection(section) => {
+                if !writing::valid_section(&section) { return }
                 if let Some(lib) = self.lib.as_mut().filter(|l| l.writing.section != section) {
                     let draft = lib.store.drafts().ok().and_then(|mut drafts| drafts.remove(&section)).unwrap_or_default();
+                    lib.writing.generation = None;
+                    lib.writing.generation_error.clear();
+                    lib.writing.proposal = lib.store.writing_proposal(&section).unwrap_or_default();
                     lib.writing.section = section;
                     lib.writing.candidates = None;
                     lib.writing.editor.update(cx, |input, cx| input.set_text(&draft, cx));
@@ -1455,6 +1468,12 @@ impl Workspace {
                     sorting.working.clear();
                 }
             }
+            Cmd::WriteGenerate => self.writing_generate(cx),
+            Cmd::WriteCancelGeneration => {
+                if let Some(lib) = self.lib.as_mut() { lib.writing.generation = None }
+            }
+            Cmd::WriteApplyProposal => self.writing_apply(false, cx),
+            Cmd::WriteRestoreOriginal => self.writing_apply(true, cx),
             Cmd::SetFilter(key, value) => {
                 if let Some(lib) = self.lib.as_mut() {
                     let f = &mut lib.filters;
@@ -2080,7 +2099,16 @@ impl Workspace {
         let screen = Screen::new(&info.criteria, cx);
         let section = "introduction".to_string();
         let draft = store.drafts().ok().and_then(|mut drafts| drafts.remove(&section)).unwrap_or_default();
-        let editor = cx.new(|cx| TextInput::new("在这里写。右边会列出文献库里的文献在同一部分是怎么写的；中文也可以，先写下想表达的意思。", cx).multiline(14).with_text(&draft));
+        let editor = cx.new(|cx| TextInput::new("粘贴或写下这一部分的草稿，再点「AI 帮我写」。也可以直接编辑，草稿随写随存。", cx).multiline(14).with_text(&draft));
+        let rules_text = store.writing_rules().unwrap_or_default();
+        let rules = cx.new(|cx| TextInput::new("可选写作要求，例如：保留中文、简洁表达、引文紧邻对应论断。", cx).multiline(2).with_text(&rules_text));
+        subscriptions.push(cx.subscribe(&rules, |this, input, event: &InputEvent, cx| {
+            if *event != InputEvent::Changed { return }
+            let text = input.read(cx).text().to_string();
+            let saved = this.lib.as_mut().map(|lib| lib.store.save_writing_rules(&text));
+            if let Some(Err(err)) = saved { this.fail(format!("写作要求没有保存：{err:#}"), cx) }
+        }));
+        let proposal = store.writing_proposal(&section).unwrap_or_default();
         let find = cx.new(|cx| TextInput::new("找句子：输入词或短语，例如 remains unclear", cx));
         subscriptions.push(cx.subscribe(&editor, |this, input, event: &InputEvent, cx| {
             if *event != InputEvent::Changed { return }
@@ -2091,7 +2119,7 @@ impl Workspace {
         // The caret moving to another paragraph changes what is looked for, as typing does.
         subscriptions.push(cx.observe(&editor, |this, _, cx| this.writing_changed(cx)));
         subscriptions.push(cx.observe(&find, |this, _, cx| this.writing_changed(cx)));
-        let writing = Writing { section, editor, find, asked: None, words: String::new(), candidates: None, searching: false, round: 0, keywords: HashMap::new(), structures: BTreeMap::new(), sorting: Sorting::default(), scroll: ScrollHandle::new() };
+        let writing = Writing { section, editor, rules, proposal, generation: None, generation_error: String::new(), find, asked: None, words: String::new(), candidates: None, searching: false, round: 0, keywords: HashMap::new(), structures: BTreeMap::new(), sorting: Sorting::default(), scroll: ScrollHandle::new() };
         let mut lib = Library {
             info,
             store,
@@ -3392,6 +3420,69 @@ impl Workspace {
 
     // ---- writing
 
+    fn writing_generate(&mut self, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_for_or_default(Task::Chat);
+        let Some(lib) = self.lib.as_mut() else { return };
+        if lib.writing.generation.is_some() { return }
+        let draft = lib.writing.editor.read(cx).text().to_string();
+        let rules = lib.writing.rules.read(cx).text().to_string();
+        let candidates = lib.writing.candidates.as_ref().and_then(|result| result.as_ref().ok());
+        let planned = writing::WritingInput::new(&lib.writing.section, &draft, &rules, candidates)
+            .and_then(|input| ai::plain_request(&profile, writing::SYSTEM, &input.prompt()).map(|request| (input, request)));
+        let (input, request) = match planned {
+            Ok(planned) => planned,
+            Err(error) => { lib.writing.generation_error = error; return cx.notify() }
+        };
+        if let Err(error) = lib.store.save_draft(&input.section, &draft) {
+            lib.writing.generation_error = format!("原稿没有保存，未开始生成：{error:#}");
+            return cx.notify();
+        }
+        let token = new_id("W");
+        lib.writing.generation = Some(token.clone());
+        lib.writing.generation_error.clear();
+        let (library, protocol) = (lib.info.id.clone(), profile.protocol);
+        let model = format!("{} · {}", profile.title(), profile.model);
+        let work = cx.background_executor().spawn(async move {
+            wisp_net::complete(request, protocol).and_then(|reply| input.proposal(&reply, &model))
+        });
+        cx.spawn(async move |this, cx| {
+            let reply = work.await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|lib| lib.info.id == library && lib.writing.generation.as_ref() == Some(&token)) else { return };
+                lib.writing.generation = None;
+                match reply {
+                    Ok(proposal) => {
+                        match lib.store.save_writing_proposal(&proposal) {
+                            Ok(()) => lib.writing.proposal = Some(proposal),
+                            Err(error) => lib.writing.generation_error = format!("建议没有保存，原稿未改动：{error:#}"),
+                        }
+                    }
+                    Err(error) => lib.writing.generation_error = error,
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+        cx.notify();
+    }
+
+    fn writing_apply(&mut self, restore: bool, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut() else { return };
+        if lib.writing.generation.is_some() { return }
+        let current = lib.writing.editor.read(cx).text().to_string();
+        let section = lib.writing.section.clone();
+        let Some(proposal) = lib.writing.proposal.as_ref() else { return };
+        let result = if restore { lib.store.restore_writing_original(&section, &current, proposal) } else { lib.store.apply_writing_proposal(&section, &current, proposal) };
+        match result {
+            Ok(body) => {
+                lib.writing.proposal = lib.store.writing_proposal(&section).unwrap_or_default();
+                lib.writing.generation_error.clear();
+                lib.writing.editor.update(cx, |input, cx| input.set_text(&body, cx));
+            }
+            Err(error) => lib.writing.generation_error = format!("{error:#}"),
+        }
+        cx.notify();
+    }
+
     /// Look for candidates again when the part, the words looked for or
     /// what is being written has changed: a moment after the last change,
     /// so typing does not ask for every letter.
@@ -3890,6 +3981,14 @@ impl Workspace {
                 "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, "sources" => Page::Sources, "screen" => Page::Screen, "write" => Page::Write, _ => Page::Papers })),
                 // `write:methods` shows another part of the manuscript; `draft:<text>` leaves text in it, as if typed.
                 "write" => Some(Cmd::WriteSection(arg.to_string())),
+                "write-ai" => Some(Cmd::WriteGenerate),
+                "write-apply" => Some(Cmd::WriteApplyProposal),
+                "write-restore" => Some(Cmd::WriteRestoreOriginal),
+                "write-cancel" => Some(Cmd::WriteCancelGeneration),
+                "write-rules" => {
+                    if let Some(lib) = self.lib.as_ref() { lib.writing.rules.update(cx, |input, cx| input.set_text(arg, cx)) }
+                    return;
+                }
                 "draft" => {
                     if let Some(lib) = self.lib.as_ref() { lib.writing.editor.update(cx, |input, cx| input.insert(arg, cx)) }
                     return;

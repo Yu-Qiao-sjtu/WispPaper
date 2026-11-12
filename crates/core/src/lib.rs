@@ -40,4 +40,5 @@ pub mod structure;
 pub mod time;
 pub mod tools;
 pub mod update;
+pub mod writing;
 pub mod zotero;

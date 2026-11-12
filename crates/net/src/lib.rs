@@ -317,8 +317,30 @@ mod tests {
         step(base, protocol, &[user_message("你好")])
     }
 
-    /// One question answered in two steps: the model calls a tool, gets the
-    /// result, and answers. What matters is what the second request carries.
+    /// A real request to a loopback fake model, then the same proposal workflow used by the window.
+    #[test]
+    fn writing_proposal_from_mock_service_leaves_draft_untouched_until_accepted() {
+        let (base, server) = serve(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"body\\\":\\\"Revised draft.\\\",\\\"notes\\\":[]}\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n",
+        );
+        let input = wisp_core::writing::WritingInput::new("methods", "Draft.", "Keep the meaning.", None).unwrap();
+        let profile = Profile { protocol: Protocol::OpenAI, base_url: base, api_key: "test-key".into(), model: "mock-writing".into(), ..Default::default() };
+        let request = ai::plain_request(&profile, wisp_core::writing::SYSTEM, &input.prompt()).unwrap();
+        assert!(request.body.get("tools").is_none());
+        let reply = complete(request, profile.protocol).unwrap();
+        let sent = server.join().unwrap();
+        assert!(sent.contains("Keep the meaning."));
+        let proposal = input.proposal(&reply, "mock-writing").unwrap();
+        let mut store = wisp_core::store::Store::in_memory(std::path::Path::new(".")).unwrap();
+        store.save_draft("methods", "Draft.").unwrap();
+        store.save_writing_proposal(&proposal).unwrap();
+        assert_eq!(store.drafts().unwrap()["methods"], "Draft.");
+        assert_eq!(store.apply_writing_proposal("methods", "Draft.", &proposal).unwrap(), "Revised draft.");
+    }
+
     #[test]
     fn tool_round_trip() {
         let (base, server) = serve(

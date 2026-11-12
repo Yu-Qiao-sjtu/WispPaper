@@ -49,9 +49,10 @@ impl Workspace {
                     .pt(px(16.))
                     .pb(px(12.))
                     .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child("写作"))
-                    .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("写哪一部分，右边就列出文献库里的文献在这一部分的句子：先看别人怎么写，再写自己的。句子是用来参考和引用的，不要照抄。"))
+                    .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("提供草稿，让 AI 帮你改写或扩写；检查建议后直接采用。右侧文献句子用于参考与引用，不能替代你自己的结果。"))
                     .child(div().flex().items_center().flex_wrap().gap(px(6.)).children(parts)),
             )
+            .child(self.render_writing_ai(cx))
             .child(
                 div().flex().flex_col().flex_1().min_h_0().px(px(20.)).pb(px(8.)).child(
                     div()
@@ -66,9 +67,56 @@ impl Workspace {
                         .child(div().px(px(18.)).py(px(14.)).text_size(px(15.)).line_height(px(26.)).text_color(Theme::text()).child(writing.editor.clone())),
                 ),
             )
+            .children(writing.proposal.as_ref().map(|proposal| self.render_writing_proposal(proposal, cx)))
             .child(div().flex().flex_none().items_center().px(px(22.)).pb(px(12.)).text_size(px(11.)).text_color(Theme::text_tertiary()).child(if characters == 0 { "草稿随写随存，留在这个文献库里。".to_string() } else { format!("{words} 词 · {characters} 字符 · 已保存") }));
 
         div().flex().size_full().child(editor).child(self.render_candidates(panel, window, cx)).into_any_element()
+    }
+
+    fn render_writing_ai(&self, cx: &mut Context<Self>) -> Div {
+        let writing = &self.lib.as_ref().unwrap().writing;
+        let profile = self.settings.profile_for_or_default(Task::Chat);
+        let busy = writing.generation.is_some();
+        div().flex().flex_col().flex_none().gap(px(6.)).px(px(20.)).pb(px(10.))
+            .child(div().text_size(px(12.)).text_color(Theme::text_secondary()).child("写作要求（可选，随本库保存）"))
+            .child(div().id("write-rules-scroll").max_h(px(90.)).overflow_y_scroll().border_1().border_color(Theme::line()).rounded(px(8.)).px(px(10.)).py(px(6.)).text_size(px(12.)).child(writing.rules.clone()))
+            .child(div().flex().items_center().gap(px(8.))
+                .child(if busy {
+                    ui::secondary_button("write-cancel-generation", "停止等待").on_click(self.on(Cmd::WriteCancelGeneration, cx)).into_any_element()
+                } else {
+                    ui::primary_button("write-generate", "AI 帮我写").on_click(self.on(Cmd::WriteGenerate, cx)).into_any_element()
+                })
+                .when(busy, |row| row.child(ui::spinner("write-generating", 13., Theme::accent())))
+                .child(div().flex_1().text_size(px(11.)).text_color(Theme::text_tertiary()).child(format!("{} · {}", profile.title(), profile.model))))
+            .child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child(if busy { "正在生成，原稿不变。停止等待不一定能停止服务端请求；切换章节会忽略本次结果。" } else { "发送当前章节草稿、写作要求及最多 12 条参考句；使用设置中的提问模型。生成不会自动覆盖原稿。" }))
+            .when(!writing.generation_error.is_empty(), |panel| panel.child(ui::error_line(&writing.generation_error)))
+    }
+
+    fn render_writing_proposal(&self, proposal: &wisp_core::writing::Proposal, cx: &mut Context<Self>) -> Div {
+        let writing = &self.lib.as_ref().unwrap().writing;
+        let current = writing.editor.read(cx).text();
+        let ready = writing.generation.is_none() && if proposal.applied { proposal.check_restore(current).is_ok() } else { proposal.check_apply(current).is_ok() };
+        let action = if proposal.applied { Cmd::WriteRestoreOriginal } else { Cmd::WriteApplyProposal };
+        let label = if proposal.applied { "恢复生成前原稿" } else { "采用建议" };
+        let rows = proposal.body.lines().map(|line| div().text_size(px(13.)).line_height(px(21.)).child(line.to_string()));
+        let notes = proposal.notes.iter().map(|note| div().text_size(px(11.)).text_color(Theme::text_secondary()).child(note.clone()));
+        let sources: Vec<_> = proposal.input.evidence.iter().enumerate().map(|(n, source)| {
+            ui::ghost_button(("write-evidence", n), None, Some(format!("{} · {}", source.citation, source.page.map_or("摘要".to_string(), |page| format!("第 {page} 页"))).into()))
+                .on_click(self.on(Cmd::GotoSource(source.paper_id.clone(), source.page, source.text.clone()), cx))
+        }).collect();
+        div().flex().flex_col().flex_none().max_h(px(320.)).mx(px(20.)).mb(px(8.)).border_1().border_color(Theme::line_strong()).rounded(px(8.))
+            .child(div().flex().flex_wrap().items_center().gap(px(6.)).p(px(8.))
+                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(if proposal.applied { "已采用的 AI 建议" } else { "AI 建议 · 原稿尚未改动" }))
+                .child(div().flex_1())
+                .child(ui::secondary_button("write-apply-proposal", label).when(!ready, |button| button.opacity(0.4)).when(ready, |button| button.on_click(self.on(action, cx))))
+                .child(ui::ghost_button("write-copy-proposal", None, Some("复制建议".into())).on_click(self.on(Cmd::CopyText(proposal.body.clone()), cx)))
+                .child(ui::ghost_button("write-copy-original", None, Some("复制原稿".into())).on_click(self.on(Cmd::CopyText(proposal.input.original.clone()), cx))))
+            .child(div().id("write-proposal-preview").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(7.)).px(px(12.)).pb(px(10.))
+                .when(!ready && writing.generation.is_none(), |panel| panel.child(ui::error_line("正文已变化，不能直接覆盖。可复制建议 / 原稿，或基于当前草稿重新生成。")))
+                .children(rows)
+                .child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child(format!("{} · 本次提供 {} 条参考句", proposal.model, proposal.input.evidence.len())))
+                .children(notes)
+                .child(div().flex().flex_wrap().gap(px(4.)).children(sources)))
     }
 
     /// The panel beside the manuscript: what there is to draw on, and the candidates.
