@@ -131,6 +131,7 @@ pub enum Cmd {
     AddManual,
     ImportReferences,
     ImportPdfs,
+    ImportFolder,
     /// Show what came of each file of the last import.
     ShowImport,
     /// Put the report of the last import away.
@@ -1143,6 +1144,7 @@ impl Workspace {
             MenuKind::Add => {
                 items.push(item("通过 DOI / PMID 添加…", Cmd::AddById));
                 items.push(item("导入 PDF 文件…", Cmd::ImportPdfs));
+                items.push(item("导入文件夹…", Cmd::ImportFolder));
                 items.push(item("导入 BibTeX / RIS…", Cmd::ImportReferences));
                 items.push(item("手动录入…", Cmd::AddManual));
             }
@@ -1324,6 +1326,7 @@ impl Workspace {
             Cmd::EditPaper(id) => self.paper_dialog(Some(id), window, cx),
             Cmd::ImportReferences => self.pick_files("导入", false, cx),
             Cmd::ImportPdfs => self.pick_files("导入", true, cx),
+            Cmd::ImportFolder => self.pick_folders(cx),
             Cmd::ShowImport => {
                 self.modal_subscriptions.clear();
                 self.modal_error.clear();
@@ -2254,6 +2257,17 @@ impl Workspace {
         .detach();
     }
 
+    /// Folders picked: every PDF under them, tagged with the folders it lies in.
+    fn pick_folders(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: true, prompt: Some("导入".into()), extensions: None });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picked.await {
+                this.update(cx, |this, cx| this.import_paths(paths, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
     fn pick_attachment(&mut self, paper_id: String, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("添加".into()), extensions: None });
         cx.spawn(async move |this, cx| {
@@ -2284,10 +2298,28 @@ impl Workspace {
         .detach();
     }
 
-    /// Files picked or dropped: PDFs become papers, reference files are imported.
+    /// Files picked or dropped: PDFs become papers, reference files are
+    /// imported, and a folder gives every PDF under it, tagged with the
+    /// folders between it and the file (`import::folder_pdfs`).
     pub fn import_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if self.lib.is_none() { return self.fail("请先打开一个文献库，再拖入文件。", cx) }
-        let (pdfs, others): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")));
+        let mut pdfs: Vec<(PathBuf, Vec<String>)> = vec![];
+        let mut others = vec![];
+        let mut empty_folders = vec![];
+        for path in paths {
+            if path.is_dir() {
+                let found = import::folder_pdfs(&path);
+                if found.is_empty() { empty_folders.push(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()) }
+                pdfs.extend(found);
+            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+                pdfs.push((path, vec![]));
+            } else {
+                others.push(path);
+            }
+        }
+        if !empty_folders.is_empty() && pdfs.is_empty() && others.is_empty() {
+            return self.fail(format!("文件夹「{}」里没有 PDF。", empty_folders.join("」「")), cx);
+        }
         let mut added = vec![];
         let mut skipped = 0;
         let mut errors = vec![];
@@ -2329,7 +2361,7 @@ impl Workspace {
             let (queue, library) = (queue.clone(), library.clone());
             cx.spawn(async move |this, cx| {
                 loop {
-                    let Some(path) = queue.borrow_mut().pop() else { break };
+                    let Some((path, tags)) = queue.borrow_mut().pop() else { break };
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let known = this.update(cx, |this, cx| {
                         let Some(run) = this.lib.as_mut().filter(|l| l.info.id == library).and_then(|l| l.import.as_mut()) else { return false };
@@ -2351,7 +2383,7 @@ impl Workspace {
                         .await;
                     let done = this.update(cx, |this, cx| {
                         if this.lib.as_ref().is_none_or(|l| l.info.id != library) { return false }
-                        this.add_pdf(&path, pages, found, cx);
+                        this.add_pdf(&path, &tags, pages, found, cx);
                         true
                     });
                     if !matches!(done, Ok(true)) { break }
@@ -2364,12 +2396,15 @@ impl Workspace {
     /// One read PDF: a new paper with the file attached, or the file attached
     /// to the paper the library already holds for its DOI. What came of it
     /// joins the import's report; a single file says so at once instead.
-    fn add_pdf(&mut self, path: &std::path::Path, pages: Result<Vec<String>, String>, found: Option<Paper>, cx: &mut Context<Self>) {
+    /// `tags` (the folders the file lay in) go to the paper, a paper already
+    /// held included.
+    fn add_pdf(&mut self, path: &std::path::Path, tags: &[String], pages: Result<Vec<String>, String>, found: Option<Paper>, cx: &mut Context<Self>) {
         let Some(lib) = self.lib.as_mut() else { return };
         let stem = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "未命名文献".into());
         let recognised = found.is_some();
         let mut paper = found.unwrap_or_else(|| Paper { title: stem.clone(), ..Default::default() });
         paper.source = "PDF 导入".into();
+        paper.tags = clean_strings(paper.tags.iter().chain(tags));
         let mut row = ImportRow { name: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| stem.clone()), outcome: Imported::Added, paper_id: None, unrecognised: false, textless: String::new() };
         let stored = (|| -> anyhow::Result<()> {
             let target = match lib.store.existing_paper(&{
@@ -2383,6 +2418,11 @@ impl Workspace {
                         return Ok(());
                     }
                     row.outcome = Imported::Attached;
+                    let mut held = lib.store.get_paper(&existing)?;
+                    if tags.iter().any(|tag| !held.tags.contains(tag)) {
+                        held.tags = clean_strings(held.tags.iter().chain(tags));
+                        lib.store.save_paper(&mut held)?;
+                    }
                     existing
                 }
                 None => {
@@ -3770,11 +3810,10 @@ impl Workspace {
                     if let Some(lib) = self.lib.as_ref() { lib.writing.editor.update(cx, |input, cx| input.insert(arg, cx)) }
                     return;
                 }
-                // `import:<folder>` takes in every PDF of a folder, as if they were dropped on the window.
+                // `import:<folder>` takes in every PDF under a folder, as if it were dropped on the window:
+                // the folders below it become tags.
                 "import" => {
-                    let mut paths: Vec<PathBuf> = std::fs::read_dir(arg).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))).collect();
-                    paths.sort();
-                    self.import_paths(paths, cx);
+                    self.import_paths(vec![PathBuf::from(arg)], cx);
                     return;
                 }
                 // `shot:<file.png>` writes the window as it is drawn to a picture, without the screen:
