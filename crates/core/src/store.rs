@@ -213,6 +213,14 @@ CREATE TABLE IF NOT EXISTS drafts (
     body TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS writing_preferences (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    rules TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS writing_proposals (
+    section TEXT PRIMARY KEY NOT NULL,
+    payload TEXT NOT NULL
+);
 
 -- Where a file that was fetched came from: the address, who listed it, which version it is.
 CREATE TABLE IF NOT EXISTS file_origins (
@@ -1086,6 +1094,57 @@ impl Store {
         Ok(())
     }
 
+    pub fn writing_rules(&self) -> Result<String> {
+        Ok(self.db.query_row("SELECT rules FROM writing_preferences WHERE id = 1", [], |row| row.get(0)).optional()?.unwrap_or_default())
+    }
+
+    pub fn save_writing_rules(&mut self, rules: &str) -> Result<()> {
+        self.db.execute("INSERT INTO writing_preferences(id, rules) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET rules = excluded.rules", [rules])?;
+        Ok(())
+    }
+
+    pub fn writing_proposal(&self, section: &str) -> Result<Option<crate::writing::Proposal>> {
+        let raw: Option<String> = self.db.query_row("SELECT payload FROM writing_proposals WHERE section = ?1", [section], |row| row.get(0)).optional()?;
+        raw.map(|text| serde_json::from_str(&text).context("无法读取 AI 写作建议")).transpose()
+    }
+
+    pub fn save_writing_proposal(&mut self, proposal: &crate::writing::Proposal) -> Result<()> {
+        if !crate::writing::valid_section(&proposal.input.section) { bail!("没有这个写作部分。") }
+        self.db.execute("INSERT INTO writing_proposals(section, payload) VALUES (?1, ?2) ON CONFLICT(section) DO UPDATE SET payload = excluded.payload", params![proposal.input.section, serde_json::to_string(proposal)?])?;
+        Ok(())
+    }
+
+    /// Both the editor and persisted draft must still match the generation snapshot.
+    pub fn apply_writing_proposal(&mut self, section: &str, editor: &str, expected: &crate::writing::Proposal) -> Result<String> {
+        let tx = self.db.transaction()?;
+        let raw: String = tx.query_row("SELECT payload FROM writing_proposals WHERE section = ?1", [section], |row| row.get(0))?;
+        let mut proposal: crate::writing::Proposal = serde_json::from_str(&raw)?;
+        if &proposal != expected || proposal.input.section != section { bail!("建议记录已变化，请重新打开这一部分再审阅。") }
+        proposal.check_apply(editor).map_err(|error| anyhow!(error))?;
+        let current: String = tx.query_row("SELECT body FROM drafts WHERE section = ?1", [section], |row| row.get(0)).optional()?.unwrap_or_default();
+        proposal.check_apply(&current).map_err(|error| anyhow!(error))?;
+        proposal.applied = true;
+        tx.execute("UPDATE drafts SET body = ?2, updated_at = ?3 WHERE section = ?1", params![section, proposal.body, now_iso()])?;
+        tx.execute("UPDATE writing_proposals SET payload = ?2 WHERE section = ?1", params![section, serde_json::to_string(&proposal)?])?;
+        tx.commit()?;
+        Ok(proposal.body)
+    }
+
+    pub fn restore_writing_original(&mut self, section: &str, editor: &str, expected: &crate::writing::Proposal) -> Result<String> {
+        let tx = self.db.transaction()?;
+        let raw: String = tx.query_row("SELECT payload FROM writing_proposals WHERE section = ?1", [section], |row| row.get(0))?;
+        let mut proposal: crate::writing::Proposal = serde_json::from_str(&raw)?;
+        if &proposal != expected || proposal.input.section != section { bail!("建议记录已变化，请重新打开这一部分再审阅。") }
+        proposal.check_restore(editor).map_err(|error| anyhow!(error))?;
+        let current: String = tx.query_row("SELECT body FROM drafts WHERE section = ?1", [section], |row| row.get(0))?;
+        proposal.check_restore(&current).map_err(|error| anyhow!(error))?;
+        proposal.applied = false;
+        tx.execute("UPDATE drafts SET body = ?2, updated_at = ?3 WHERE section = ?1", params![section, proposal.input.original, now_iso()])?;
+        tx.execute("UPDATE writing_proposals SET payload = ?2 WHERE section = ?1", params![section, serde_json::to_string(&proposal)?])?;
+        tx.commit()?;
+        Ok(proposal.input.original)
+    }
+
     /// Every extracted full text, by paper id: (file, pages).
     /// The full-text files that gave no text, with why: (file, paper, reason).
     /// A paper that has another file with text is not among them.
@@ -1510,6 +1569,55 @@ mod tests {
         assert!(!store.file_path(&file).exists());
         assert!(dir.join("removed").read_dir().unwrap().count() == 1);
         assert!(store.list_files().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn writing_proposal_survives_reopen_and_applies_atomically() {
+        let dir = temp_dir("writing");
+        let mut store = Store::open(&dir).unwrap();
+        store.save_draft("methods", "原始草稿 12。").unwrap();
+        store.save_draft("results", "另一部分").unwrap();
+        store.save_writing_rules("保留中文与数值").unwrap();
+        let proposal = crate::writing::WritingInput::new("methods", "原始草稿 12。", "保留中文与数值", None).unwrap()
+            .proposal(r#"{"body":"改写后的正文 12。","notes":["核对方法细节"]}"#, "mock-model").unwrap();
+        store.save_writing_proposal(&proposal).unwrap();
+        drop(store);
+        let mut store = Store::open(&dir).unwrap();
+        assert_eq!(store.writing_rules().unwrap(), "保留中文与数值");
+        assert_eq!(store.writing_proposal("methods").unwrap(), Some(proposal.clone()));
+        assert_eq!(store.drafts().unwrap()["methods"], "原始草稿 12。");
+        // A competing writer changes the persisted draft, while the window still shows the old one.
+        store.save_draft("methods", "外部修改").unwrap();
+        assert!(store.apply_writing_proposal("methods", "原始草稿 12。", &proposal).is_err());
+        assert!(!store.writing_proposal("methods").unwrap().unwrap().applied);
+        assert_eq!(store.drafts().unwrap()["methods"], "外部修改");
+        store.save_draft("methods", "原始草稿 12。").unwrap();
+        assert!(store.apply_writing_proposal("methods", "窗口新写的内容", &proposal).is_err());
+        // A newer suggestion for the same draft cannot be accepted through an old preview.
+        let mut other = proposal.clone();
+        other.body = "另一份未审阅建议".into();
+        store.save_writing_proposal(&other).unwrap();
+        assert!(store.apply_writing_proposal("methods", "原始草稿 12。", &proposal).is_err());
+        store.save_writing_proposal(&proposal).unwrap();
+        assert_eq!(store.apply_writing_proposal("methods", "原始草稿 12。", &proposal).unwrap(), proposal.body);
+        assert!(store.writing_proposal("methods").unwrap().unwrap().applied);
+        assert!(store.apply_writing_proposal("methods", &proposal.body, &proposal).is_err());
+        let applied = store.writing_proposal("methods").unwrap().unwrap();
+        assert!(store.restore_writing_original("methods", "采用后又手改", &applied).is_err());
+        assert_eq!(store.restore_writing_original("methods", &proposal.body, &applied).unwrap(), proposal.input.original);
+        assert_eq!(store.drafts().unwrap()["methods"], proposal.input.original);
+        assert_eq!(store.drafts().unwrap()["results"], "另一部分");
+        drop(store);
+        // An older-shaped database picks up the two new tables idempotently on open.
+        let connection = Connection::open(dir.join(DB_FILE)).unwrap();
+        connection.execute_batch("DROP TABLE writing_preferences; DROP TABLE writing_proposals;").unwrap();
+        drop(connection);
+        let store = Store::open(&dir).unwrap();
+        assert!(store.writing_rules().unwrap().is_empty());
+        assert!(store.writing_proposal("methods").unwrap().is_none());
+        assert_eq!(store.drafts().unwrap()["methods"], "原始草稿 12。");
+        drop(store);
         std::fs::remove_dir_all(dir).ok();
     }
 }

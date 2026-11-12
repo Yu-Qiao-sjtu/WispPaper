@@ -1,12 +1,9 @@
-//! 写作: the manuscript on the left, one part at a time, and on the right
-//! the sentences the library's papers have in the same part: how they open
-//! it while nothing is written yet, then those closest to the paragraph
-//! being written. A sentence can be cited, copied, or looked at where it
-//! stands in its PDF. The panel also says how much of the library there is
-//! to draw on, and lets a model sort the full texts into parts or read the
-//! pages of files that gave no text.
+//! Draft-first writing and explicit intent search. Chinese input becomes
+//! a reviewable English search expression, matched to stored sentences.
+//! Selecting a candidate opens its source and a cached Chinese translation
+//! without changing the draft. AI rewriting remains a separate action.
 
-use crate::app::{Cmd, Workspace};
+use crate::app::{Cmd, Translated, Workspace};
 use crate::settings::SettingsPage;
 use crate::theme::Theme;
 use crate::ui;
@@ -15,6 +12,7 @@ use serde_json::Value;
 use wisp_core::model::label;
 use wisp_core::settings::Task;
 use wisp_core::structure::SECTIONS;
+use wisp_core::{store::translation_key, writing};
 
 /// The parts a manuscript is written in: `SECTIONS` without the catch-all.
 const PARTS: usize = 5;
@@ -49,9 +47,10 @@ impl Workspace {
                     .pt(px(16.))
                     .pb(px(12.))
                     .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child("写作"))
-                    .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("写哪一部分，右边就列出文献库里的文献在这一部分的句子：先看别人怎么写，再写自己的。句子是用来参考和引用的，不要照抄。"))
+                    .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("用中文写下想表达的意思，点「寻找语料」匹配英文原句；点击候选句对照论文原文和译文。需要改写草稿时，可另用「AI 帮我写」。"))
                     .child(div().flex().items_center().flex_wrap().gap(px(6.)).children(parts)),
             )
+            .child(self.render_writing_ai(cx))
             .child(
                 div().flex().flex_col().flex_1().min_h_0().px(px(20.)).pb(px(8.)).child(
                     div()
@@ -66,9 +65,57 @@ impl Workspace {
                         .child(div().px(px(18.)).py(px(14.)).text_size(px(15.)).line_height(px(26.)).text_color(Theme::text()).child(writing.editor.clone())),
                 ),
             )
+            .children(writing.proposal.as_ref().map(|proposal| self.render_writing_proposal(proposal, cx)))
             .child(div().flex().flex_none().items_center().px(px(22.)).pb(px(12.)).text_size(px(11.)).text_color(Theme::text_tertiary()).child(if characters == 0 { "草稿随写随存，留在这个文献库里。".to_string() } else { format!("{words} 词 · {characters} 字符 · 已保存") }));
 
         div().flex().size_full().child(editor).child(self.render_candidates(panel, window, cx)).into_any_element()
+    }
+
+    fn render_writing_ai(&self, cx: &mut Context<Self>) -> Div {
+        let writing = &self.lib.as_ref().unwrap().writing;
+        let profile = self.settings.profile_for_or_default(Task::Chat);
+        let busy = writing.generation.is_some();
+        div().flex().flex_col().flex_none().gap(px(6.)).px(px(20.)).pb(px(10.))
+            .child(div().text_size(px(12.)).text_color(Theme::text_secondary()).child("写作要求（可选，随本库保存）"))
+            .child(div().id("write-rules-scroll").max_h(px(90.)).overflow_y_scroll().border_1().border_color(Theme::line()).rounded(px(8.)).px(px(10.)).py(px(6.)).text_size(px(12.)).child(writing.rules.clone()))
+            .child(div().flex().items_center().gap(px(8.))
+                .child(ui::primary_button("write-find-from-draft", "寻找语料").on_click(self.on(Cmd::WriteFind, cx)))
+                .child(if busy {
+                    ui::secondary_button("write-cancel-generation", "停止等待").on_click(self.on(Cmd::WriteCancelGeneration, cx)).into_any_element()
+                } else {
+                    ui::secondary_button("write-generate", "AI 帮我写").on_click(self.on(Cmd::WriteGenerate, cx)).into_any_element()
+                })
+                .when(busy, |row| row.child(ui::spinner("write-generating", 13., Theme::accent())))
+                .child(div().flex_1().text_size(px(11.)).text_color(Theme::text_tertiary()).child(format!("改写模型：{} · {}", profile.title(), profile.model))))
+            .child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child(if busy { "正在生成，原稿不变。停止等待不一定能停止服务端请求；切换章节会忽略本次结果。" } else { "改写使用提问模型，发送当前草稿、写作要求及至多 12 条已匹配当前输入的参考句；寻找仅检索，不改稿。" }))
+            .when(!writing.generation_error.is_empty(), |panel| panel.child(ui::error_line(&writing.generation_error)))
+    }
+
+    fn render_writing_proposal(&self, proposal: &wisp_core::writing::Proposal, cx: &mut Context<Self>) -> Div {
+        let writing = &self.lib.as_ref().unwrap().writing;
+        let current = writing.editor.read(cx).text();
+        let ready = writing.generation.is_none() && if proposal.applied { proposal.check_restore(current).is_ok() } else { proposal.check_apply(current).is_ok() };
+        let action = if proposal.applied { Cmd::WriteRestoreOriginal } else { Cmd::WriteApplyProposal };
+        let label = if proposal.applied { "恢复生成前原稿" } else { "采用建议" };
+        let rows = proposal.body.lines().map(|line| div().text_size(px(13.)).line_height(px(21.)).child(line.to_string()));
+        let notes = proposal.notes.iter().map(|note| div().text_size(px(11.)).text_color(Theme::text_secondary()).child(note.clone()));
+        let sources: Vec<_> = proposal.input.evidence.iter().enumerate().map(|(n, source)| {
+            ui::ghost_button(("write-evidence", n), None, Some(format!("{} · {}", source.citation, source.page.map_or("摘要".to_string(), |page| format!("第 {page} 页"))).into()))
+                .on_click(self.on(Cmd::GotoSource(source.paper_id.clone(), source.page, source.text.clone()), cx))
+        }).collect();
+        div().flex().flex_col().flex_none().max_h(px(320.)).mx(px(20.)).mb(px(8.)).border_1().border_color(Theme::line_strong()).rounded(px(8.))
+            .child(div().flex().flex_wrap().items_center().gap(px(6.)).p(px(8.))
+                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(if proposal.applied { "已采用的 AI 建议" } else { "AI 建议 · 原稿尚未改动" }))
+                .child(div().flex_1())
+                .child(ui::secondary_button("write-apply-proposal", label).when(!ready, |button| button.opacity(0.4)).when(ready, |button| button.on_click(self.on(action, cx))))
+                .child(ui::ghost_button("write-copy-proposal", None, Some("复制建议".into())).on_click(self.on(Cmd::CopyText(proposal.body.clone()), cx)))
+                .child(ui::ghost_button("write-copy-original", None, Some("复制原稿".into())).on_click(self.on(Cmd::CopyText(proposal.input.original.clone()), cx))))
+            .child(div().id("write-proposal-preview").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(7.)).px(px(12.)).pb(px(10.))
+                .when(!ready && writing.generation.is_none(), |panel| panel.child(ui::error_line("正文已变化，不能直接覆盖。可复制建议 / 原稿，或基于当前草稿重新生成。")))
+                .children(rows)
+                .child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child(format!("{} · 本次提供 {} 条参考句", proposal.model, proposal.input.evidence.len())))
+                .children(notes)
+                .child(div().flex().flex_wrap().gap(px(4.)).children(sources)))
     }
 
     /// The panel beside the manuscript: what there is to draw on, and the candidates.
@@ -76,17 +123,16 @@ impl Workspace {
         let lib = self.lib.as_ref().unwrap();
         let writing = &lib.writing;
         let name = label(&SECTIONS, &writing.section);
-        let asked = writing.find.read(cx).text().trim().to_string();
+        let translation_model = self.settings.profile_for_or_default(Task::Translate);
         let found = writing.candidates.as_ref().and_then(|result| result.as_ref().ok());
         let sentences: &[Value] = found.and_then(|value| value["sentences"].as_array()).map_or(&[], Vec::as_slice);
-        let query = found.and_then(|value| value["query"].as_str()).unwrap_or("");
-        let heading = if !asked.is_empty() {
-            "含有这些词的句子"
-        } else if query.is_empty() {
+        let query = writing.searched.as_ref().map(|(_, query)| query.as_str()).unwrap_or("");
+        let heading = if query.is_empty() {
             "各篇文献这一部分的开头"
         } else {
-            "与正在写的这一段相近的句子"
+            "匹配的文献原句 · 点击查看原文与中文翻译"
         };
+        let changed = writing.searched.as_ref() != writing.asked.as_ref();
         let drawn_on = found.map(|value| {
             let (count, papers, without) = (value["sentencesInSection"].as_u64().unwrap_or(0), value["papersWithSection"].as_u64().unwrap_or(0), value["papersWithout"].as_u64().unwrap_or(0));
             format!("{papers} 篇文献的 {count} 句{}", if without > 0 { format!(" · {without} 篇没有{name}可查") } else { String::new() })
@@ -133,8 +179,15 @@ impl Workspace {
                             .child(div().flex_1())
                             .children(drawn_on.map(|text| div().flex_none().text_size(px(11.)).text_color(Theme::text_tertiary()).child(text))),
                     )
-                    .child(ui::field(&writing.find, window, cx))
-                    .when(!writing.words.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child(format!("按英文关键词查找：{}", writing.words))))
+                    .child(div().flex().items_center().gap(px(6.))
+                        .child(div().flex_1().min_w_0().child(ui::field(&writing.find, window, cx)))
+                        .child(ui::primary_button("write-find", if writing.searching { "重新寻找" } else { "寻找" }).on_click(self.on(Cmd::WriteFind, cx))))
+                    .child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child("留空时使用中间光标所在段落；输入不会自动调用模型。"))
+                    .child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child(format!("意图与译句模型：{} · {}", translation_model.title(), translation_model.model)))
+                    .when(changed && !writing.searching, |d| d.child(div().text_size(px(11.)).text_color(Theme::text_secondary()).child("输入或语料已变化，请点「寻找」更新。")))
+                    .children(writing.intent.as_ref().map(|intent| div().flex().flex_col().gap(px(3.))
+                        .child(div().text_size(px(11.)).text_color(Theme::text_secondary()).child(format!("英文检索表达：{}", intent.english)))
+                        .when(!intent.keywords.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child(format!("关键词：{}", intent.keywords.join(" · ")))))))
                     .child(self.render_groundwork(cx)),
             )
             .child(div().flex_none().px(px(14.)).pb(px(6.)).text_size(px(11.)).text_color(Theme::text_tertiary()).child(heading))
@@ -149,7 +202,11 @@ impl Workspace {
         let field = |key: &str| sentence[key].as_str().unwrap_or("").to_string();
         let (paper, text, cite) = (field("paperId"), field("text"), field("cite"));
         let page = sentence["page"].as_u64().map(|page| page as usize);
-        // Known by what it shows: the list is found anew with every sentence written.
+        let selected = self.lib.as_ref().unwrap().writing.selected_candidate.as_ref() == Some(sentence);
+        let translation_text = writing::sentence_translation_input(&field("title"), &text);
+        let key = translation_key(&translation_text, writing::SENTENCE_TRANSLATION);
+        let translation = self.lib.as_ref().unwrap().translations.get(&key);
+        // Stable across redraws, specific to the actual stored source sentence.
         let id = |part: &str| SharedString::from(format!("write-{part}-{paper}-{}-{n}", sentence["position"].as_u64().unwrap_or(0)));
         let mut about = vec![cite.clone(), field("journal"), page.map(|page| format!("第 {page} 页")).unwrap_or_default(), field("heading")];
         about.retain(|part| !part.is_empty());
@@ -163,9 +220,20 @@ impl Workspace {
             .py(px(10.))
             .rounded(px(10.))
             .border_1()
-            .border_color(Theme::line())
+            .border_color(if selected { Theme::accent() } else { Theme::line() })
             .bg(Theme::bg_body())
-            .child(div().text_size(px(13.)).line_height(px(21.)).text_color(Theme::text()).child(text.clone()))
+            .child(div().id(id("read")).cursor_pointer().text_size(px(13.)).line_height(px(21.)).text_color(Theme::text()).child(text.clone()).on_click(self.on(Cmd::WriteCandidate(sentence.clone()), cx)))
+            .when(selected, |card| card.child(div().flex().flex_col().gap(px(5.)).p(px(8.)).rounded(px(6.)).bg(Theme::bg_sunken())
+                .child(div().text_size(px(11.)).text_color(Theme::text_tertiary()).child("对应原句的中文翻译"))
+                .child(match translation {
+                    Some(Translated::Done(translated)) => div().flex().flex_col().gap(px(4.))
+                        .child(div().text_size(px(13.)).line_height(px(21.)).child(translated.clone()))
+                        .child(small(id("copy-translation"), "复制译文").on_click(self.on(Cmd::CopyText(translated.clone()), cx))).into_any_element(),
+                    Some(Translated::Failed(error)) => div().flex().flex_col().gap(px(4.)).child(ui::error_line(error))
+                        .child(small(id("retry-translation"), "重试翻译").on_click(self.on(Cmd::WriteCandidate(sentence.clone()), cx))).into_any_element(),
+                    _ => div().flex().items_center().gap(px(5.)).child(ui::spinner(id("translating"), 12., Theme::accent())).child("正在翻译这一句…").into_any_element(),
+                })
+                .child(div().text_size(px(10.)).text_color(Theme::text_tertiary()).child("机器译文仅辅助理解，请结合英文原句与论文上下文核对。"))))
             .child(
                 div()
                     .flex()
@@ -175,7 +243,7 @@ impl Workspace {
                     .child(small(id("cite"), "引用").on_click(self.on(Cmd::WriteCite(cite), cx)))
                     .child(small(id("copy"), "复制").on_click(self.on(Cmd::CopyText(text.clone()), cx)))
                     // With a page, the sentence is shown where it stands in the PDF; an abstract's opens the record.
-                    .child(small(id("source"), if page.is_some() { "原文" } else { "文献" }).on_click(self.on(Cmd::GotoSource(paper.clone(), page, if page.is_some() { text } else { String::new() }), cx))),
+                    .child(small(id("source"), if page.is_some() { "原文与翻译" } else { "文献与翻译" }).on_click(self.on(Cmd::WriteCandidate(sentence.clone()), cx))),
             );
         ui::fade_in(id("card"), card).into_any_element()
     }

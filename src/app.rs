@@ -21,7 +21,7 @@ use wisp_core::model::*;
 pub(crate) use wisp_core::settings::default_root;
 use wisp_core::settings::{Settings, Task, settings_file};
 use wisp_core::store::{Conversation, ConversationInfo, ImportBatch, SavedSearch, Store, StructureInfo, Suggestion, TrashEntry, translation_key};
-use wisp_core::{export, fulltext, import, structure, time, tools, zotero};
+use wisp_core::{export, fulltext, import, structure, time, tools, writing, zotero};
 
 /// What the middle of an open library shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +276,13 @@ pub enum Cmd {
     /// Have the model sort the full texts into parts (false), or read the pages of the files that gave no text (true).
     WriteRun(bool),
     WriteStop,
+    /// Rewrite the current draft, then review before applying.
+    WriteGenerate,
+    WriteCancelGeneration,
+    WriteApplyProposal,
+    WriteRestoreOriginal,
+    WriteFind,
+    WriteCandidate(Value),
     // Dialogs
     CloseModal,
     SubmitModal,
@@ -403,18 +410,23 @@ pub struct Writing {
     /// The part being written, a key of `structure::SECTIONS`.
     pub section: String,
     pub editor: Entity<TextInput>,
+    pub rules: Entity<TextInput>,
+    pub proposal: Option<writing::Proposal>,
+    pub generation: Option<String>,
+    pub generation_error: String,
+    pub search_request: Option<String>,
+    pub intent: Option<writing::SearchIntent>,
+    pub searched: Option<(String, String)>,
+    pub selected_candidate: Option<Value>,
     /// Words to look for, instead of what is being written.
     pub find: Entity<TextInput>,
-    /// What the candidates on show were looked for: the part and the words.
-    asked: Option<(String, String)>,
-    /// The English words a search was made with, when they are not the person's own.
-    pub words: String,
+    /// Current input snapshot; compared with `searched` to identify stale results.
+    pub asked: Option<(String, String)>,
     /// What `find_sentences` gave.
     pub candidates: Option<Result<Value, String>>,
     pub searching: bool,
-    round: u64,
-    /// English search words a model gave for something written in Chinese; `None` while it is asked.
-    keywords: HashMap<String, Option<String>>,
+    /// Parsed intent translations, scoped by input and the model profile.
+    keywords: HashMap<String, writing::SearchIntent>,
     /// How each full text was sorted into parts, by file id.
     pub structures: BTreeMap<String, StructureInfo>,
     pub sorting: Sorting,
@@ -1423,17 +1435,28 @@ impl Workspace {
                         lib.writing.structures = lib.store.structures().unwrap_or_default();
                         lib.writing.asked = None;
                         self.writing_changed(cx);
+                        self.writing_find(true, cx);
                     }
                 }
             }
             Cmd::WriteSection(section) => {
+                if !writing::valid_section(&section) { return }
                 if let Some(lib) = self.lib.as_mut().filter(|l| l.writing.section != section) {
                     let draft = lib.store.drafts().ok().and_then(|mut drafts| drafts.remove(&section)).unwrap_or_default();
+                    lib.writing.generation = None;
+                    lib.writing.generation_error.clear();
+                    lib.writing.proposal = lib.store.writing_proposal(&section).unwrap_or_default();
+                    lib.writing.search_request = None;
+                    lib.writing.searching = false;
+                    lib.writing.intent = None;
+                    lib.writing.searched = None;
+                    lib.writing.selected_candidate = None;
                     lib.writing.section = section;
                     lib.writing.candidates = None;
                     lib.writing.editor.update(cx, |input, cx| input.set_text(&draft, cx));
                     lib.writing.editor.read(cx).focus(window);
                     self.writing_changed(cx);
+                    self.writing_find(true, cx);
                 }
             }
             Cmd::WriteCite(cite) => {
@@ -1454,6 +1477,25 @@ impl Workspace {
                     sorting.todo.clear();
                     sorting.working.clear();
                 }
+            }
+            Cmd::WriteGenerate => self.writing_generate(cx),
+            Cmd::WriteCancelGeneration => {
+                if let Some(lib) = self.lib.as_mut() { lib.writing.generation = None }
+            }
+            Cmd::WriteApplyProposal => self.writing_apply(false, cx),
+            Cmd::WriteRestoreOriginal => self.writing_apply(true, cx),
+            Cmd::WriteFind => self.writing_find(false, cx),
+            Cmd::WriteCandidate(sentence) => {
+                let valid = self.lib.as_ref().and_then(|lib| lib.writing.candidates.as_ref())
+                    .and_then(|result| result.as_ref().ok()).and_then(|value| value["sentences"].as_array())
+                    .is_some_and(|rows| rows.contains(&sentence));
+                if !valid { return }
+                let id = sentence["paperId"].as_str().unwrap_or("").to_string();
+                let text = sentence["text"].as_str().unwrap_or("").to_string();
+                let page = sentence["page"].as_u64().map(|page| page as usize);
+                if let Some(lib) = self.lib.as_mut() { lib.writing.selected_candidate = Some(sentence) }
+                self.run(Cmd::GotoSource(id, page, text), window, cx);
+                self.translate_writing_candidate(cx);
             }
             Cmd::SetFilter(key, value) => {
                 if let Some(lib) = self.lib.as_mut() {
@@ -2080,18 +2122,30 @@ impl Workspace {
         let screen = Screen::new(&info.criteria, cx);
         let section = "introduction".to_string();
         let draft = store.drafts().ok().and_then(|mut drafts| drafts.remove(&section)).unwrap_or_default();
-        let editor = cx.new(|cx| TextInput::new("在这里写。右边会列出文献库里的文献在同一部分是怎么写的；中文也可以，先写下想表达的意思。", cx).multiline(14).with_text(&draft));
-        let find = cx.new(|cx| TextInput::new("找句子：输入词或短语，例如 remains unclear", cx));
+        let editor = cx.new(|cx| TextInput::new("粘贴或写下这一部分的草稿，再点「AI 帮我写」。也可以直接编辑，草稿随写随存。", cx).multiline(14).with_text(&draft));
+        let rules_text = store.writing_rules().unwrap_or_default();
+        let rules = cx.new(|cx| TextInput::new("可选写作要求，例如：保留中文、简洁表达、引文紧邻对应论断。", cx).multiline(2).with_text(&rules_text));
+        subscriptions.push(cx.subscribe(&rules, |this, input, event: &InputEvent, cx| {
+            if *event != InputEvent::Changed { return }
+            let text = input.read(cx).text().to_string();
+            let saved = this.lib.as_mut().map(|lib| lib.store.save_writing_rules(&text));
+            if let Some(Err(err)) = saved { this.fail(format!("写作要求没有保存：{err:#}"), cx) }
+        }));
+        let proposal = store.writing_proposal(&section).unwrap_or_default();
+        let find = cx.new(|cx| TextInput::new("可选：指定中文意图或英文词；留空时查找中间当前段落", cx));
+        subscriptions.push(cx.subscribe(&find, |this, _, event: &InputEvent, cx| {
+            if *event == InputEvent::Submit { this.writing_find(false, cx) }
+        }));
         subscriptions.push(cx.subscribe(&editor, |this, input, event: &InputEvent, cx| {
             if *event != InputEvent::Changed { return }
             let text = input.read(cx).text().to_string();
             let saved = this.lib.as_mut().map(|lib| lib.store.save_draft(&lib.writing.section.clone(), &text));
             if let Some(Err(err)) = saved { this.fail(format!("草稿没有保存：{err:#}"), cx) }
         }));
-        // The caret moving to another paragraph changes what is looked for, as typing does.
+        // Observe edits/caret movement to mark results stale, without automatically calling a model.
         subscriptions.push(cx.observe(&editor, |this, _, cx| this.writing_changed(cx)));
         subscriptions.push(cx.observe(&find, |this, _, cx| this.writing_changed(cx)));
-        let writing = Writing { section, editor, find, asked: None, words: String::new(), candidates: None, searching: false, round: 0, keywords: HashMap::new(), structures: BTreeMap::new(), sorting: Sorting::default(), scroll: ScrollHandle::new() };
+        let writing = Writing { section, editor, rules, proposal, generation: None, generation_error: String::new(), search_request: None, intent: None, searched: None, selected_candidate: None, find, asked: None, candidates: None, searching: false, keywords: HashMap::new(), structures: BTreeMap::new(), sorting: Sorting::default(), scroll: ScrollHandle::new() };
         let mut lib = Library {
             info,
             store,
@@ -2611,6 +2665,7 @@ impl Workspace {
                     // The candidates on show were found without this paper.
                     if lib.extracting.is_empty() {
                         lib.writing.asked = None;
+                        lib.writing.searched = None;
                         this.writing_changed(cx);
                     }
                     cx.notify();
@@ -3392,79 +3447,203 @@ impl Workspace {
 
     // ---- writing
 
-    /// Look for candidates again when the part, the words looked for or
-    /// what is being written has changed: a moment after the last change,
-    /// so typing does not ask for every letter.
+    fn writing_generate(&mut self, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_for_or_default(Task::Chat);
+        let Some(lib) = self.lib.as_mut() else { return };
+        if lib.writing.generation.is_some() { return }
+        let draft = lib.writing.editor.read(cx).text().to_string();
+        let rules = lib.writing.rules.read(cx).text().to_string();
+        let candidates = lib.writing.candidates.as_ref().and_then(|result| result.as_ref().ok())
+            .filter(|_| lib.writing.searched == lib.writing.asked);
+        let planned = writing::WritingInput::new(&lib.writing.section, &draft, &rules, candidates)
+            .and_then(|input| ai::plain_request(&profile, writing::SYSTEM, &input.prompt()).map(|request| (input, request)));
+        let (input, request) = match planned {
+            Ok(planned) => planned,
+            Err(error) => { lib.writing.generation_error = error; return cx.notify() }
+        };
+        if let Err(error) = lib.store.save_draft(&input.section, &draft) {
+            lib.writing.generation_error = format!("原稿没有保存，未开始生成：{error:#}");
+            return cx.notify();
+        }
+        let token = new_id("W");
+        lib.writing.generation = Some(token.clone());
+        lib.writing.generation_error.clear();
+        let (library, protocol) = (lib.info.id.clone(), profile.protocol);
+        let model = format!("{} · {}", profile.title(), profile.model);
+        let work = cx.background_executor().spawn(async move {
+            wisp_net::complete(request, protocol).and_then(|reply| input.proposal(&reply, &model))
+        });
+        cx.spawn(async move |this, cx| {
+            let reply = work.await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|lib| lib.info.id == library && lib.writing.generation.as_ref() == Some(&token)) else { return };
+                lib.writing.generation = None;
+                match reply {
+                    Ok(proposal) => {
+                        match lib.store.save_writing_proposal(&proposal) {
+                            Ok(()) => lib.writing.proposal = Some(proposal),
+                            Err(error) => lib.writing.generation_error = format!("建议没有保存，原稿未改动：{error:#}"),
+                        }
+                    }
+                    Err(error) => lib.writing.generation_error = error,
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+        cx.notify();
+    }
+
+    fn writing_apply(&mut self, restore: bool, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut() else { return };
+        if lib.writing.generation.is_some() { return }
+        let current = lib.writing.editor.read(cx).text().to_string();
+        let section = lib.writing.section.clone();
+        let Some(proposal) = lib.writing.proposal.as_ref() else { return };
+        let result = if restore { lib.store.restore_writing_original(&section, &current, proposal) } else { lib.store.apply_writing_proposal(&section, &current, proposal) };
+        match result {
+            Ok(body) => {
+                lib.writing.proposal = lib.store.writing_proposal(&section).unwrap_or_default();
+                lib.writing.generation_error.clear();
+                lib.writing.editor.update(cx, |input, cx| input.set_text(&body, cx));
+            }
+            Err(error) => lib.writing.generation_error = format!("{error:#}"),
+        }
+        cx.notify();
+    }
+
+    /// Editing only invalidates an in-flight search; a model is called explicitly by 寻找.
     fn writing_changed(&mut self, cx: &mut Context<Self>) {
-        let Some(lib) = self.lib.as_mut().filter(|l| l.page == Page::Write) else { return };
+        let Some(lib) = self.lib.as_mut().filter(|lib| lib.page == Page::Write) else { return };
         let writing = &mut lib.writing;
-        let find = writing.find.read(cx).text().trim().to_string();
-        let query = if find.is_empty() {
-            let editor = writing.editor.read(cx);
-            structure::writing_at(editor.text(), editor.caret())
-        } else {
-            find
+        let editor = writing.editor.read(cx);
+        let query = writing::search_input(editor.text(), editor.caret(), writing.find.read(cx).text());
+        let Ok(query) = query else {
+            writing.asked = None;
+            writing.search_request = None;
+            writing.searching = false;
+            return cx.notify();
         };
         let wanted = (writing.section.clone(), query);
         if writing.asked.as_ref() == Some(&wanted) { return }
         writing.asked = Some(wanted);
-        writing.round += 1;
-        let (round, library) = (writing.round, lib.info.id.clone());
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(std::time::Duration::from_millis(220)).await;
-            this.update(cx, |this, cx| {
-                if this.lib.as_ref().is_some_and(|l| l.info.id == library && l.writing.round == round) { this.writing_search(cx) }
-            })
-            .ok();
-        })
-        .detach();
+        writing.search_request = None;
+        writing.searching = false;
+        cx.notify();
     }
 
-    /// Find the candidates for what was last asked. Something written in
-    /// Chinese is first put into English search words by the model for
-    /// translation (once per text): the library's sentences are English.
-    fn writing_search(&mut self, cx: &mut Context<Self>) {
+    fn writing_find(&mut self, openers: bool, cx: &mut Context<Self>) {
+        self.writing_changed(cx);
         let profile = self.settings.profile_for_or_default(Task::Translate);
         let Some(lib) = self.lib.as_mut() else { return };
-        let Some((section, query)) = lib.writing.asked.clone() else { return };
-        let round = lib.writing.round;
-        let mut words = query.clone();
-        if structure::in_chinese(&query) {
-            match lib.writing.keywords.get(&query) {
-                Some(Some(known)) => words = known.clone(),
-                Some(None) => return,
-                None => {
-                    // Without a model the words go as written, and find what little they can.
-                    if let Ok(request) = ai::plain_request(&profile, structure::KEYWORDS_SYSTEM, &query) {
-                        lib.writing.keywords.insert(query.clone(), None);
-                        lib.writing.searching = true;
-                        let (library, protocol) = (lib.info.id.clone(), profile.protocol);
-                        let work = cx.background_executor().spawn(async move { wisp_net::complete(request, protocol) });
-                        cx.spawn(async move |this, cx| {
-                            let reply = work.await;
-                            this.update(cx, |this, cx| {
-                                let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library) else { return };
-                                let found = reply.map(|words| words.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_else(|_| query.clone());
-                                lib.writing.keywords.insert(query, Some(found));
-                                if lib.writing.round == round { this.writing_search(cx) }
-                            })
-                            .ok();
-                        })
-                        .detach();
-                        return cx.notify();
+        let editor = lib.writing.editor.read(cx);
+        let query = if openers { Ok(String::new()) } else { writing::search_input(editor.text(), editor.caret(), lib.writing.find.read(cx).text()) };
+        let query = match query {
+            Ok(query) => query,
+            Err(error) => { lib.writing.candidates = Some(Err(error)); return cx.notify() }
+        };
+        let section = lib.writing.section.clone();
+        let token = new_id("F");
+        lib.writing.search_request = Some(token.clone());
+        lib.writing.searching = true;
+        lib.writing.candidates = None;
+        lib.writing.intent = None;
+        lib.writing.selected_candidate = None;
+        lib.writing.searched = Some((section.clone(), query.clone()));
+        if !structure::in_chinese(&query) {
+            self.writing_find_matches(token, section, query.clone(), writing::SearchIntent::literal(&query), cx);
+            return;
+        }
+        let cache_key = translation_key(&query, &serde_json::json!({"instructions":writing::INTENT_SYSTEM, "id":profile.id, "model":profile.model, "baseUrl":profile.base_url, "protocol":profile.protocol, "effort":profile.effort}).to_string());
+        if let Some(intent) = lib.writing.keywords.get(&cache_key).cloned() {
+            self.writing_find_matches(token, section, query, intent, cx);
+            return;
+        }
+        let request = match ai::plain_request(&profile, writing::INTENT_SYSTEM, &query) {
+            Ok(request) => request,
+            Err(error) => {
+                lib.writing.searching = false;
+                lib.writing.search_request = None;
+                lib.writing.candidates = Some(Err(format!("中文意图需要翻译模型：{error} 也可在右侧输入英文后查找。")));
+                return cx.notify();
+            }
+        };
+        let (library, protocol) = (lib.info.id.clone(), profile.protocol);
+        let work = cx.background_executor().spawn(async move {
+            wisp_net::complete(request, protocol).and_then(|reply| writing::SearchIntent::parse(&reply))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|lib| lib.info.id == library && lib.writing.search_request.as_ref() == Some(&token)) else { return };
+                match result {
+                    Ok(intent) => {
+                        if lib.writing.keywords.len() >= 128 { lib.writing.keywords.clear() }
+                        lib.writing.keywords.insert(cache_key, intent.clone());
+                        this.writing_find_matches(token, section, query, intent, cx);
+                    }
+                    Err(error) => {
+                        lib.writing.searching = false;
+                        lib.writing.search_request = None;
+                        lib.writing.candidates = Some(Err(error));
+                        cx.notify();
                     }
                 }
-            }
-        }
-        lib.writing.searching = true;
-        lib.writing.words = if words == query { String::new() } else { words.clone() };
-        self.library_tool("find_sentences", serde_json::json!({"section": section, "query": words, "limit": 30}), cx, move |this, result, _| {
-            let Some(lib) = this.lib.as_mut().filter(|l| l.writing.round == round) else { return };
+            }).ok();
+        }).detach();
+        cx.notify();
+    }
+
+    fn writing_find_matches(&mut self, token: String, section: String, original_query: String, intent: writing::SearchIntent, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut().filter(|lib| lib.writing.search_request.as_ref() == Some(&token)) else { return };
+        let query = intent.query();
+        lib.writing.intent = (!original_query.is_empty()).then_some(intent);
+        self.library_tool("find_sentences", serde_json::json!({"section":section, "query":query, "limit":30}), cx, move |this, result, _| {
+            let Some(lib) = this.lib.as_mut().filter(|lib| lib.writing.search_request.as_ref() == Some(&token)) else { return };
+            lib.writing.search_request = None;
             lib.writing.searching = false;
             lib.writing.candidates = Some(result);
+            lib.writing.searched = Some((section, original_query));
             lib.writing.scroll.set_offset(point(px(0.), px(0.)));
         });
+        cx.notify();
     }
+
+    fn translate_writing_candidate(&mut self, cx: &mut Context<Self>) {
+        let profile = self.settings.profile_for_or_default(Task::Translate);
+        let Some(lib) = self.lib.as_mut() else { return };
+        let Some(sentence) = lib.writing.selected_candidate.as_ref() else { return };
+        let text = writing::sentence_translation_input(sentence["title"].as_str().unwrap_or(""), sentence["text"].as_str().unwrap_or(""));
+        let key = translation_key(&text, writing::SENTENCE_TRANSLATION);
+        if matches!(lib.translations.get(&key), Some(Translated::Busy | Translated::Done(_))) { return }
+        if let Ok(Some(kept)) = lib.store.translation(&key) {
+            lib.translations.insert(key, Translated::Done(kept));
+            return cx.notify();
+        }
+        let request = match ai::translate_request(&profile, writing::SENTENCE_TRANSLATION, &text) {
+            Ok(request) => request,
+            Err(error) => { lib.translations.insert(key, Translated::Failed(error)); return cx.notify() }
+        };
+        lib.translations.insert(key.clone(), Translated::Busy);
+        let (library, protocol, author) = (lib.info.id.clone(), profile.protocol, format!("{} · {}", profile.title(), profile.model));
+        let work = cx.background_executor().spawn(async move { wisp_net::complete(request, protocol) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|lib| lib.info.id == library) else { return };
+                let translated = match result {
+                    Ok(text) => match lib.store.save_translation(&key, &text, &author) {
+                        Ok(()) => Translated::Done(text.trim().to_string()),
+                        Err(error) => Translated::Failed(format!("译文没有保存：{error:#}")),
+                    },
+                    Err(error) => Translated::Failed(error),
+                };
+                lib.translations.insert(key, translated);
+                cx.notify();
+            }).ok();
+        }).detach();
+        cx.notify();
+    }
+
 
     /// Start the model on the full texts: sorting those the rules sorted
     /// into parts, or reading the pages of those that gave no text.
@@ -3550,6 +3729,7 @@ impl Workspace {
                         let _ = lib.reload();
                         lib.texts_changed();
                         lib.writing.asked = None;
+                        lib.writing.searched = None;
                         this.write_run_next(run, cx);
                         this.writing_changed(cx);
                     }
@@ -3890,6 +4070,22 @@ impl Workspace {
                 "page" => Some(Cmd::SetPage(match arg { "ask" => Page::Ask, "trash" => Page::Trash, "sources" => Page::Sources, "screen" => Page::Screen, "write" => Page::Write, _ => Page::Papers })),
                 // `write:methods` shows another part of the manuscript; `draft:<text>` leaves text in it, as if typed.
                 "write" => Some(Cmd::WriteSection(arg.to_string())),
+                "write-ai" => Some(Cmd::WriteGenerate),
+                "write-find" => Some(Cmd::WriteFind),
+                "write-query" => {
+                    if let Some(lib) = self.lib.as_ref() { lib.writing.find.update(cx, |input, cx| input.set_text(arg, cx)) }
+                    return;
+                }
+                "write-candidate" => self.lib.as_ref().and_then(|lib| lib.writing.candidates.as_ref())
+                    .and_then(|result| result.as_ref().ok()).and_then(|value| value["sentences"].as_array())
+                    .and_then(|rows| rows.get(arg.parse::<usize>().unwrap_or(0))).cloned().map(Cmd::WriteCandidate),
+                "write-apply" => Some(Cmd::WriteApplyProposal),
+                "write-restore" => Some(Cmd::WriteRestoreOriginal),
+                "write-cancel" => Some(Cmd::WriteCancelGeneration),
+                "write-rules" => {
+                    if let Some(lib) = self.lib.as_ref() { lib.writing.rules.update(cx, |input, cx| input.set_text(arg, cx)) }
+                    return;
+                }
                 "draft" => {
                     if let Some(lib) = self.lib.as_ref() { lib.writing.editor.update(cx, |input, cx| input.insert(arg, cx)) }
                     return;
