@@ -2,10 +2,12 @@
 # Build Wisp Paper for macOS and package it: `dist/Wisp Paper.app` and a DMG.
 # The command line travels inside the bundle: "Wisp Paper.app/Contents/MacOS/wisp".
 #
-#   scripts/package-macos.sh [--arch host|universal]
+#   scripts/package-macos.sh [--arch host|universal|arm64|x64]
 #
 # --arch host       this machine's architecture (the default)
 # --arch universal  Apple Silicon + Intel in one binary (needs both rustup targets)
+# --arch arm64      Apple Silicon only (aarch64-apple-darwin)
+# --arch x64        Intel only (x86_64-apple-darwin)
 #
 # Environment:
 #   CARGO                        the cargo command, e.g. "cargo +stable" (default: cargo)
@@ -24,12 +26,12 @@ while (($# > 0)); do
   case "$1" in
     --arch) arch="${2:-}"; shift 2 ;;
     --arch=*) arch="${1#--arch=}"; shift ;;
-    -h | --help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-if [[ "${arch}" != host && "${arch}" != universal ]]; then
-  echo "--arch must be host or universal, got '${arch}'" >&2
+if [[ "${arch}" != host && "${arch}" != universal && "${arch}" != arm64 && "${arch}" != x64 ]]; then
+  echo "--arch must be host, universal, arm64 or x64, got '${arch}'" >&2
   exit 2
 fi
 
@@ -70,6 +72,11 @@ if [[ "${arch}" == universal ]]; then
   for binary in wisp_paper wisp; do
     lipo -create -output "${macos_dir}/${binary}" "${target_dir}/aarch64-apple-darwin/release/${binary}" "${target_dir}/x86_64-apple-darwin/release/${binary}"
   done
+elif [[ "${arch}" == arm64 || "${arch}" == x64 ]]; then
+  label="${arch}"
+  if [[ "${arch}" == arm64 ]]; then triple=aarch64-apple-darwin; else triple=x86_64-apple-darwin; fi
+  build --target "${triple}"
+  for binary in wisp_paper wisp; do cp "${target_dir}/${triple}/release/${binary}" "${macos_dir}/${binary}"; done
 else
   case "$(uname -m)" in
     arm64) label=arm64 ;;
