@@ -21,6 +21,7 @@
   <a href="#安装"><b>安装</b></a> ·
   <a href="#功能">功能</a> ·
   <a href="docs/TUTORIAL.md">教程</a> ·
+  <a href="docs/ZOTERO.md">Zotero 导入</a> ·
   <a href="docs/CLI.md">命令行与 MCP</a> ·
   <a href="docs/DATA.md">数据与隐私</a> ·
   <a href="docs/DEVELOPMENT.md">开发</a>
@@ -76,7 +77,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 ## 功能
 
 - **文献库**：多个独立的文献库，各有名称、主题描述和标识色。
-- **收集**：粘贴 DOI 或 PMID，拖入 PDF，导入 BibTeX / RIS，或手动录入。按 DOI、PMID、题目去重。成批导入 PDF 有进度和结果汇总。
+- **收集**：粘贴 DOI 或 PMID，拖入 PDF，导入 BibTeX / RIS，或手动录入；也可以[从 Zotero 本地数据库导入](docs/ZOTERO.md)文献信息、标签、笔记及已下载的 PDF。按 DOI、PMID、题目去重。成批导入有进度和结果汇总。
 - **整理**：搜索、筛选、排序；阅读状态、收录判断、收藏、标签、笔记；每个库自己定义的词条；回收站；导出 BibTeX 和 CSV。
 - **检索与导入**：保存检索式，先试检索再导入，每次导入可以整批撤销；可以定时自动更新。
 - **建库向导**：写下主题，助手为各个数据库拟几条检索式并逐条试检索，你挑靠谱的。

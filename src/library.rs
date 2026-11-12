@@ -345,6 +345,11 @@ impl Workspace {
                     .child(div().id("tags").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(1.)).children(tag_rows).when(tags.is_empty(), |d| d.child(div().px(px(8.)).text_size(px(12.)).text_color(Theme::text_placeholder()).child("编辑文献时添加标签"))))
             )
             .children(self.render_import(cx))
+            .when_some(lib.zotero.as_ref(), |d, run| d.child(
+                div().id("zotero-progress").p(px(10.)).rounded(px(8.)).bg(Theme::bg_sunken()).cursor_pointer()
+                    .on_click(self.on(Cmd::ShowZotero, cx))
+                    .child(div().text_size(px(12.)).child(if run.running { format!("Zotero 导入 {}/{}", run.rows.len(), run.total) } else { "Zotero 导入结果 · 查看明细".into() }))
+            ))
             .children(self.render_fetching(cx))
             .child(
                 div()

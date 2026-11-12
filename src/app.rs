@@ -21,7 +21,7 @@ use wisp_core::model::*;
 pub(crate) use wisp_core::settings::default_root;
 use wisp_core::settings::{Settings, Task, settings_file};
 use wisp_core::store::{Conversation, ConversationInfo, ImportBatch, SavedSearch, Store, StructureInfo, Suggestion, TrashEntry, translation_key};
-use wisp_core::{export, fulltext, import, structure, time, tools};
+use wisp_core::{export, fulltext, import, structure, time, tools, zotero};
 
 /// What the middle of an open library shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +130,9 @@ pub enum Cmd {
     AddById,
     AddManual,
     ImportReferences,
+    ImportZotero,
+    PickZotero,
+    ShowZotero,
     ImportPdfs,
     ImportFolder,
     /// Show what came of each file of the last import.
@@ -538,6 +541,30 @@ pub struct ImportRun {
     pub rows: Vec<ImportRow>,
 }
 
+#[derive(Default)]
+pub struct ZoteroRun {
+    pub id: String,
+    pub running: bool,
+    pub total: usize,
+    pub current: String,
+    pub rows: Vec<zotero::Row>,
+    pub other_attachments: usize,
+    pub error: String,
+}
+
+impl ZoteroRun {
+    pub fn summary(&self) -> String {
+        if self.running { return format!("正在导入 Zotero · {}/{} · {}", self.rows.len(), self.total, self.current) }
+        format!("新增 {} 篇 · 已有 {} 篇 · 回收站 {} 篇 · 失败 {} 篇 · 新增 PDF {} 个 · 待处理 {} 项",
+            self.rows.iter().filter(|r| r.added).count(),
+            self.rows.iter().filter(|r| !r.added && r.paper_id.is_some()).count(),
+            self.rows.iter().filter(|r| r.in_trash).count(),
+            self.rows.iter().filter(|r| r.paper_id.is_none() && !r.in_trash).count(),
+            self.rows.iter().map(|r| r.files_added).sum::<usize>(),
+            self.rows.iter().map(|r| r.problems.len()).sum::<usize>())
+    }
+}
+
 impl ImportRun {
     pub fn running(&self) -> bool {
         self.rows.len() < self.total
@@ -706,6 +733,8 @@ pub enum Modal {
     Confirm { title: String, message: String, action: String, cmd: Cmd },
     /// What came of each PDF of the last import (`Library::import`).
     ImportReport,
+    Zotero,
+    ZoteroReport,
     /// What came of looking for each paper's open full text (`Library::fetching`).
     FetchReport,
     /// An answer about a paper, to be looked over before it joins that paper's notes.
@@ -759,6 +788,7 @@ pub struct Library {
     pub running: HashSet<String>,
     /// The PDFs being read in, or what came of the last lot until it is put away.
     pub import: Option<ImportRun>,
+    pub zotero: Option<ZoteroRun>,
     /// The round of looking for open full texts, likewise.
     pub fetching: Option<FetchRun>,
     /// Where the fetched files came from, by file: (address, who listed it, version).
@@ -1146,6 +1176,7 @@ impl Workspace {
                 items.push(item("导入 PDF 文件…", Cmd::ImportPdfs));
                 items.push(item("导入文件夹…", Cmd::ImportFolder));
                 items.push(item("导入 BibTeX / RIS…", Cmd::ImportReferences));
+                items.push(item("从 Zotero 导入…", Cmd::ImportZotero));
                 items.push(item("手动录入…", Cmd::AddManual));
             }
             MenuKind::Export => {
@@ -1325,6 +1356,16 @@ impl Workspace {
             Cmd::AddManual => self.paper_dialog(None, window, cx),
             Cmd::EditPaper(id) => self.paper_dialog(Some(id), window, cx),
             Cmd::ImportReferences => self.pick_files("导入", false, cx),
+            Cmd::ImportZotero => {
+                if self.lib.is_none() { return self.fail("请先打开一个文献库。", cx) }
+                self.modal_error.clear();
+                self.modal = Some(if self.lib.as_ref().and_then(|l| l.zotero.as_ref()).is_some_and(|r| r.running) { Modal::ZoteroReport } else { Modal::Zotero });
+            }
+            Cmd::PickZotero => self.pick_zotero(cx),
+            Cmd::ShowZotero => {
+                self.modal_error.clear();
+                self.modal = Some(Modal::ZoteroReport);
+            }
             Cmd::ImportPdfs => self.pick_files("导入", true, cx),
             Cmd::ImportFolder => self.pick_folders(cx),
             Cmd::ShowImport => {
@@ -2088,6 +2129,7 @@ impl Workspace {
             trial: None,
             running: HashSet::new(),
             import: None,
+            zotero: None,
             fetching: None,
             origins: BTreeMap::new(),
             writing,
@@ -2245,6 +2287,86 @@ impl Workspace {
     }
 
     // ---- collecting
+
+    fn pick_zotero(&mut self, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_ref() else { return };
+        if lib.zotero.as_ref().is_some_and(|run| run.running) { return }
+        let library = lib.info.id.clone();
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("选择 zotero.sqlite".into()), extensions: Some(vec!["sqlite".into()]) });
+        cx.spawn(async move |this, cx| {
+            let result = picked.await;
+            this.update(cx, |this, cx| {
+                if this.lib.as_ref().is_none_or(|l| l.info.id != library) { return }
+                match result {
+                    Ok(Ok(Some(paths))) => { if let Some(path) = paths.into_iter().next() { this.import_zotero(path, cx) } }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(err)) => { this.modal_error = format!("无法打开文件选择器：{err:#}"); }
+                    Err(err) => { this.modal_error = format!("文件选择器未能返回结果：{err}"); }
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
+
+    fn import_zotero(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(lib) = self.lib.as_mut() else { return };
+        if lib.zotero.as_ref().is_some_and(|run| run.running) { return }
+        let library = lib.info.id.clone();
+        let root = lib.store.root().to_path_buf();
+        let run_id = new_id("Z");
+        lib.zotero = Some(ZoteroRun { id: run_id.clone(), running: true, current: "正在读取数据库…".into(), ..Default::default() });
+        lib.page = Page::Papers;
+        self.modal = Some(Modal::ZoteroReport);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let parsed = cx.background_executor().spawn(async move { zotero::read(&path) }).await;
+            let entries = this.update(cx, |this, cx| {
+                let run = this.lib.as_mut().filter(|l| l.info.id == library)?.zotero.as_mut().filter(|r| r.id == run_id)?;
+                let entries = match parsed {
+                    Ok(imported) => {
+                        run.total = imported.entries.len();
+                        run.other_attachments = imported.other_attachments;
+                        Some(imported.entries)
+                    }
+                    Err(err) => { run.error = format!("{err:#}"); run.running = false; None }
+                };
+                cx.notify();
+                entries
+            });
+            let Ok(Some(entries)) = entries else { return };
+            for entry in entries {
+                let active = this.update(cx, |this, cx| {
+                    let Some(run) = this.lib.as_mut().filter(|l| l.info.id == library).and_then(|l| l.zotero.as_mut()).filter(|r| r.id == run_id) else { return false };
+                    run.current = entry.paper.title.clone();
+                    cx.notify();
+                    true
+                });
+                if !matches!(active, Ok(true)) { return }
+                let folder = root.clone();
+                let row = cx.background_executor().spawn(async move {
+                    match Store::open(&folder) {
+                        Ok(mut store) => zotero::import_entry(&mut store, entry),
+                        Err(err) => zotero::Row { title: entry.paper.title, problems: vec![format!("{err:#}")], ..Default::default() },
+                    }
+                }).await;
+                let active = this.update(cx, |this, cx| {
+                    let Some(run) = this.lib.as_mut().filter(|l| l.info.id == library).and_then(|l| l.zotero.as_mut()).filter(|r| r.id == run_id) else { return false };
+                    run.rows.push(row);
+                    cx.notify();
+                    true
+                });
+                if !matches!(active, Ok(true)) { return }
+            }
+            this.update(cx, |this, cx| {
+                let Some(lib) = this.lib.as_mut().filter(|l| l.info.id == library) else { return };
+                let Some(run) = lib.zotero.as_mut().filter(|r| r.id == run_id) else { return };
+                run.running = false;
+                if let Err(err) = lib.reload() { this.fail(format!("{err:#}"), cx) }
+                this.extract_missing(cx);
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
 
     fn pick_files(&mut self, prompt: &'static str, pdfs: bool, cx: &mut Context<Self>) {
         let extensions: Vec<SharedString> = if pdfs { vec!["pdf".into()] } else { vec!["bib".into(), "ris".into(), "txt".into(), "enw".into()] };
@@ -3594,6 +3716,8 @@ impl Workspace {
                 self.run(cmd, window, cx);
             }
             Modal::ImportReport => self.run(Cmd::CloseImport, window, cx),
+            Modal::Zotero => self.run(Cmd::PickZotero, window, cx),
+            Modal::ZoteroReport => self.run(Cmd::CloseModal, window, cx),
             Modal::FetchReport => self.run(Cmd::CloseFetch, window, cx),
             Modal::Library { editing, name, topic, color } => {
                 let (name, topic, color) = (text(name, cx), text(topic, cx), color.clone());
@@ -3893,6 +4017,11 @@ impl Workspace {
                 }
                 // `report` shows what came of the last import.
                 "report" => Some(Cmd::ShowImport),
+                "zotero" => {
+                    self.import_zotero(PathBuf::from(arg), cx);
+                    None
+                }
+                "zotero-report" => Some(Cmd::ShowZotero),
                 "screen" => Some(Cmd::ScreenStart),
                 // `sort` has the model sort the full texts into parts, `read` has it read the pages of those without text.
                 "sort" => Some(Cmd::WriteRun(false)),

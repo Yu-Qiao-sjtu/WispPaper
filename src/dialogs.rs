@@ -45,6 +45,33 @@ impl Workspace {
         let body = || div().id("modal-body").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().gap(px(12.)).px(px(20.)).py(px(8.));
 
         let card = match modal {
+            Modal::Zotero => ui::dialog(560.)
+                .child(ui::dialog_title("从 Zotero 导入"))
+                .child(body()
+                    .child(div().line_height(px(23.)).child("1. 在 Zotero 的「设置 › 高级 › 文件和文件夹」中打开数据目录。\n2. 等同步完成，下载需要的 PDF，然后退出 Zotero。\n3. 点击下方按钮，选择该目录中的 zotero.sqlite。"))
+                    .child(div().text_color(Theme::text_secondary()).line_height(px(21.)).child("导入本机个人库和群组库的文献信息、标签、笔记与 PDF。分类转为 Zotero/分类路径 标签；原数据库和 PDF 保留。已有文献保留原记录，并补充 PDF。"))
+                    .child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).line_height(px(19.)).child("这是一次本地复制，不会持续同步。暂不迁移独立笔记、PDF 批注、网页快照及其他非 PDF 附件；相对链接附件会在结果中提示手动处理。只迁移部分文献时，可从 Zotero 导出 BibTeX / RIS，再使用对应入口。"))
+                    .child(error))
+                .child(footer("选择 zotero.sqlite…", false, self, cx)),
+            Modal::ZoteroReport => {
+                let run = self.lib.as_ref()?.zotero.as_ref()?;
+                let rows = run.rows.iter().enumerate().map(|(i, row)| {
+                    div().id(("zotero-row", i)).flex().flex_col().gap(px(4.)).py(px(8.)).border_b_1().border_color(Theme::line())
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(if row.title.is_empty() { "（无题目）".into() } else { row.title.clone() }))
+                        .child(div().text_size(px(12.)).text_color(Theme::text_secondary()).child(row.summary()))
+                        .children(row.problems.iter().map(|problem| div().text_size(px(12.)).text_color(Theme::warning()).child(problem.clone())))
+                        .when_some(row.paper_id.clone().filter(|_| !run.running), |d, id| d.cursor_pointer().hover(|s| s.bg(Theme::hover())).on_click(self.on(Cmd::OpenImported(id), cx)))
+                });
+                ui::dialog(680.).child(ui::dialog_title(if run.running { "正在从 Zotero 导入" } else { "Zotero 导入结果" }))
+                    .child(body()
+                        .child(div().line_height(px(21.)).child(run.summary()))
+                        .when(!run.error.is_empty(), |d| d.child(ui::error_line(&run.error)))
+                        .when(!run.running && run.total == 0 && run.error.is_empty(), |d| d.child(div().child("没有找到可导入的文献。回收站、订阅源、独立笔记和独立附件不导入。")))
+                        .when(run.other_attachments > 0, |d| d.child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child(format!("另有 {} 个非 PDF 附件未迁移。", run.other_attachments))))
+                        .when(run.running, |d| d.child(div().text_size(px(12.)).text_color(Theme::text_tertiary()).child("可以收起此窗口。返回首页或切换文献库会停止后续条目，已导入的保留；重新导入会跳过重复项。")))
+                        .children(rows))
+                    .child(div().flex().justify_end().px(px(20.)).py(px(14.)).child(ui::secondary_button("zotero-close", if run.running { "收起" } else { "完成" }).on_click(self.on(Cmd::CloseModal, cx))))
+            }
             Modal::Confirm { title, message, action, .. } => ui::dialog(440.).child(ui::dialog_title(title.clone())).child(body().child(div().text_color(Theme::text_secondary()).line_height(px(21.)).child(message.clone())).child(error)).child(footer(action, true, self, cx)),
 
             Modal::ImportReport => {
