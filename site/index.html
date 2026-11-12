@@ -398,10 +398,14 @@
     <div class="dl-grid">
       <article class="dl" data-os="mac">
         <h3>macOS</h3>
-        <p class="dl-req">Apple 芯片与 Intel 通用</p>
-        <a class="btn primary" data-asset="mac" href="https://github.com/xuzhougeng/WispPaper/releases/latest">去发布页下载</a>
-        <p class="dl-file" data-file="mac">WispPaper-v<i>版本</i>-macos-universal.dmg</p>
-        <p class="dl-note">Developer ID 签名并经 Apple 公证。打开后把 Wisp Paper 拖进「应用程序」，直接运行。只给 Apple 芯片的较小版本是发布页上的 <code>macos-arm64.dmg</code>。</p>
+        <p class="dl-req">macOS 11 起，Apple 芯片或 Intel</p>
+        <div class="dl-pick">
+          <a class="btn primary" data-asset="mac" data-label="Apple 芯片" href="https://github.com/xuzhougeng/WispPaper/releases/latest">Apple 芯片</a>
+          <a class="btn" data-asset="mac-intel" data-label="Intel" href="https://github.com/xuzhougeng/WispPaper/releases/latest">Intel</a>
+        </div>
+        <p class="dl-file" data-file="mac">WispPaper-v<i>版本</i>-macos-arm64.dmg</p>
+        <p class="dl-file" data-file="mac-intel">WispPaper-v<i>版本</i>-macos-x64.dmg</p>
+        <p class="dl-note">Developer ID 签名并经 Apple 公证。打开后把 Wisp Paper 拖进「应用程序」，直接运行。不确定是哪一种：苹果菜单 › 关于本机，写着 Apple M… 的是 Apple 芯片，写着 Intel 的是 Intel。</p>
       </article>
       <article class="dl" data-os="win">
         <h3>Windows</h3>

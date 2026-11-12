@@ -90,7 +90,7 @@ GPUI 应用。
 ```sh
 scripts/package-macos.sh                    # dist/Wisp Paper.app 和 DMG，本机架构，ad hoc 签名
 scripts/package-macos.sh --arch universal   # Apple 芯片 + Intel（需要两个 rustup target）
-scripts/package-macos.sh --arch arm64       # 只有 Apple 芯片（发布时与 universal 各出一个 DMG）
+scripts/package-macos.sh --arch arm64       # 只有 Apple 芯片；--arch x64 只有 Intel（发布时这两个各出一个 DMG）
 pwsh -File scripts/package-windows.ps1      # dist/WispPaper-v<版本>-windows-x64.zip，不签名
 ```
 

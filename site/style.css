@@ -310,6 +310,9 @@ html:not(.js) .steps-list { display: none; }
 .dl-grid:not(:has(.mine)) .btn.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .dl-file { margin-top: 12px; font: .74rem/1.6 var(--mono); color: var(--ink-3); overflow-wrap: anywhere; }
 .dl-file i { font-style: normal; }
+.dl-file + .dl-file { margin-top: 2px; }
+.dl-pick { margin-top: 22px; display: flex; flex-wrap: wrap; gap: 10px; }
+.dl .dl-pick .btn { margin-top: 0; }
 .dl-note { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); font-size: .86rem; line-height: 1.7; color: var(--ink-2); }
 .dl-foot { margin-top: clamp(36px, 5vw, 56px); display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: clamp(24px, 4vw, 56px); align-items: start; }
 .dl-foot ul { margin-top: 12px; font-size: .92rem; color: var(--ink-2); }

@@ -3,8 +3,8 @@ name: Release
 # Pushing a tag like v0.2.0 builds the packages, signs them and publishes a
 # release with them. The signing follows BiblioCell's release workflow:
 #
-# - macOS: scripts/package-macos.sh builds two DMGs, a universal one (Apple
-#   silicon and Intel) and a smaller one for Apple silicon only. Each signs
+# - macOS: scripts/package-macos.sh builds two DMGs, one for Apple silicon
+#   (arm64) and one for Intel (x64). Each signs
 #   "Wisp Paper.app" with the Developer ID certificate, has Apple notarize the
 #   app and the DMG, and staples the tickets. The certificate lives in a
 #   keychain made for the run.
@@ -114,12 +114,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: universal
-            targets: aarch64-apple-darwin x86_64-apple-darwin
-            lipo: arm64 x86_64
           - arch: arm64
-            targets: aarch64-apple-darwin
+            target: aarch64-apple-darwin
             lipo: arm64
+            other: x86_64
+          - arch: x64
+            target: x86_64-apple-darwin
+            lipo: x86_64
+            other: arm64
     env:
       VERSION: ${{ needs.check.outputs.version }}
       ARCH: ${{ matrix.arch }}
@@ -129,7 +131,7 @@ jobs:
           ref: ${{ env.BUILD_REF }}
       # rust-toolchain.toml names the toolchain; rustup installs it on first use.
       - run: rustup show
-      - run: rustup target add ${{ matrix.targets }}
+      - run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-${{ matrix.arch }}
@@ -183,8 +185,9 @@ jobs:
             --team-id "${APPLE_TEAM_ID}" \
             --password "${APPLE_APP_PASSWORD}"
 
-      # The binary (both architectures in one for universal), the bundle, its
-      # signature, the DMG, and (signed) Apple's tickets. A signature or
+      # The binary for this architecture (cross-compiled for Intel on an Apple
+      # silicon runner), the bundle, its signature, the DMG, and (signed)
+      # Apple's tickets. A signature or
       # notarization that fails fails the script, so a signed run cannot end
       # with an unsigned DMG.
       - name: Build and package
@@ -193,7 +196,8 @@ jobs:
       - name: Check the package
         env:
           SIGNED: ${{ needs.check.outputs.sign }}
-          LIPO_ARCHS: ${{ matrix.lipo }}
+          LIPO_ARCH: ${{ matrix.lipo }}
+          OTHER_ARCH: ${{ matrix.other }}
         run: |
           set -euo pipefail
           dmg="dist/WispPaper-v${VERSION}-macos-${ARCH}.dmg"
@@ -205,15 +209,19 @@ jobs:
           fi
           codesign --verify --strict --verbose=2 "${app}"
           for binary in wisp_paper wisp; do
-            read -r -a archs <<<"${LIPO_ARCHS}"
-            lipo "${app}/Contents/MacOS/${binary}" -verify_arch "${archs[@]}"
-            # The Apple silicon DMG holds nothing else.
-            if [[ "${ARCH}" == arm64 ]] && lipo "${app}/Contents/MacOS/${binary}" -verify_arch x86_64 2>/dev/null; then
-              echo "::error::${binary} in the arm64 package also holds x86_64" >&2
+            lipo "${app}/Contents/MacOS/${binary}" -verify_arch "${LIPO_ARCH}"
+            # Each DMG holds its own architecture and nothing else.
+            if lipo "${app}/Contents/MacOS/${binary}" -verify_arch "${OTHER_ARCH}" 2>/dev/null; then
+              echo "::error::${binary} in the ${ARCH} package also holds ${OTHER_ARCH}" >&2
               exit 1
             fi
           done
-          "${app}/Contents/MacOS/wisp" help >/dev/null
+          # The Intel binary runs here through Rosetta, where the runner has it.
+          if arch "-${LIPO_ARCH}" /usr/bin/true 2>/dev/null; then
+            arch "-${LIPO_ARCH}" "${app}/Contents/MacOS/wisp" help >/dev/null
+          else
+            echo "::warning::No way to run ${LIPO_ARCH} on this runner: wisp help not tried"
+          fi
           hdiutil verify "${dmg}" >/dev/null
           if [[ "${SIGNED}" != true ]]; then
             echo "Rehearsal: ad hoc signature, not notarized"
@@ -385,8 +393,8 @@ jobs:
           cd dist
           ls -la
           count() { find . -maxdepth 1 -type f -name "$1" | wc -l; }
-          if (( $(count '*-macos-universal.dmg') != 1 || $(count '*-macos-arm64.dmg') != 1 || $(count '*.dmg') != 2 || $(count '*.zip') != 1 || $(count '*.tar.gz') != 1 )); then
-            echo "::error::Expected two DMGs (universal, arm64), one zip and one tar.gz" >&2
+          if (( $(count '*-macos-arm64.dmg') != 1 || $(count '*-macos-x64.dmg') != 1 || $(count '*.dmg') != 2 || $(count '*.zip') != 1 || $(count '*.tar.gz') != 1 )); then
+            echo "::error::Expected two DMGs (arm64, x64), one zip and one tar.gz" >&2
             exit 1
           fi
           sha256sum *.dmg *.zip *.tar.gz > SHA256SUMS

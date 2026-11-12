@@ -85,7 +85,8 @@
   if (os) $(`.dl[data-os=${os}]`).classList.add('mine');
 
   // release.json is written when the site is deployed (see .github/workflows/pages.yml).
-  const WANTED = { mac: [/macos-universal/, /macos.*arm64/, /macos/], win: [/windows/], linux: [/linux/] };
+  // Earlier releases had one universal DMG; both Mac buttons lead to it there.
+  const WANTED = { mac: [/macos.*arm64/, /macos-universal/], 'mac-intel': [/macos.*x64/, /macos-universal/], win: [/windows/], linux: [/linux/] };
   fetch('release.json').then(response => response.ok ? response.json() : null).then(release => {
     if (!release || !release.tag || !Array.isArray(release.assets)) return;
     const version = $('[data-version]');
@@ -103,10 +104,11 @@
       const asset = patterns.map(pattern => release.assets.find(a => pattern.test(a.name))).find(Boolean);
       if (!asset) continue;
       const kind = (asset.name.match(/\.(dmg|zip|tar\.gz)$/) || [])[1];
-      const button = $(`[data-asset=${key}]`);
+      const button = $(`[data-asset="${key}"]`);
       button.href = asset.url;
-      button.textContent = kind ? '下载 .' + kind : '下载';
-      $(`[data-file=${key}]`).textContent = `${asset.name}　${(asset.size / 1048576).toFixed(1)} MB`;
+      const label = button.dataset.label ? button.dataset.label + ' ' : '';
+      button.textContent = label + (kind ? '下载 .' + kind : '下载');
+      $(`[data-file="${key}"]`).textContent = `${asset.name}　${(asset.size / 1048576).toFixed(1)} MB`;
     }
   }).catch(() => {});
 })();
