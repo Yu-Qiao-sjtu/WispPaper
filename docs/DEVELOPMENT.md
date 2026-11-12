@@ -45,6 +45,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 | `store` | 一个文献库：SQLite 数据库和 `papers/` 里的附件 |
 | `filter` | 搜索、筛选、排序、侧栏计数 |
 | `import` / `export` | BibTeX、RIS 读入；BibTeX、CSV 写出 |
+| `zotero` | 只读 Zotero 本地 SQLite 快照，读取元数据、标签、笔记与分类，逐条去重并复制 PDF；单条失败保留在结果中 |
 | `lookup` | Crossref / Europe PMC 返回值 → 文献 |
 | `sources` | 文献数据库检索：要请求的地址，以及从返回内容读出的记录 |
 | `fulltext` | PDF 逐页文字提取；引文与页面字形的比对 |

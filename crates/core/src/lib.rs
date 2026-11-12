@@ -6,6 +6,7 @@
 //! - `store`    one library on disk: a SQLite file plus `papers/`
 //! - `filter`   search, filters, sorting and the sidebar counts
 //! - `import`   BibTeX and RIS readers
+//! - `zotero`   read-only local Zotero import, with notes, tags and PDF copies
 //! - `export`   BibTeX and CSV writers
 //! - `lookup`   Crossref / Europe PMC records → `Paper`
 //! - `fulltext` page text of a stored PDF
@@ -39,3 +40,4 @@ pub mod structure;
 pub mod time;
 pub mod tools;
 pub mod update;
+pub mod zotero;
