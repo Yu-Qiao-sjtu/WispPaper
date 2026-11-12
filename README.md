@@ -50,6 +50,7 @@
 | 平台 | 文件 | 说明 |
 |---|---|---|
 | **macOS** | `WispPaper-v<版本>-macos-universal.dmg` | Apple 芯片与 Intel 通用，Developer ID 签名并经 Apple 公证。打开后把 Wisp Paper 拖进「应用程序」 |
+| **macOS**，仅 Apple 芯片 | `WispPaper-v<版本>-macos-arm64.dmg` | 同上，只含 Apple 芯片的代码，体积约为通用版的一半 |
 | **Windows** 10 / 11（x64） | `WispPaper-v<版本>-windows-x64.zip` | 解压后运行 `WispPaper.exe`，带 Authenticode 签名 |
 | **Linux**（x64） | `WispPaper-v<版本>-linux-x64.tar.gz` | 解压后运行 `wisp-paper`；没有签名，也没有在真机上测试过 |
 
