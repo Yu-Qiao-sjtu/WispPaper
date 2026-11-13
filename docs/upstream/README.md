@@ -2,6 +2,8 @@
 
 本索引承接已关闭的 [上游概念 issue #29](https://github.com/xuzhougeng/WispPaper/issues/29)，在 [Yu-Qiao-sjtu/WispPaper](https://github.com/Yu-Qiao-sjtu/WispPaper) 中持续整理需求、开发者取舍、实现、发布边界与剩余工作。它是 fork 的观察与规划记录，不代表上游接受了 #29 的全部构想，也不表示已经把上游应用代码合入本 fork。
 
+长期讨论与新需求归属：[fork 总追踪 issue #2](https://github.com/Yu-Qiao-sjtu/WispPaper/issues/2)。
+
 上游定位是本地优先的文献库与研究写作应用：用 Rust／GPUI 提供收集、检索、阅读、筛选、问答与稿件界面，CLI／MCP 共享文献工具。fork 的演进以可追溯的 AI 写作和证据组织为中心；远端计算、实验与图形工作流通过可选边界逐步连接。
 
 快照时间：**2026-11-13 16:56:49（北京时间）**。本次收录全部 **21 个 issue、57 个 PR**，包括已关闭的历史记录。后续状态变化应另建快照，不能悄悄改写本次依据。
