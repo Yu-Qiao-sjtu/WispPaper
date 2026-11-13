@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-11-13T08:56:49Z",
+  "upstream": "xuzhougeng/WispPaper",
+  "fork": "Yu-Qiao-sjtu/WispPaper",
+  "release_tag": "v0.6.0",
+  "release_commit": "60703bd1251456dd78eb13dad100de764fe3611d",
+  "main_commit": "facc7b249d04b14064b77eb4e167c7efc7d5732a",
+  "fork_commit": "c7f84ea5ea52fbea148f592cf5df4fb18044d319",
+  "release_published_at": "2026-11-13T02:27:00Z",
+  "open_prs": [
+    77,
+    78
+  ],
+  "issue29_state": "CLOSED",
+  "scope": "Public issues, comments, PRs and exact Git source; no private screenshots or manuscript content."
+}
