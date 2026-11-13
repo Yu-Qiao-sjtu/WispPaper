@@ -1,0 +1,910 @@
+[
+  {
+    "baseRefName": "main",
+    "body": "Follows #76. A Word file whose headings were typed as plain paragraphs used to come in as a single 正文 section. That broke the section pills, the kind-based candidates and the per-section comment counts.\n\n**Guessing** (`crates/core/src/headings.rs`): a paragraph counts as a heading when it is short and doesn't end like a sentence, and at least one of these holds:\n- it names a part every paper has\n- it is numbered: `一、` `（一）` `1.` `1.1` `第二章` `II.`\n- it ends with the figure it shows: `（图1）`, `(Fig. 2A)`\n- it is set in bold (the docx reader now reports this per paragraph)\n- it stands alone between longer paragraphs\n\nThese are not taken for headings: legends (`图1 …`, `Figure 2.`), keyword and author lines, numbered items next to each other (a list), and anything after 参考文献. Numbering kinds decide the level, so `（一）` sits under `一、` and `1.1` under `1.`.\n\n**The person confirms:** when an imported file has guesses, a dialog (按哪些段落分节？) lists them. Each row shows the reason it was guessed and the start of the paragraph that follows. The highest level is ticked beforehand. `from_word_with` makes sections only at the ticked paragraphs; nothing is cut without the dialog. If several files are dropped at once, they are asked about one after another.\n\n**In the editor:**\n- 设为标题 and 从这里拆成新节 cut the section at the caret's paragraph (`Store::split_section`). Comments go with their words, and a snapshot is taken first.\n- 并入上一节 in a section's menu is the inverse (`merge_section`).\n- Setting the first paragraph of the unnamed 正文 section as a heading names that section, instead of leaving an empty one behind.\n\n**Word export:** a section name that came from a plain paragraph is written back as that same paragraph, with no heading style added. A section cut off without a heading is `bare`, so its name goes into no file.\n\n**Checked:**\n- `cargo test`: all crates pass, including the new Chinese and English guessing tests and a store test that imports, splits, merges and exports with `kept 9, changed 0, added 0`.\n- `cargo clippy --all-targets` is clean.\n- `docx` example on a generated styleless Chinese review: guesses listed. `guessed` mode wrote 21 paragraphs kept and 0 style changes; LibreOffice reads the result back the same.\n- Scripted window run (`importdoc`, `headings:3`, `submit`, `split:heading`, `merge`, `exportdoc`): the dialog, the import and the split render, and both Word exports still had no heading styles.\n\n**Left out:**\n- Markdown files keep the old rule (common names only).\n- When a section is merged back, a paragraph that had a real Heading style in the file keeps that style on export, because `rewrite` keeps an unchanged paragraph's XML.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T08:54:24Z",
+    "headRefName": "claude/word-heading-guesses",
+    "headRefOid": "d78d482b99e5a10fcddd3a3a84dbee55944a8b6c",
+    "mergeCommit": null,
+    "mergedAt": null,
+    "number": 78,
+    "state": "OPEN",
+    "title": "写作: guess headings in Word files without heading styles, split sections in the editor",
+    "updatedAt": "2026-11-13T08:54:24Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/78"
+  },
+  {
+    "baseRefName": "claude/write-page-polish",
+    "body": "Stacked on #76 (uses its `length_label`); retarget to `main` once that merges.\n\n## What\n\n**Outline instead of the library sidebar while writing.** On 写作 the sidebar (tags, 全部文献/未读 counts) is replaced by the manuscript's outline (`render_outline` in `src/manuscripts.rs`):\n- the manuscript's title, its total length and how many comments are open\n- each section with its number, name, kind (when the name differs from it), its length (字 / 词), and a badge with its open comments; click to open it; the current one has its section menu (chevron, right click)\n- 添加一节, 通读全文 and the manuscripts menu\n- a top row「<library> · 文献库导航」 shows the library's navigation again (`Cmd::WriteNav`, `Writing::library_nav`), until 写作 is opened again (its row in that navigation brings the outline back)\n\n`Workspace::sidebar_width`, dragging and hiding work as before. While the outline is on screen the section pills over the editor are left out; they come back when the sidebar is hidden or shows the library.\n\n**Comments tied to their words.**\n- A marker sits in the editor's right margin on each line where commented words begin (one per line, with a count when several share it); hovering shows who said what and what a proposal would change.\n- Clicking a marker or the tinted words turns the side panel to 批注 and shows that comment: its card is outlined and scrolled into view. A marker also selects the words (`Do::Show`); a click in the text leaves the caret where it was placed, so the words aren't overwritten by typing.\n- `TextInput` emits `InputEvent::MarkClicked(n)` for a click (not a drag) inside a mark and exposes `mark_tops()`, where the last frame drew each mark. When they move it requests another frame, so the markers catch up after wrapping or typing.\n- The card list is only scrolled once it has been drawn (`comment_reveal`): a `ScrollHandle` that hasn't been laid out yet scrolls by stale bounds.\n\n## Checked\n- `cargo clippy --all-targets` has no warnings from this code, and `cargo test` passes.\n- Window via `WISP_PAPER_DEV` `shot:` steps on a seeded library with an imported Chinese .docx carrying 10 Word comments over 4 sections: the outline shows the lengths and comment counts; markers line up with the tinted lines, including a wrapped second line; clicking a marker switches 候选句 → 批注, selects the words and outlines the card, with the hover tip showing; clicking tinted text places the caret and outlines the card; the library-navigation row brings back the normal sidebar and the section pills; clicking 结果 in the outline opens it.\n- Not checked: dark theme, and scrolling to a card below the fold in a long list (the test sections had at most 3 cards).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-13T08:50:13Z",
+    "headRefName": "claude/write-outline-comment-markers",
+    "headRefOid": "d9fd15fd1e25d3764098ac88c0850da3a0c4d4d2",
+    "mergeCommit": null,
+    "mergedAt": null,
+    "number": 77,
+    "state": "OPEN",
+    "title": "写作: manuscript outline in the sidebar, comment markers in the margin",
+    "updatedAt": "2026-11-13T08:50:13Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/77"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The writing page explained itself in full sentences everywhere. This PR moves those explanations behind hover and tightens the candidates panel, the cards and the references box.\n\n## What changes\n- **Hints become ⓘ icons** (`ui::hint`): the two lines over the manuscript, the find button's line, the label over the model's search groups, the 「对光标所在的段落：」 prefix and the references box's Pandoc note. Each now sits next to what it explains and shows on hover.\n- **Model actions become icons** (`ui::icon_action`), like the sparkles in the figure library. The groundwork runs are a sparkle (sort into parts) or a scan icon (read pages) with the number of papers, and the tooltip says what each does.\n- **Candidates panel**\n  - The find button is an icon at the end of the find box.\n  - The header shows only `308 句`; the full account is on hover.\n  - The tag chips become one 范围 button with a menu (`MenuKind::WriteNarrow`, up to 24 tags).\n  - The groundwork line keeps its first fact and shows the rest on hover.\n- **Cards**: 引用 always shows. 上下文 / 复制 / 原文 appear over the end of the source line on hover, so they take no width otherwise. The journal name is dropped (it was always cut short).\n- **Editor**: the text column is capped at 720px. The references box puts its find field in its header row.\n- **Lengths**: `text_length` counts a CJK character as one, so a Chinese draft reads 「84 字」 instead of 「34 词」 (the old count split on spaces only).\n- **No table rows or notes among candidates**: `structure::apparatus` rejects table cells read as one line (≥5 bare numbers making up ≥10% of the tokens) and table notes (`Note:`, `Abbreviations:`, `注：`).\n  - `usable()` leaves these out of newly stored sentences.\n  - `find_sentences` filters the ones earlier builds already stored, so nothing has to be sorted again and `structure::VERSION` is unchanged.\n\nNot in this PR (larger, kept for separate work): guessing headings when a Word file has no heading styles, replacing the library sidebar with the manuscript outline while writing, and comment markers in the editor's margin.\n\n## Checked\n- `cargo clippy --all-targets` is warning-free and `cargo test` passes. New tests: `structure::apparatus_is_not_prose`, `write::length_as_a_writer_counts_it`.\n- Off-screen window shots (`shot:`) of a seeded library of real plant single-cell PDFs: the panel header, the 范围 menu, card actions on hover, 「84 字 · 已保存」. Not checked: the window in English, the stacked narrow layout, and the 720px cap at a window wide enough to show it.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T08:31:24Z",
+    "headRefName": "claude/write-page-polish",
+    "headRefOid": "965260eb3eca1bd3029279ee5750a4a9696facba",
+    "mergeCommit": {
+      "oid": "facc7b249d04b14064b77eb4e167c7efc7d5732a"
+    },
+    "mergedAt": "2026-11-13T08:32:54Z",
+    "number": 76,
+    "state": "MERGED",
+    "title": "写作: hints on hover, a quieter candidates panel, lengths in 字",
+    "updatedAt": "2026-11-13T08:32:54Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/76"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Selecting manuscript text now opens rewrite, translation, polish, citation and comment actions beside the selection instead of beneath the editor. The compact menu follows scrolling, stays within the editor, and closes on Escape, outside clicks or an action while preserving the text passed to that action. Paragraph actions remain available when nothing is selected.\n\nUpdated the writing documentation to match.\n\nValidation:\n- `cargo test -p wisp_paper --offline`: 26 passed.\n- `cargo clippy -p wisp_paper --all-targets --offline -- -D warnings`: passed.\n- Windows UI checked in an isolated library: compact placement, reverse and multiline selection, top-edge fallback, scrolling, hiding offscreen, Escape, and comment action retaining the selected quote.\n- The compiled binary was exercised from `target/debug/deps`; `cargo build` could not replace the existing `target/debug/wisp_paper.exe` because another process holds it open.\r\n",
+    "createdAt": "2026-11-13T08:19:21Z",
+    "headRefName": "codex/writing-selection-toolbar",
+    "headRefOid": "3cfc58201816c291b9551ba5946521ef402c6a44",
+    "mergeCommit": {
+      "oid": "cf577b0fd6875a2aa0cf442d92258e23c63fcb25"
+    },
+    "mergedAt": "2026-11-13T08:20:07Z",
+    "number": 75,
+    "state": "MERGED",
+    "title": "Show writing actions beside the text selection",
+    "updatedAt": "2026-11-13T08:20:07Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/75"
+  },
+  {
+    "baseRefName": "main",
+    "body": "PDF text selections can now be underlined or highlighted and kept across sessions. An annotation panel lists the saved passages, jumps back to their location, and lets the reader edit a note or delete a mark. Selection actions wrap within narrow PDF panes, with Chinese and English labels.\n\nAnnotations are stored in a new SQLite table and drawn over the PDF at its current zoom. Each record keeps the paper and attachment IDs, 1-based page, original selected text, per-line rectangles in PDF points, annotation type, user note, and timestamps. The source PDF is unchanged. Marks survive paper trash/restore; removing their attachment or permanently deleting their paper removes the associated records.\n\nThe built-in assistant, CLI, and read-only MCP clients can use `list_pdf_annotations` to filter by paper, attachment, page, type, or text and paginate results. `get_paper` reports the annotation count. Agent instructions distinguish selected source text from the reader's own notes. Usage and data/privacy documentation are updated.\n\nValidation:\n\n- `cargo test`\n- `cargo clippy --all-targets -- -D warnings`\n- Storage tests cover reopening, unchanged PDF bytes, attachment isolation, deduplication, invalid anchors, migration, notes, and deletion/trash behavior.\n- Tool tests cover filters, pagination, annotation counts, and read-only MCP access.\n- Desktop interaction was tested and confirmed by the requester.\n",
+    "createdAt": "2026-11-13T08:03:01Z",
+    "headRefName": "codex/pdf-annotations-metadata",
+    "headRefOid": "1130fad56954f65ead57a2ad2a9427ec7940ed71",
+    "mergeCommit": {
+      "oid": "b302168a3f798559a015ee0c7b502750d5836c5b"
+    },
+    "mergedAt": "2026-11-13T08:08:58Z",
+    "number": 74,
+    "state": "MERGED",
+    "title": "Add PDF underlines, highlights and agent-readable annotations",
+    "updatedAt": "2026-11-13T08:08:58Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/74"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Clicking a citation such as `[P429 p.8]` previously scrolled to the PDF page without any visual marker because only citations containing a quotation entered the highlighting flow. Page-only citations now mark the destination page and explain that no specific passage was supplied; quoted citations retain sentence highlighting.\n\nSearch results are tied to the latest navigation request so an earlier search cannot replace a newer citation or scroll back to it. The assistant instructions also favor verified original-text quotations when summarizing full text, while retaining page-only references when no exact sentence is available.\n\nValidation:\n- 260 tests passed across the desktop, core, CLI, and networking crates; one external-service test remains ignored. Local HTTP tests passed outside the restricted sandbox.\n- `cargo clippy --offline --all-targets -- -D warnings` and the Windows debug build passed.\n- Windows manual check confirmed citation-card navigation to page 8 with a visible page border and explanatory hint. Sentence-highlight UI verification remains pending; automated tests cover page-only references, stale search results, and missing-quotation state transitions.\n",
+    "createdAt": "2026-11-13T07:42:23Z",
+    "headRefName": "codex/fix-pdf-citation-highlight",
+    "headRefOid": "a2f9fd85aa76218f9a86bd28b5145ba921064aea",
+    "mergeCommit": {
+      "oid": "c08cb4db72279a648d24c4d5f1b94dd515b36d69"
+    },
+    "mergedAt": "2026-11-13T08:03:49Z",
+    "number": 73,
+    "state": "MERGED",
+    "title": "Fix PDF citation highlighting for page-only references",
+    "updatedAt": "2026-11-13T08:03:49Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/73"
+  },
+  {
+    "baseRefName": "main",
+    "body": "写作 now has three ways to start: from nothing, from a file, and from what the assistant wrote. A manuscript that came from a Word file is reviewed with comments as in Word's review, and goes back into that file.\n\n## What changes\n\n- **Import.** 稿件 › 导入 Word / Markdown 文件…, or a .docx dropped on the window (on the writing page, .md and .txt too). Headings become the sections; a Word file without heading styles is cut at the names every paper has (摘要, 引言, Methods…). The comments a Word file came with are read in.\n- **From the assistant.** The same menu lists the reviews the assistant wrote sections for (从助手的综述新建), beside the existing 存为新稿件 / 插入到稿件.\n- **批注.** The panel beside the manuscript has a second page beside 候选句. The words a comment is about are tinted in the manuscript; a section's pill counts its open comments.\n- **Review by the assistant.** 让助手审阅这一节 (or the selection, with a line saying what to look at). Each remark names the words it is about and may propose words for their place; it answers the collaborators' comments first. Only the person takes a proposal: the comment then stands on the new words and keeps the old, and can be taken back. A new review replaces the last one's remarks that still wait.\n- **Comments of one's own**, on the selection.\n- **Export to Word.** A manuscript that came from a Word file is that file written again: a paragraph that did not change is left as it is to the byte (with tables, pictures, footnotes and fields where they were), a changed one is changed inside the runs it has, comments are Word's own. 改动记为修订 writes the changes as `w:ins` / `w:del` for the reader to accept or reject. A manuscript written from nothing is exported with its comments too.\n- In a manuscript from a Word file, replacing a paragraph with 润色 / 改写 leaves a comment saying what was done and what stood there.\n- 设置 › 通用 › 写作 › 署名: whose name the comments and revisions of an export carry.\n\n## How\n\n- `crates/core/src/docx.rs`: the archive and the XML are read by hand, so that what is not changed is written back as it was. `read` (paragraphs, heading levels, comments with the words their ranges cover), `rewrite` (`align` matches the file's paragraphs with the manuscript's, `Para::edited` changes a paragraph word by word inside its runs).\n- `crates/core/src/comment.rs`: `manuscript_comments`, each found again by the quotation it is about (`locate`); `review_prompt` / `parse_review`, a quotation kept only when the text has it.\n- `crates/core/src/manuscript.rs`: `from_word` / `from_markdown`, `Store::import_manuscript` (the Word file is kept under `manuscripts/`), `wanted`, `Store::manuscript_word`.\n- `src/comments.rs`: the panel, the import, the review; `TextInput::set_marks` tints ranges of a field.\n- New tables are made beside the library's own and one column is added by `add_columns`: no schema version bump. `flate2` becomes a direct dependency of `wisp_core` (it was in its tree already).\n\n## Checked\n\n- `cargo test` and `cargo clippy --all-targets`: clean.\n- Files made by LibreOffice and by macOS `textutil`: written again unchanged, `word/document.xml` is identical; with changes, tracked changes and comments, every part is well-formed and LibreOffice reads the result and writes it again with the comments and revisions intact.\n- In the window, with a real model: import a Word file with comments → review → take all → export with tracked changes (11 comments, read back). Markdown import, a comment of one's own, a manuscript from a review of the assistant's (mock model).\n\n## Not checked, and left out\n\n- **The exported files were not opened in Microsoft Word or WPS** (neither is on the machine this was built on), and no file written by Word itself was tried. Worth one look with a real manuscript before a release.\n- Tables and pictures are not shown in the editor (they stay in the file and are there again on export); text inside tables cannot be changed.\n- A comment that came with a file can only be marked as dealt with, not removed or replied to.\n- A paragraph moved to another place loses its inline formatting.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T07:04:41Z",
+    "headRefName": "claude/word-review-comments-8a8222",
+    "headRefOid": "aacdc4b329e7c289db214fbb89fa28a3507c635d",
+    "mergeCommit": {
+      "oid": "b346de4b414e2d688051d05abf147cbcbccab589"
+    },
+    "mergedAt": "2026-11-13T07:06:27Z",
+    "number": 72,
+    "state": "MERGED",
+    "title": "批注: manuscripts from Word and Markdown files, reviewed with comments, written back into the Word file",
+    "updatedAt": "2026-11-13T08:01:38Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/72"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The outline of a review now comes in two stages, after the F0 → F1 idea of [gzd-review-writing](https://github.com/Shipeng-Guo/gzd-review-writing): read the reviews already published first, then rebuild the outline from the library's own papers.\n\n## What changes\n\n`/review` goes through four steps instead of three:\n\n1. **写作要求**: as before.\n2. **初步框架** (new): the assistant finds the reviews already published on the topic (those in the library, and those `search_online` finds), compares what each asks, how it is laid out, its strengths and blind spots, says for each whether it read the full text, the abstract or only the record, and proposes a starting framework: each chapter's question and provisional answer. It is a starting point that nothing has borne out yet.\n3. **大纲**: built against the framework from the library's papers. Each chapter is kept, reworded, merged, split, dropped or new, with the papers that made it so; what the library's evidence does not bear out and what the published reviews did not cover are listed apart.\n4. **分节写作**: as before.\n\nDetails:\n\n- `Review::framework` and `framework_confirmed`; `ReviewAction::SetFramework`, `ConfirmFramework`, `SkipFramework`. A framework worded anew asks for its confirmation and the outline's again; sections and evidence stay.\n- A topic without reviews to read: 跳过 goes on to the outline (only while no framework is recorded). A record from before this change, which has an outline and no framework, stands where it stood (`Review::framework_settled`). No schema change: the record is one JSON body.\n- The `/review` template and the note each question carries (`chat::review_note`) say what the step asks of the model; the framework goes along until the outline is confirmed.\n- The bar over the conversation offers the request that asks for the step's text (提出初步框架, 重建大纲) where it is still to come.\n- The record shows 初步框架 between 写作要求 and 大纲; a review that went on without one can add it later.\n- Dev steps `review:framework` and `review:skip`; `review:confirm` confirms the framework at step 2.\n- English labels, TUTORIAL.md §9, FEATURES.md and CLAUDE.md updated.\n\n## Checked\n\n- `cargo clippy --all-targets` without warnings and `cargo test` passing, after merging main.\n- A scripted run in the window against a real model (a library of 40 PubMed records on root responses to soil compaction, 5 with full text): requirements → framework → outline. The framework came back as a table of ten reviews with 「未读到」 for every structure it had not read and the reading basis per review; the outline came back as a chapter-by-chapter comparison with the framework, then the outline with what was read in full and what only as an abstract.\n- Not checked in the window: the English labels, 跳过, and a record from 0.6.0 (the last is covered by a test).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T06:17:18Z",
+    "headRefName": "review-frameworks",
+    "headRefOid": "e3169ee2490a73f47e4c43cf6ea7010817216c6a",
+    "mergeCommit": {
+      "oid": "74c98c24d4a5ba2dc41b59507f40c42cc41ea258"
+    },
+    "mergedAt": "2026-11-13T06:26:06Z",
+    "number": 71,
+    "state": "MERGED",
+    "title": "Review: a framework from the published reviews before the outline",
+    "updatedAt": "2026-11-13T08:01:42Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/71"
+  },
+  {
+    "baseRefName": "keep-running",
+    "body": "Stacked on #69 (`keep-running`): the settings here already carry `keep_running`. Once #69 is merged, this PR can be retargeted to `main`.\n\n## What changes\n\n**Providers with several models** (`crates/core/src/provider.rs`)\n- A `Provider` is one address, key, proxy and protocol, and offers any number of `Model`s (model name and thinking setting). Tasks are bound to a model id that is unique across providers.\n- A new settings file starts with **DeepSeek, Kimi and GLM**. 添加服务 also offers Claude, OpenAI and any other OpenAI-compatible service.\n- Each preset reads its own key variable (`DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `ZHIPUAI_API_KEY`, …), so an `OPENAI_API_KEY` in the environment is never sent to DeepSeek.\n- Requests still go through the flat `ai::Profile` (`Provider::profile`). Nothing outside the settings changed how it asks a model.\n- Old `profiles` are migrated on load: profiles that share address, key and proxy become one provider, and model ids are kept, so task bindings stay. `profiles` is never written again.\n- An unbound task falls back to the chat model, then the first model that has a key, then the first model.\n\n**设置 › AI, now with three tabs**\n- **模型**: the providers in a list at the left, each with its mark, its status (缺 API Key / n 个模型) and a dot when in use. The provider picked is at the right: name, protocol, address, key (saying whether it comes from the environment), proxy, a link to get a key, and its models. Each model has its thinking setting and the tasks it serves. A model is added by typing and Enter, and the field keeps the keyboard for the next one.\n- **任务**: a card per task with its model picker, which says when that model has no key. 批量筛选 keeps 同时阅读的篇数, and 翻译 holds its 提示词.\n- **命令**: the former 命令 page. `settings:commands` and `command:<n>` still work.\n- The providers' marks come from [lobe-icons](https://github.com/lobehub/lobe-icons) (`@lobehub/icons-static-svg` 1.100.0, MIT), shown on tiles in each brand's colour. This is noted in THIRD_PARTY.md.\n\n## Checked\n- `cargo clippy --all-targets` is clean. `cargo test` passes, with new tests for presets, keys, migration and fallback.\n- The window was checked through `shot:` renders in light and dark mode, on all three tabs and the add-provider menu. Adding a model by keyboard was written to `settings.json`.\n\n## Not checked\n- No real request was sent to DeepSeek, Kimi or GLM.\n- The preset model names (`deepseek-v4-pro` / `deepseek-v4-flash`, `kimi-k2.6`, `glm-5.3` / `glm-5.1`) come from the providers' docs and third-party pages, which partly disagree. They are editable.\n- The English UI was not looked at.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T05:32:05Z",
+    "headRefName": "ai-providers",
+    "headRefOid": "2dd724ef1e20a9cd471d68e7d116c63b25043560",
+    "mergeCommit": {
+      "oid": "3ca802a801b513ea278b4dfcbe3455a113d1acc0"
+    },
+    "mergedAt": "2026-11-13T05:48:10Z",
+    "number": 70,
+    "state": "MERGED",
+    "title": "Split 设置 › AI into 模型, 任务 and 命令; providers with several models",
+    "updatedAt": "2026-11-13T08:01:37Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/70"
+  },
+  {
+    "baseRefName": "main",
+    "body": "关闭窗口不再退出：应用留在后台，筛选、导入和定时检索同步照常进行。\n\n## What changes\n- **Setting**: 设置 › 通用 › 后台 › 关闭窗口后在后台运行 (`Settings::keep_running`, on by default, also for existing settings files). Off: closing quits as before.\n- **macOS**: the close button hides the app; the Dock icon brings the window back (`on_reopen`). The app had no menu, so no ⌘Q; it now has one: 设置…, 隐藏 (⌘H), 隐藏其他, 全部显示, 退出 (⌘Q), rebuilt when the interface language changes.\n- **Windows**: the close button hides the window behind a tray icon (`tray-icon` 0.25, Windows-only dependency) whose click brings it back and whose menu has 打开 / 退出. A second launch for the same settings file brings the running window up instead of opening a second instance on the same database (`hand_over`: a marker file in the temp folder with the pid and window handle, checked against the process and GPUI's window class).\n- **Linux**: unchanged, closing quits.\n- Debug step `close` acts as the close button.\n\nAll of it is in `src/background.rs`.\n\n## Checked\n- macOS, in a throwaway .app bundle: after closing, the process stays alive and hidden; `open` again unhides it; a quit Apple Event ends it; with the switch off, closing quits. The settings row was looked at in a `shot:`.\n- `cargo clippy --all-targets` clean on macOS; `wisp_core` settings tests and the app's tests pass.\n\n## Not checked\n- **The Windows tray and hand-over have not been compiled or run**: no Windows target on the Mac this was written on. The calls were checked against the `windows-sys` 0.61 and `tray-icon` 0.25 sources; this PR's Windows CI is their first build. Worth a manual try on Windows: close → tray → click back, tray 退出, launch twice.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T05:06:45Z",
+    "headRefName": "keep-running",
+    "headRefOid": "3ca802a801b513ea278b4dfcbe3455a113d1acc0",
+    "mergeCommit": {
+      "oid": "ac3e9bbd9d3680bd8dc493aeecb9b3093ad14335"
+    },
+    "mergedAt": "2026-11-13T05:53:17Z",
+    "number": 69,
+    "state": "MERGED",
+    "title": "Keep running in the background when the window closes",
+    "updatedAt": "2026-11-13T08:01:40Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/69"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Stacked on #67 (助手 and 提取); review that one first. This is the third step of the plan for the app's AI features: the assistant could search, import and propose, but could not organise what the library holds, and it had no way to or from the manuscripts.\n\n## What\n\n**Organising** (`organise.rs`, tool `organise_papers`)\n\n- Tags added or removed, the star, the reading status, and a paragraph added to the end of the notes (marked as the assistant's, never replacing what is there), for any number of papers in one call. One transaction: all of it or none.\n- In the window the tool asks first, and the consent card lists what it would change paper by paper, only what differs from how the paper is. A call that could not run (a paper missing or in the trash) is not asked about and fails by itself.\n- It cannot set the screening decision or a custom field: those stay with `suggest_screening` and `suggest_field`.\n- `ai::resolve_labels` reads labels inside a list of objects, so `changes[].id` may be `P3`.\n\n**Manuscripts**\n\n- `list_manuscripts` and `read_manuscript`, read-only.\n- 插入到稿件 under an answer of the assistant (and 所选插入稿件 for a selection) adds the text to the end of a section the person picks. `[P3 p.5 \"…\"]` becomes `[@Key, p. 5]`, the section's text is kept as a snapshot first, and the keys are kept with their papers (`Store::append_to_section`).\n\n**配引用 on the writing page** (`ai::Assist::Cite`)\n\n- `find_citations` looks through the library for each sentence off the main thread; the model chooses among those candidates and places `[@Key]`, told to leave the words alone. The card shows the result beside the original with what was added marked; only the person replaces the paragraph.\n\n**Start page**: a fourth card, 整理, and the cards two to a row.\n\n## Checked\n\n- `cargo clippy --all-targets` is warning-free; `cargo test` passes (202 in core, with new tests for the organise rules, the tools, appending to a section and the cite prompt).\n- Driven in the window with dev steps against `mock_model` (which now answers 「试试整理」 and a citation request): the consent card and the write, the failure path, inserting an answer into a section, and 配引用 through to the replaced paragraph and the kept key.\n\n## Not checked\n\n- No real model was used, so how well a model chooses citations or tags is untested.\n- `find_citations` matches on shared words and wants half of a sentence's terms in a record or page; a paraphrase far from the source finds no candidate, and the card then says there is nothing to cite.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-13T04:50:31Z",
+    "headRefName": "assistant-organise",
+    "headRefOid": "67ccced358e1390b20c69c00b4c7a47bd02cd8ca",
+    "mergeCommit": {
+      "oid": "4247579dfb4afd51dcec42f29e5b574f42eedafe"
+    },
+    "mergedAt": "2026-11-13T04:54:14Z",
+    "number": 68,
+    "state": "MERGED",
+    "title": "Let the assistant organise papers, read manuscripts and place citations",
+    "updatedAt": "2026-11-13T08:01:37Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/68"
+  },
+  {
+    "baseRefName": "main",
+    "body": "## What\n\nTwo steps of the plan for the app's AI features.\n\n**助手** (was 向文献库提问). The page is an agent with 24 tools and 7 commands by now, and \"ask the library\" undersold it.\n\n- The sidebar, the page title, the shortcut (打开助手) and the task label in 设置 › AI call it 助手. The paper's own tab is still 提问.\n- Before a conversation starts, the page lists what the assistant can be asked to do, in three cards (找文献, 读文献, 写). A sentence is sent as it stands; a command such as `/review` is left in the box for its words to follow (`Cmd::StartCommand`).\n- Each task in 设置 › AI says which features use its model (figure legends and the writing page's rewrite use the assistant's; PDF passages and candidate search words use the translation one; extraction uses the screening one).\n\n**提取**. A model reads each paper and proposes values for the library's custom fields, each with a sentence quoted from the paper.\n\n- Proposals are kept apart from the fields (`field_proposals`). Only the person writes a field: the ticked proposals together, in one transaction, and that can be taken back.\n- A Select answer is one of the field's options or is not written; an excerpt is kept only when `ai::locate_quote` finds it.\n- 要点 is an ordinary Text field the feature offers to add. Fields gain a `hint` that tells the model what to look for.\n- Entered from the marked papers' menu, the 提取 page, and a sparkle by each field in the detail panel. Tool `suggest_field` saves a proposal and never writes a field.\n\n## Checked\n\n- `cargo clippy --all-targets` is warning-free and `cargo test` passes on macOS.\n- Both parts were driven in the window with the dev steps against `mock_model` (light, dark and English for the assistant page; a run, the confirmation and the write for 提取).\n\n## Not checked\n\n- No real model was used for 提取.\n- The screenshots in `docs/images` and on the project page still show the old sidebar label; they come from a real 355-paper run that was not repeated.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-13T04:27:20Z",
+    "headRefName": "assistant-and-extraction",
+    "headRefOid": "db6e5cef44f5ff5dba421bb5e796c096c6a6910d",
+    "mergeCommit": {
+      "oid": "5cfb74d6e90407b18bc53178b957903296bd3baa"
+    },
+    "mergedAt": "2026-11-13T04:53:05Z",
+    "number": 67,
+    "state": "MERGED",
+    "title": "助手 and 提取: rename the library chat, and let the assistant fill custom fields",
+    "updatedAt": "2026-11-13T08:01:37Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/67"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The desktop UI was Chinese-only, and longer English labels exposed clipped controls and overlapping text, especially on Writing with paper details open. Add an immediate 中文 / English switch under Settings → General and make the affected layouts adapt to the available space.\n\n## Changes\n\n- Persist `language: zh | en` with backward-compatible Chinese defaults. Add an embedded English catalog, contextual translations, checked bilingual format strings, and render-time input placeholder translation.\n- Localize navigation, dialogs, settings, menus, status labels, progress, writing and chat UI. Keep stored identifiers, existing paper content, notes and model instructions independent of the interface language.\n- Stack the editor and candidates when the writing area is narrower than 680 px. Wrap manuscript/reference tools, candidate statistics and guidance instead of clipping them.\n- Wrap paper-list, PDF, image, search, screening and settings controls; give English table statuses enough column width; make long pages, chat suggestions and short-window sidebars scrollable.\n- Add debug-only window-size and grouped navigation steps, plus a documented UI audit checklist for future layout changes.\n\n## Validation\n\n- `cargo +stable clippy --offline --all-targets --features gpui/runtime_shaders -- -D warnings`\n- `cargo +stable test --offline --workspace --features gpui/runtime_shaders`: 216 passed, 1 existing network lookup test ignored.\n- `git diff --check`; catalog audit found no missing literal UI lookup keys.\n- Native macOS offscreen inspection in Chinese and English at 900×560 and 1360×860, including the selected-paper/detail layout from the report. Covered home, library/details, library and paper chat, history/review, search/guide, all three screening views, writing, figures, seven settings pages and the main create/edit/import/evidence/confirmation dialogs. Used isolated sample libraries, a synthetic PDF with a long filename and a local mock model.\n- Verified the actual language buttons switch existing views and placeholders, and the selection survives restart.\n\nThe local pinned toolchain/Metal compiler was unavailable, so build and test verification used the installed stable toolchain with GPUI runtime shaders. No dependency or release-build configuration changes are included.\n",
+    "createdAt": "2026-11-13T03:08:59Z",
+    "headRefName": "codex/zh-en-ui-layout",
+    "headRefOid": "5c08b3615e10c481305cd4892a0ac20617efe659",
+    "mergeCommit": {
+      "oid": "3f08921469640b58e33f6fd3b0a20f15dd6d08aa"
+    },
+    "mergedAt": "2026-11-13T03:15:31Z",
+    "number": 66,
+    "state": "MERGED",
+    "title": "Add Chinese/English UI switching and fix narrow-window text overflow",
+    "updatedAt": "2026-11-13T08:01:39Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/66"
+  },
+  {
+    "baseRefName": "main",
+    "body": "允许外部智能体直接从空数据目录创建文献库，并通过 CLI 或 MCP 导入本地 PDF、BibTeX、RIS 和 Zotero，无需先在桌面完成建库与导入。\n\n新增四个工具：\n\n| 命令 | 行为 |\n|---|---|\n| `create_library` | 创建独立文献库，返回 ID、主题、颜色和目录 |\n| `import_pdf` | 导入单个 PDF 或递归扫描文件夹，将子文件夹名称转为标签；`--paper-id` 可明确指定附件归属 |\n| `import_references` | 按内容识别 BibTeX / RIS，导入记录并返回新增与跳过的文献 ID |\n| `import_zotero` | 只读 Zotero 数据库，复制支持的记录、标签、笔记和本地 PDF |\n\n复用现有解析、去重和附件复制逻辑：保留已有记录与笔记，回收站条目跳过，同一条目的相同附件内容只保存一次。PDF 导入在本地提取 DOI 与全文，不联网补全元数据，题目缺省使用文件名。结果区分已保存附件、无可读全文和逐项导入问题；MCP 只读模式隐藏并拒绝全部新增写入工具。\n\n新增根目录 `SKILL.md`，提供可执行的 PowerShell 流程、结果核对规则及 MCP 配置，并更新 README、CLI 和 Zotero 文档。本地导入不生成在线检索批次号，不能使用 `undo_import`；PDF / Zotero 部分失败时须检查 `failed` 和 `results[].problems`。\n\n验证（Windows，基于最新 main）：\n\n- `cargo clippy --offline --all-targets -- -D warnings` 通过。\n- `cargo test --offline`：218 项通过，1 项真实联网测试按原配置跳过。网络模拟测试在允许本机回环连接的环境运行。\n- `cargo build --offline --release -p wisp_cli` 通过。\n- release 可执行文件端到端验证：空目录建库、中文和带空格路径、BibTeX / RIS 去重、PDF 文件夹及指定条目附件导入、全文读取、Zotero 缺失附件报告、源文件保持不变、MCP 只读限制。\n",
+    "createdAt": "2026-11-13T02:35:39Z",
+    "headRefName": "codex/cli-library-local-imports",
+    "headRefOid": "e8ef41c3f02f7676c8f5a80b51fa247263f16214",
+    "mergeCommit": {
+      "oid": "2deac1f54744ea15d1be5d86aa89bb8a15e4f025"
+    },
+    "mergedAt": "2026-11-13T03:00:31Z",
+    "number": 65,
+    "state": "MERGED",
+    "title": "feat: 支持 CLI/MCP 建库与本地文献导入",
+    "updatedAt": "2026-11-13T08:01:38Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/65"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Version 0.6.0 and its release notes (`.github/release-notes/v0.6.0.md`). After merging, the tag `v0.6.0` on main starts the signed release.\n\nChecked: `cargo clippy --all-targets -- -D warnings` and `cargo test` on macOS (core 183, window 20).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-13T02:11:53Z",
+    "headRefName": "release-0.6",
+    "headRefOid": "999645d0f7b12668b383fd9d018205c9914ee7c6",
+    "mergeCommit": {
+      "oid": "60703bd1251456dd78eb13dad100de764fe3611d"
+    },
+    "mergedAt": "2026-11-13T02:11:58Z",
+    "number": 64,
+    "state": "MERGED",
+    "title": "0.6.0: reading, screening one by one, reviews with evidence",
+    "updatedAt": "2026-11-13T08:01:42Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/64"
+  },
+  {
+    "baseRefName": "main",
+    "body": "参考 CiteBox 的图片库：读文献时看到值得留下的图或表，在 PDF 上框出来收藏，带上图号、图注、自己的标签和备注，以后按标签和关键词找图，并能回到原文的那一页。\n\n## 改动\n\n- **入口在「收藏」。** 侧栏的「收藏」同时装星标文献和图片，顶上有「文献 / 图片」切换；侧栏的数字是两者之和。\n- **从 PDF 截图收藏。** 工具栏的「截图提问」改名为「截图」，框出一块后多了「收藏到图片库」（原来的「用这张截图提问」还在）。收藏后留在截图状态，可以接着框下一张；对话框取消时框还在。\n- **图号和图注从页面上读出来。** `figure::caption` 在这一页的文字行里找挨着截图的图注：认 `Fig. 2 | …`、`Figure 3.`、`Table S1`、`Extended Data Fig. 4`、`图 3` 等写法，图的图注在下面找、表的在上面找，只在同一栏里找，然后把排版相同的后续行接上。正文里以 `Figure 2 shows`、`Fig. 2a). These` 开头的行不算。收藏前由人过目。\n- **AI 图标。** 图注、标签、备注三个字段名右边各有一个不带文字的图标（悬停有提示）。点一下，提问用的模型看着图写这一项：图注连同图号、3 到 5 个标签（优先用图片库里已有的）、两到四句解读。结果只进字段（可撤销；图号只填空的，标签是添加，解读接在已有备注后面），点「收藏 / 保存」才存。图片会发给模型服务。\n- **图片有自己的标签**，和文献的标签分开。对话框里列出已有的，点一下加上。\n- **图片库页面。** 卡片网格（缩略图、图号、图注、出处、标签），可搜索图注、图号、标签、备注和所属文献的题目、作者、期刊、年份，可按标签筛选。缩略图在卡片第一次画出来时在后台读取和缩小，只留最近用到的 160 张。\n- **点开一张图片**：左边是原图，右边是四个字段；「打开原文」在右侧打开 PDF 并滚到截图的位置，「用这张图提问」把它带进这篇文献的对话，还有复制图片、另存为、移出。卡片右键有同样的操作。\n- **存储。** `figures` 表（和稿件的表一样随库建立，不升数据库版本）加文献库文件夹下的 `figures/`。文献在回收站时图片不显示；文献彻底删除或图片移出时，图片文件移到 `removed/`，不删除。\n- **工具。** 只读的 `list_figures`（命令行和 MCP）。\n- `structure` 示例多了 `captions`（列出每页认出的图注）；假模型会回答关于图片的三种问题；调试步骤 `pdfcut` / `collect` / `page:figures` / `figure:<n>` / `figtag` / `figfind` / `figlabel|figlegend|figtags|fignotes` / `figinfer`。`CLAUDE.md`、`docs/FEATURES.md`、`docs/CLI.md`、`README.md` 已更新。\n- 合并了 main（筛选的逐篇 / 确认界面）。只有 `CLAUDE.md` 冲突，两边的内容都保留。\n\n逻辑在 `crates/core/src/figure.rs`，窗口在 `src/figures.rs`。\n\n## 验证\n\n- 合并 main 之后：`cargo test --features gpui/runtime_shaders` 核心 183 项、窗口 20 项通过；`cargo clippy --all-targets` 对本项目的代码无警告。\n- 图注识别在两篇真实论文（Nature、Nature Communications 各一篇）上逐页看过：图号和图注都读对；看出的一种误判（正文里换行后以 `Fig. 2a).` 开头的句子）已修并加了测试。\n- 在隔离的示例库里用脚本驱动窗口并截图：PDF 上标出一块 → 对话框里读出 `Fig. 1` 和完整图注 → 加标签收藏 → 「收藏 › 图片」里出现卡片；点开查看；「打开原文」后图片库在左、PDF 在右并跳到第 2 页；空图片库的提示；深色主题；用假模型点了三个 AI 图标，标签合并、解读写入、图注替换而图号保留。合并 main 后又跑了一次图片库页面。\n- 没有验证：AI 图标没有接真实模型，写出的图注和标签质量没看过；截图用的是调试步骤设定的框，没有用真实的鼠标拖拽和点击走一遍；右键菜单、复制图片、另存为、移出没有在窗口里点过；图注识别在其他期刊版式和中文论文上只有单元测试；Windows 未运行。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T02:07:24Z",
+    "headRefName": "claude/image-gallery-collection-f94959",
+    "headRefOid": "d6a25765e41e236d090ab56b96141b402ab56ebd",
+    "mergeCommit": {
+      "oid": "f644cbd1c13e210023386dc4e0a3e4c5bc4a2d07"
+    },
+    "mergedAt": "2026-11-13T02:08:56Z",
+    "number": 63,
+    "state": "MERGED",
+    "title": "图片库：从 PDF 截图收藏，带图注、标签和备注，入口在「收藏」",
+    "updatedAt": "2026-11-13T08:01:38Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/63"
+  },
+  {
+    "baseRefName": "main",
+    "body": "筛选页原来只有一个队列：点开一行，用鼠标选判断。这一版把它分成三个界面，并给归类配了按键。\n\n## 改动\n\n- **批量 / 逐篇两种模式。** 标题旁的开关切换。批量是原来的队列加助手的批量判断；逐篇参考 BiblioCell，一次只看一篇。\n- **逐篇。** 左边是这一轮的文献和每篇的判断状态，中间是题目、助手的建议、摘要，底部固定四个判断按钮。判断后跳到下一篇，看完最后一篇给出小结。这一轮的文献在进入时固定：判断过的不会从列表里消失，可以回头改，也可以撤销上一个判断。右侧详情默认不开，按 Enter 才打开，之后跟着当前文献走。\n- **归类按键。** Y / R / U / N（或 1 到 4）对应已纳入、相关、证据不足、不相关；P 留待判断，A 采纳助手的建议，Z 撤销，G 让助手判断这一篇，S 收藏，T 译文。批量里对点开的那一篇生效，逐篇里对当前这一篇，确认界面里对光标所在的一行。正在输入文字时不起作用。按键是固定的，在 设置 › 快捷键 里只读列出。\n- **确认建议。** 助手一轮判断完后，进度面板和状态行都通向这里。每行一篇：助手的建议、理由、将要写入的判断。可以改判、不勾选、按建议分组看、把握低的排前面。点「确认这 N 篇」才写入，写入后可以撤销。\n- **一次写入是一个事务。** `Store::set_screenings`：全部成功或全部不写。\n- **单篇请助手判断。** `screen_start` 多了 `only`，逐篇和队列里都可以只问一篇，或重新判断一篇。\n- 逻辑在 `wisp_core::screening`（`Round`、`Confirming`、按键、判断理由的取法），窗口在 `src/screen_single.rs` 和 `src/screen_confirm.rs`。`screen:single|confirm|batch|go;<n>|apply|unconfirm` 调试步骤；`CLAUDE.md` 已更新。\n\n## 与之前不同的行为\n\n- 去掉「全部采纳为「X」（N 篇）」按钮和它的确认对话框，由确认界面取代：选中一个建议分组再进入，就是只确认那一组。\n- 队列里展开的一行改用和另外两个界面相同的建议卡片；按钮上带按键。\n- 「相关」用 R、「不相关」用 N。BiblioCell 里 N 是「相关不纳入」，这里有四种判断，按字面意思分配。\n- 「确认这 N 篇」没有配按键：一次写几百篇，留给鼠标。\n\n## 验证\n\n- `cargo test --features gpui/runtime_shaders`：核心 176 项、窗口 17 项通过；`cargo clippy --all-targets` 无警告。\n- 在隔离的示例库里（Europe PMC 取回的 61 篇，53 篇带建议）用脚本驱动窗口并截图：逐篇里 Y / A / N / ↓ / U / Z / S 的结果和数据库一致；确认界面里用键盘改判、不勾选后写入 52 篇，分布和数据库一致；队列里点开一行按 R；用假模型跑完一轮后出现「去确认」入口，逐篇里按 G 问一篇再按 A 采纳；深色主题看过。\n- 没有验证：确认界面里的鼠标操作（切换分组、全选 / 全不选、排序、撤销按钮）没有在窗口里点过，撤销走的批量写入只有核心测试覆盖；逐篇里的译文没有接模型跑过；中文输入法开着时的单字母按键；Windows 未运行。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T01:47:51Z",
+    "headRefName": "screening-modes",
+    "headRefOid": "f6a0e1b5dd373bcb26219ae50bd152c23b759f27",
+    "mergeCommit": {
+      "oid": "415acf0cb6065c1f63192718d75ffee679a94169"
+    },
+    "mergedAt": "2026-11-13T01:49:25Z",
+    "number": 62,
+    "state": "MERGED",
+    "title": "筛选：批量 / 逐篇两种模式，归类按键，判断完后的确认界面",
+    "updatedAt": "2026-11-13T08:01:43Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/62"
+  },
+  {
+    "baseRefName": "main",
+    "body": "#56 和 #59 合并后的一轮迭代，在它们进入发布版之前做。两者的核心（阶段状态机、事务式创建稿件、引用转换、`/review` 提示词）保留。\n\n## 改动\n\n- **证据从引用派生。** 保存一节正文时，每处引用成为一条证据：论断是引用所在的句子，来源是文献和页码，摘录是引用带的原句。摘录用 `ai::check_quote` 和文献文字比对，结果写在卡片上；是否支持论断仍由人判断（#28 的原则不变）。手填表单保留，用于没有引用的句子。\n- **带原句的引用进稿件。** `[P3 p.5 \"…\"]` 转成 `[@Key, p. 5]`，原句留在综述记录里。此前这类引用原样留在稿件中。\n- **记录可编辑。** 「查看记录」整页显示，每一项可直接修改；也可以只记回答里选中的一段，而不是整条回答。\n- **按钮减少。** 回答下面只有当前步骤用得上的按钮；普通对话不再有常驻的「开始综述流程」，改在回答的右键菜单里。\n- **渲染不读库。** 综述读入 `Chat::review`（`Library::load_review`），只在对话、记录或文献变化时重读。\n- **提问不重发正文。** 只带步骤、要求、大纲和已存章节的名字。\n- **存储回到两张表。** 撤掉约 20 个触发器、惰性的 v1/v2 升级和对 `write_paper` 的改动；`SCHEMA_VERSION` 回到 1。判断改为保存来源的指纹（题目、摘要、所引页的文字）。v0.5.0 没有综述表，不存在会误读的旧版。中间版本升到 2 的库照常打开并清理。\n- **综述随对话删除**，删除前说明；不再有「暂不能删除」和找不回的孤儿记录。\n- `review:*` 调试步骤；`CLAUDE.md`、教程、功能说明、数据说明已更新。\n\n## 与原 PR 不同的行为\n\n- 改写作要求或大纲不再清空证据判断，只需重新确认。\n- 来源内容改了又改回，原判断继续有效。\n- 去掉「记为证据」按钮，证据笔记在记录页里编辑。\n- 删除一节正文时，它派生的、未判断也无备注的证据一起删除。\n\n## 验证\n\n- `cargo test --features gpui/runtime_shaders`：核心 170 项、窗口 16 项通过；clippy `-D warnings` 通过。\n- 在隔离的示例库里用真实模型走通：要求 → 大纲 → 正文 → 派生证据与原句比对 → 判断 → 存为稿件；示例库带着中间版本留下的触发器，打开后已清理。\n- 没有验证：示例库只有摘要，带页码的引用、「原文在 p.N」和「看原文」跳转只有核心测试覆盖；选中文字的按钮、右键开始综述、证据表单的保存没有在窗口里点过；Windows 未运行。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-13T00:51:16Z",
+    "headRefName": "review-iteration",
+    "headRefOid": "8b7797f1b57205a8b01729f20581f78f7afea3e1",
+    "mergeCommit": {
+      "oid": "e7dada1ff9896abc21c2f1bf4ba685384e1f13d6"
+    },
+    "mergedAt": "2026-11-13T00:58:43Z",
+    "number": 61,
+    "state": "MERGED",
+    "title": "综述：证据从引用派生，记录可编辑，存储回到两张表",
+    "updatedAt": "2026-11-13T08:01:42Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/61"
+  },
+  {
+    "baseRefName": "main",
+    "body": "## What changes\n\nClicking 提问 on a paper now lays the whole window out for it: the sidebar is put away, the papers on show become a narrow list at the left, the conversation is in the middle and the paper's PDF at the right. Before, the conversation and the PDF only stood side by side once the detail panel was dragged wide, squeezed in next to the sidebar and a table whose filter bar wrapped.\n\n- **The narrow list** has the two corner buttons, the search box, and for each paper a two-line title with authors and year (「无 PDF」 where there is none). ↑↓ move from paper to paper while the question box keeps the keyboard. Its right edge is dragged for its width (`Settings::ask_list_width`), a double click gives the default back.\n- **Leaving**: Esc (before Esc closes the paper), 退出提问 in the header, the sidebar button or its shortcut, or another tab. The paper stays open and the tab goes back to the one 提问 was come to from.\n- **The × on the PDF's bar** puts the PDF away, which also ends the layout for the papers after it; 对照 PDF brings it back.\n- **A paper without a PDF keeps the layout**, with 添加 PDF / 查找开放全文 at the right, so moving through the list does not flip the window back and forth.\n- On 筛选, 向文献库提问 and 写作, or in a window narrower than 960, there is no list and the paper has the window.\n- The floating conversation works as before, over a PDF that now has everything right of the list.\n\n## How\n\nNothing is stored for the layout. `Workspace::asking` follows from the tab being 提问 and `Library::split`; `detail_width` and `render_library` read it. That removes the `lib.wide = true` nudges that used to widen the panel for the two. The table and the narrow list share `Library::table_scroll`, and `render_library` scrolls to the selected paper when the layout changes.\n\n## Checked\n\n- `cargo clippy --all-targets` without warnings, `cargo test` passing (a new test for the list's width).\n- Off-screen shots on macOS with the seeded library and the mock model: entering, an answer, a paper without a PDF, Esc, dragging the list's edge, floating, the PDF put away and back, the sidebar button, 提问 from 筛选.\n- **Not looked at on Windows**, where the window buttons sit at the top right over the one-line header.\n\nDev step: `asklist:<px>`.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-13T00:51:06Z",
+    "headRefName": "ask-layout",
+    "headRefOid": "56c1e44a8acfed3ac91e5e91c3cef3e8d141a686",
+    "mergeCommit": {
+      "oid": "b5d1aaa0a9774f0760fbf1ac3be5b97d2f320c1b"
+    },
+    "mergedAt": "2026-11-13T01:02:32Z",
+    "number": 60,
+    "state": "MERGED",
+    "title": "Lay the window out for asking about a paper",
+    "updatedAt": "2026-11-13T08:01:37Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/60"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Closes #58.\n\n综述可以保存自由文本证据，但用户重新检查某个论断时，需要从对话中找回它对应的文献、摘录和判断。本 PR 在综述记录中增加可选的人工证据表，帮助保存和回看这些关联。\n\n## 改动\n\n- 用户可以手动添加或从回答中选择论断，关联已有章节和文献库中的具体文献，填写默认 PDF 页码、摘录、依据类型及备注。\n- 支持、部分支持、不支持和无法判断均由用户明确选择；摘录、页码和依据类型也是人工填写，程序不宣称已经核验论断。\n- 来源、论断或关联章节变化后保留记录并要求重新判断；移除章节后不会因为创建同名章节而自动重新关联。文献进入回收站或被删除时显示不可用，保留题名快照。\n- 记录可编辑、删除和从历史对话恢复，并复用现有文献 / PDF 入口。证据表不会自动发送给模型，也不会自动追踪写作页中后续修改的稿件。\n- 首次保存证据时按需升级当前文献库数据库版本；只打开没有证据的新旧库不会触发这一升级。旧连接不能静默覆盖新证据，有证据记录时也不能删除其关联对话。升级后的库不能由旧版打开；切换版本前应关闭所有客户端并备份。\n- 给已记录来源跟踪变更，并缓存已提取全文的摘要以减少重复读取。磁盘 PDF 不会在每次界面刷新时重新计算完整哈希，外部内容变化若保持相同文件大小和修改时间可能漏检。未针对大型库或网络磁盘做性能压力测试。\n\n此前 [#28 的维护者说明](https://github.com/xuzhougeng/WispPaper/issues/28#issuecomment-6795897467) 暂不持久化独立论断—证据对象。本 PR 在已合入的综述流程里重新提出**用户自愿维护的记录**，仍把是否支持论断交给用户；这是对当时范围决定的改变，提交供维护者评估，并不预设已经获得同意。\n\n## 验证\n\n- `cargo test --features gpui/runtime_shaders --offline`：工作区测试通过，核心 171 项、桌面端 14 项；1 项真实网络查询按原配置忽略。\n- `cargo clippy --all-targets --features gpui/runtime_shaders --offline -- -D warnings`：通过。\n- 使用旧版示例文献库的隔离副本测试：打开原有综述、新增与编辑证据、选择来源、人工判断、重新打开历史对话、跳转文献；修改测试文献摘要后，旧判断显示待重新核实。首次保存证据的库升级为 v2，未使用证据的库保持 v1；原示例库校验值不变。\n- 核心回归覆盖旧 JSON、惰性升级、旧连接覆盖和删除保护、首次保存与并发删对话、事务回滚、来源变化、回收站恢复和标识符冲突。\n\n本机缺少 Apple Metal 编译工具链，因此桌面测试使用运行时着色器功能；默认构建由 CI 验证。图形界面测试使用的是没有 PDF 的隔离文献记录，未实测 PDF 跳页。\n",
+    "createdAt": "2026-11-12T15:56:46Z",
+    "headRefName": "review-evidence-matrix",
+    "headRefOid": "4ed5cde371589a62eab685346ca4703c1c6f59b1",
+    "mergeCommit": {
+      "oid": "29c2fda401d1d3d88ed9f9fb71e29146cce028d8"
+    },
+    "mergedAt": "2026-11-13T00:18:23Z",
+    "number": 59,
+    "state": "MERGED",
+    "title": "为综述增加人工论断与证据记录",
+    "updatedAt": "2026-11-13T00:18:24Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/59"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Closes #52.\n\n## What changed\n\n**Reading mode.** A 「阅读模式」 button on the PDF's toolbar and the shortcut ⌘⇧F / Ctrl+Shift+F (`reading`, can be changed) put the sidebar and the list away: the paper has the whole window under a one-line header (title, the three tabs, 「退出阅读」). Esc leaves reading mode before it closes the paper. Neither the PDF view nor the conversation is made anew, so the place read, the conversation and an unsent question stay.\n\n**The edge between the conversation and its PDF can be dragged.** The width is kept in `settings.json` (`chatWidth`); a double click gives back the default.\n\n**A floating conversation** (`src/floating.rs`, geometry in `wisp_core::floating`). As an alternative to the split, the PDF takes the whole panel and the same conversation is drawn in a window over it: moved by its title bar, sized by its bottom-right corner, folded into a round button that can be dragged. Place, size and folding are saved. This is the reduced version of what the issue asks for: there is no resizing from all eight edges.\n\n**Translating a PDF selection.** 「翻译」 beside 「复制」 and 「添加到对话」 puts a card by the selection, with the translation model from 设置 › AI; its menu asks another configured model for this once, and that answer replaces the kept one. It uses the same request path and cache as the title, abstract and batch translation.\n\n## For the reviewer\n\n- This branch merges `main` after #54. #54 moved translation into `src/translate.rs`; the selection's translation was folded into `translate_text` there (new `again` argument, and `Library::translation_asks` drops an answer that a later request for the same text overtook) instead of keeping a second copy in `app.rs`.\n- One fix to earlier behaviour: with no model configured, switching to 提问 gave the keyboard to a question box that is not drawn, so Esc did nothing. The keyboard now stays with the window.\n- New dev steps: `readmode`, `chatwidth:<px>`, `float` / `float:off`, `fold` / `fold:off`, `pdfpick:<page>;<from>;<to>`, `pdftranslate` / `pdftranslate:<n>`. `CLAUDE.md` and `docs/FEATURES.md` are updated.\n\n## Checked\n\n- `cargo clippy --all-targets`: no warnings in the project's code. `cargo test`: all pass.\n- Off-screen screenshots on macOS, light and dark, with a 51-page PDF and the mock model: scrolling to page 4 and entering reading mode keeps the place; the floating window and its folded button inside reading mode; a selection translated, then again with a chosen model; dragging the split edge saves the width; Esc and the shortcut.\n\n## Not checked\n\n- A real mouse: pointer steps were scripted events.\n- Windows.\n- A real model for the translation card (the mock model only).\n- The translation card and the floating window overlapping each other.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-12T14:42:21Z",
+    "headRefName": "reading-mode",
+    "headRefOid": "4521552874395810913f5fedcf801a2c67b1c322",
+    "mergeCommit": {
+      "oid": "28816708a2d2d007a478dd5e5ca461b2dfbaa663"
+    },
+    "mergedAt": "2026-11-12T14:54:37Z",
+    "number": 57,
+    "state": "MERGED",
+    "title": "Reading mode, a floating conversation, and translating a PDF selection",
+    "updatedAt": "2026-11-13T08:01:41Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/57"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Closes #55.\n\n目前 `/review` 从检索直接进入正文，用户需要在成文后调整结构，再手动将内容转入写作页。本 PR 增加从写作要求确认到多章节稿件交付的分阶段流程。\n\n## 主要改动\n\n- 扩充综述提示词，覆盖写作要求、大纲、针对缺口补充证据、按问题综合文献、分节写作和最终检查；区分全文、摘要与在线检索结果，要求说明证据缺口，避免编造引用。\n- 在文献库对话发送 `/review 主题` 时建立综述记录；普通对话也可以手动开始。用户可以记录并确认写作要求和大纲，保存证据、正文及检查记录，并从历史对话恢复。\n- 大纲确认前不能保存综述正文。重新记录要求或大纲会使相关确认和检查失效，已有正文予以保留，界面提醒用户检查其是否仍适用。「标为完成」和检查记录是用户操作，不代表程序已独立验证结论。\n- 将保存的正文按顺序组装为新稿件，不覆盖已有稿件。综述记录与对话的关联、新稿件及其引用键分别通过事务保存，避免失败时留下部分记录。\n- 将能明确对应文献的对话引用转换为写作页引用键并保留页码；有歧义、无法安全解析或包含原文引语的引用保留供人工核对。引用转换不等于核验论断。\n- 补充操作教程与限制说明。参考文献列表和 BibTeX 仍通过写作页分别复制或导出。\n\n流程通过现有对话和工具引导模型；模型仍可能提前生成内容或产生错误，用户需要核对来源和检查记录。\n\n## 验证\n\n- `cargo test -p wisp_core --lib --offline`：163 项通过，覆盖阶段转换、数据库重开、引用转换、事务回滚和多章节稿件创建。\n- `cargo test -p wisp_paper --features gpui/runtime_shaders --offline`：14 项通过。\n- `cargo clippy -p wisp_core --all-targets --offline -- -D warnings`：通过。\n- 使用 `gpui/runtime_shaders` 构建桌面程序，并在隔离的示例文献库与模拟模型中，验证综述记录创建、两次确认、保存两个章节、记录检查、生成带引用的新稿件以及重新打开历史对话。合并最新主分支后，再次检查了记录恢复和展开。模拟模型返回固定内容，不能证明真实模型的写作质量或来源准确性。\n\n本机缺少 Apple Metal 编译工具链，因此未能验证默认的 macOS 着色器构建；桌面构建和测试使用了运行时着色器功能。\n",
+    "createdAt": "2026-11-12T14:31:44Z",
+    "headRefName": "review-two-phase",
+    "headRefOid": "d65a5cda274efea41d6ccc9963a7baee10ebe01c",
+    "mergeCommit": {
+      "oid": "7a925642b340d628d36193440b6b68f55c59c0d5"
+    },
+    "mergedAt": "2026-11-12T15:17:02Z",
+    "number": 56,
+    "state": "MERGED",
+    "title": "增加可保存和恢复的分阶段综述写作流程",
+    "updatedAt": "2026-11-12T15:17:03Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/56"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The paper list now supports selecting several papers and acting on them together, including separate batch actions for translating titles and abstracts.\n\n## Selection and batch actions\n\n- Ctrl / Cmd-click toggles a paper; Shift-click selects a range. Shift+Up/Down extends the range, Ctrl+A / Cmd+A selects the visible list, and Esc clears selection.\n- Right-click selected rows to ask about just those papers, star/unstar, change reading status, add tags, find open full texts, copy titles/BibTeX, or move them to the trash after confirmation.\n- A new library conversation uses the selected papers as its scope. New conversations and reopened history reset that scope.\n\n## Batch translations\n\n- Separate `批量翻译标题` and `批量翻译摘要` menu actions snapshot the selected texts, translation model, and instructions.\n- Requests run sequentially and share the existing cache and in-flight requests with the detail panel. Duplicate texts share a request; empty fields are skipped; progress counts papers.\n- The progress panel shows new translations, cached translations, skipped fields, and failures. Stop keeps the current result and leaves the rest unsent. Running the action again reuses successes and retries failures or unfinished texts.\n- Translated titles appear directly in the list; abstracts appear in paper details. `显示原文 / 显示译文` switches the list and details, including restoring cached titles after reopening the library. Original records and exports retain the source text.\n- Late responses are rejected after closing or reopening a library. Translation save failures are reported.\n\n## Validation\n\n- Windows: `cargo clippy --all-targets --offline -- -D warnings`, `cargo test --offline` (172 passed, 1 live lookup ignored), and debug build passed. Network tests used local mock services outside the sandbox.\n- Added tests for field/selection isolation, prompt-specific keys, duplicate texts, per-paper progress, failures, stopping, and retry planning.\n- Windows UI with an isolated five-paper library and local mock model: both menu entries, all five titles translated, repeat title run reused all five without requests, empty abstract skipped, stop retained the in-flight result, restarting completed the remaining abstracts, and translated details/original switching verified.\n- Original selection implementation was also checked on macOS with a 40-paper demo: Cmd-click, Shift range, the menu, and the selected-paper question scope. Batch star/reading/tags/full-text/trash actions were not manually exercised. Multi-selection remains limited to 全部文献.\r\n",
+    "createdAt": "2026-11-12T08:30:01Z",
+    "headRefName": "multi-select-papers",
+    "headRefOid": "f654693016984cc009ebef656dcfc18e9ba90790",
+    "mergeCommit": {
+      "oid": "7680720f685fd88b213aadda0e02e269be4d5a9b"
+    },
+    "mergedAt": "2026-11-12T09:22:38Z",
+    "number": 54,
+    "state": "MERGED",
+    "title": "Select papers together and batch translate titles or abstracts",
+    "updatedAt": "2026-11-13T08:01:41Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/54"
+  },
+  {
+    "baseRefName": "main",
+    "body": "DOI and PMID in the paper detail panel now open their respective DOI and PubMed pages. They use link styling while retaining text selection and copying; dragging does not open the browser.\n\nTranslations replace the abstract in its existing position, with 显示原文 / 显示译文 switching between versions. The translated title appears in the header. Original text remains readable while translation is pending or fails, with progress and retry controls preserved.\n\nValidation:\n- `cargo clippy --offline --all-targets -- -D warnings` passed.\n- 169 existing unit tests passed across the four workspace crates; 1 live-network test was ignored. Local network tests passed when rerun outside the sandbox after socket access was blocked with Windows error 10013.\n- `git diff --check` passed.\n- Desktop interaction has not been manually verified.\n",
+    "createdAt": "2026-11-12T08:18:36Z",
+    "headRefName": "codex/detail-links-inline-translations",
+    "headRefOid": "916cc22e90ab34c13fad37ab90a6e61193b6fc0f",
+    "mergeCommit": {
+      "oid": "c52cf9cd334fdf2667148fca0d2b0fd8339c600a"
+    },
+    "mergedAt": "2026-11-12T08:28:59Z",
+    "number": 53,
+    "state": "MERGED",
+    "title": "feat: link paper identifiers and switch translations in place",
+    "updatedAt": "2026-11-13T08:01:38Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/53"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Zotero 仍在后台运行并锁住数据库时，导入原来会显示“请选择 Zotero 6 / 7 数据目录中的 zotero.sqlite”，误导用户以为文件选错。现在按 SQLite 错误码识别 SQLITE_BUSY / SQLITE_LOCKED，明确提示正常退出 Zotero、等待后台进程结束后重新导入同一个文件，并保留底层错误供诊断。\n\n教程新增锁库排查说明。导入仍以只读事务读取源库，不绕过数据库锁，也不更改或删除 WAL / SHM 文件。\n\n验证：`cargo test -p wisp_core zotero` 6 项通过，新增真实排他锁回归测试，并验证释放锁后同一路径可正常读取；`cargo clippy -p wisp_core --all-targets -- -D warnings` 和 `git diff --check` 通过。\r\n",
+    "createdAt": "2026-11-12T07:36:03Z",
+    "headRefName": "codex/fix-zotero-locked-db",
+    "headRefOid": "f5af967d49fab07dba000ec66ab625f2dc84107c",
+    "mergeCommit": {
+      "oid": "f55be92667bcfcefe03239b72dad12149ff39f6f"
+    },
+    "mergedAt": "2026-11-12T07:40:29Z",
+    "number": 51,
+    "state": "MERGED",
+    "title": "fix: 明确提示 Zotero 数据库被占用",
+    "updatedAt": "2026-11-13T08:01:39Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/51"
+  },
+  {
+    "baseRefName": "main",
+    "body": "全文查找和导入任务的侧栏摘要较长，处理过程中也不便查看逐条结果。将全文查找、PDF／文件夹导入和 Zotero 导入统一为可点击的分段进度条，详细进展放入实时更新的弹窗，收起后继续后台处理。\n\n- 用不同颜色区分成功、待完善／未找到地址、失败、处理中及等待中的条目；弹窗展示当前任务、数量和逐条原因。\n- 全文查找停止后不再开始新请求，已发出的请求完成后仍记入结果，保留原总数和未处理数量；将容易误解的提示改为“未找到地址”和“下载失败”。\n- PDF 导入显示所有正在读取的文件，关闭详情后可再次打开；补充统一进度统计的回归测试、离线预览入口和操作说明。\n\n验证：\n\n- `cargo clippy --offline --all-targets -- -D warnings` 通过。\n- `cargo test --offline`：167 项通过，1 项联网测试按原设置忽略。\n- Debug 与 Release 构建通过，`git diff --check` 通过。\n- 已检查全文查找进度条及弹窗的实际布局；新增 PDF、Zotero 导入弹窗的视觉验证尚未完成。\n",
+    "createdAt": "2026-11-12T07:23:04Z",
+    "headRefName": "codex/fulltext-progress-modal",
+    "headRefOid": "8819b069f471647c043263fe573ff5136159000a",
+    "mergeCommit": {
+      "oid": "3c2581d822520287fd2c534dca190585b1117339"
+    },
+    "mergedAt": "2026-11-12T07:40:14Z",
+    "number": 50,
+    "state": "MERGED",
+    "title": "统一全文查找与导入进度条及详情弹窗",
+    "updatedAt": "2026-11-13T08:01:39Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/50"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The basic things the hands expect of a list were missing: the papers could only be clicked, nothing answered the right button, and the text of the detail panel could not be selected.\n\n## Keyboard\n- Up / Down change the paper on 全部文献 and 筛选; the list scrolls only as far as brings the row into view.\n- Left / Right turn the pages of a PDF on show, else move a screenful. Page Up / Down, Home / End as well.\n- Enter opens the paper's PDF, as a double click does.\n- Delete or ⌘⌫ moves the paper to the trash; the one that takes its row is selected (also for the panel's button).\n- An open menu takes the arrows and Enter.\n- A click on a row leaves the keyboard with the list; a one-line or empty text field passes Up and Down on, so Down in the search box goes into the results.\n\n## Right click (`src/context.rs`)\nMenus on a paper (list and screening), a trashed paper, a file of the detail panel, a tag of the sidebar (only this tag, rename, remove; renaming to an existing tag merges the two), a past conversation, a library card and an answer. Menus can now have lines between groups, and the paper a menu is about is marked while it is open.\n\n## Selecting (`src/select.rs`)\n`Workspace::selectable` draws a text that can be selected: drag (a layer over the window follows the pointer, as for the edges), double click for a word, triple for all, ⌘C or a right click to copy. Used for the title, authors, source line, DOI / PMID, abstract and translation in the detail panel, a screening reason, and a question asked.\n\n## Also\n- The status line named Ctrl+F on macOS; it shows the key in force now.\n- Dev steps `key:<keystroke>` and `rclick:x;y`.\n\n## Checked\nclippy clean and tests pass on macOS. In a scripted window with a 40-paper demo library: arrow keys and paging, the paper menu with keyboard choice, trash and the next selection, dragging over the abstract, double click and the copy menu.\n\nNot looked at in a window (the demo had no tags and no PDF): renaming and removing a tag, Left / Right in a PDF, and the menus of files, trashed papers, conversations and answers. Selecting several papers at once is not part of this.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-12T07:21:58Z",
+    "headRefName": "keys-and-context-menus",
+    "headRefOid": "f73f973186ab90e6fae6a45ddec8ccd563800f93",
+    "mergeCommit": {
+      "oid": "90320ba34dde3cd7bb000e2961d16aa791b5f436"
+    },
+    "mergedAt": "2026-11-12T07:26:54Z",
+    "number": 49,
+    "state": "MERGED",
+    "title": "Arrow keys, right-click menus and selectable text",
+    "updatedAt": "2026-11-13T08:01:40Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/49"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Version 0.5.0 and its release notes (`.github/release-notes/v0.5.0.md`). After merging, the tag `v0.5.0` on main starts the signed release.\n\nChecked: `cargo clippy --all-targets -- -D warnings` and `cargo test` on macOS.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-12T06:14:21Z",
+    "headRefName": "release-0.5",
+    "headRefOid": "be4da99f9169a9d47131288de076f80b483e402f",
+    "mergeCommit": {
+      "oid": "c47f2dabf5678d08ac316b5f0ed123090a76ba4d"
+    },
+    "mergedAt": "2026-11-12T06:14:35Z",
+    "number": 48,
+    "state": "MERGED",
+    "title": "0.5.0: writing, and more ways in",
+    "updatedAt": "2026-11-13T08:01:42Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/48"
+  },
+  {
+    "baseRefName": "main",
+    "body": "## What\n\n写作 was a candidate-sentence finder beside five fixed text boxes. This makes it a place to write a paper. Five pieces, built on separate branches and merged here:\n\n- **Manuscripts** (`wisp_core::manuscript`, `src/manuscripts.rs`): any number per library, each with a title, a writing language and ordered sections the person names (a section's `kind` decides where its candidates come from, `other` included, so a review can be written). Whole-manuscript reading view, export to Markdown / Word / clipboard, and a bounded history of snapshots per section. The old `drafts` rows are taken in as one manuscript (「早先的草稿」).\n- **Citations** (`wisp_core::cite`, `src/cite.rs`): 引用 inserts a key tied to the paper in Pandoc's form (`[@Zhang2024]`), with a reference list under the editor, unresolved and ambiguous citations pointed out, BibTeX of the cited papers, and a picker to cite any paper of the library.\n- **Candidates on demand** (`wisp_core::retrieval`, `src/write_find.rs`): no search while typing. ⌘↩ / Ctrl+Enter (rebindable) or the panel's button searches for the selection or the caret's paragraph; the translation model turns it, whatever language it is in, into three to five groups of search words, each ranked on its own and merged. Narrowing by tag or star, the sentences around a hit, the `other` part, and a kept word index instead of re-tokenising every search.\n- **Structuring and languages** (`structure.rs`, `pdftext.rs`): compounds broken at a line end keep their hyphen, the model is offered by the share of guessed paragraphs as well as their number, a file read in part says how many pages, and Chinese, Japanese and Korean text is cut into sentences and searched; each full text keeps its language. `structure::VERSION` is 2, so rule-made structures are redone.\n- **Model actions** (`src/write_assist.rs`): on the selection or the caret's paragraph: rewrite after the candidates, put into the manuscript's language, polish, and the person's own commands. The result streams into a card beside the original; nothing enters the manuscript until the person replaces, inserts or copies it.\n\nOne commit on top wires two of them together: `find_sentences` takes a `language`, and the window asks for the manuscript's, so sentences in another language are left out and counted.\n\n## Notes for review\n\n- `SCHEMA_VERSION` stays at 1: the new tables are unknown to an older build, which reads everything else as before. The reasoning is in the manuscripts commit message.\n- Resolving the merges meant pointing the citations, retrieval and model-action code at the manuscript's sections instead of the single draft (`src/cite.rs`, `src/write_find.rs`, `src/write_assist.rs`, `Workspace::write_show`).\n\n## Checked\n\n- `cargo test` and `cargo clippy --all-targets` pass on the merged tree (macOS, with `--features gpui/runtime_shaders`).\n- Run against a library made by the previous build and a real model: the old draft arrived as a manuscript; a paragraph in Chinese gave three groups of English search words and fitting candidates; 译成英文 gave its card with the four actions; without a model both the search and the action bar say so.\n\n## Not checked after the merge\n\n- Export, inserting a citation and the reference list, restoring a snapshot.\n- The dark theme.\n- Non-English papers in the merged tree (tested on their own branch only).\n- The real key press: the search was triggered by a dev step.\n\n## Known gaps\n\n- An exported manuscript does not yet end with its reference list.\n- With no model and no result, the candidates panel has a stretch of empty space above its empty state.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-12T05:45:34Z",
+    "headRefName": "write-integration",
+    "headRefOid": "846148cbf52bf47248857557b3b836f73b1069fd",
+    "mergeCommit": {
+      "oid": "1d905de7fbf919552828138486093fe27a42666f"
+    },
+    "mergedAt": "2026-11-12T06:11:32Z",
+    "number": 47,
+    "state": "MERGED",
+    "title": "写作: manuscripts, citations, on-demand candidates, languages, model actions",
+    "updatedAt": "2026-11-13T08:01:44Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/47"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Windows 自定义标题栏的点击会触发外层 Workspace 的焦点处理，继而阻止系统默认的窗口操作，导致无法拖动或通过标题栏激活窗口。\n\n为 Windows 的共享标题栏添加 `occlude()`，隔开外层焦点处理，让系统继续处理标题栏的激活、拖动和双击最大化。\n\n验证：\n- Windows 实测主页和设置页标题栏拖动，以及双击最大化、还原、最小化。\n- `cargo build --offline --locked -p wisp_paper` 通过。\n- `cargo clippy --offline --locked --all-targets -- -D warnings` 通过。\n- `cargo test --offline --locked`：133 项通过，1 项联网测试默认跳过。\n- 后台窗口点击标题栏激活仍需人工复核：自动操作工具会预先激活目标窗口，无法独立验证此项。\n\nFixes #45\r\n",
+    "createdAt": "2026-11-12T04:43:37Z",
+    "headRefName": "codex/fix-windows-titlebar",
+    "headRefOid": "a454924cd2a51a8c331d739eda8a47bd459b57b8",
+    "mergeCommit": {
+      "oid": "80094e9fc20c526ea947346b08dd0093a67dc3b8"
+    },
+    "mergedAt": "2026-11-12T05:05:22Z",
+    "number": 46,
+    "state": "MERGED",
+    "title": "修复 Windows 标题栏无法拖动和激活窗口",
+    "updatedAt": "2026-11-13T08:01:39Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/46"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Closes #39。范围按 [issue 里的回复](https://github.com/xuzhougeng/WispPaper/issues/39#issuecomment-6813126542)：接「按题目找候选、人工核对后补全」，不做浏览器桥接，来源都走 HTTP 接口。\n\n## 做了什么\n\n- **入口**：没有 DOI 也没有 PMID 的文献，详情面板里多一个「按题目补全」。导入结果里「没认出 DOI」的提示改为指向它。\n- **用来查找的题目**：文献自己的题目；题目还只是文件名时不拿它去查，改从 PDF 首页读（`pdftext::title_guess`：首页上最大的、读起来像题目的那几行），并标明「读自 PDF 首页，查找前请核对」。题目、作者、年份都可以改。\n- **来源**：Crossref、Europe PMC、arXiv，每个取最相近的 5 条（`complete::find`）。每个来源单独说明：查到几条、没有查到、还是没查成及原因；一个来源失败不影响其他来源的结果。\n- **候选**：列出题目、作者、年份、期刊、DOI / PMID，标出与所查一致和不一致的地方。同一个 DOI 的记录合成一条；预印本和正式版 DOI 不同，各自保留。相似度只用来排序。\n- **核对与写入**：点一条候选逐个字段看「候选值 / 现在的值」，可以打开网页对照。默认只勾选现在空着的字段和只是文件名的题目；已有的内容勾选后才替换。题目和所查不一样的记录（相似度低于 0.9）不预先勾选任何字段。\n- **拒绝写入的情况**：候选已经是库里的另一篇文献；文献在查找期间被改过；DOI / PMID 属于别的文献（`save_paper` 原有的检查）。\n- **工具** `find_metadata`：`wisp find_metadata`、MCP 和窗口里的助手拿到同样的候选，不写入。写入只在窗口里由人确认。\n- 来源一栏记下「按题目从 … 补全」。\n\n## 和 issue 回复不同的一处\n\n回复里说首版查 Crossref 和 Europe PMC。用真实 PDF 试的时候发现只在 arXiv 上的预印本这两个来源都查不到，所以加了 arXiv 作为第三个来源（同样是公开接口，解析用的是已有的 `sources::arxiv_found`）。\n\n## 没有做的\n\n- 浏览器桥接、通用网页搜索、Google Scholar（理由见 issue 回复）。\n- 字段级的来源与确认历史；由模型整理候选。\n- PubMed 没有单独查：Europe PMC 已收录 PubMed 的记录并带 PMID。\n- Crossref 记录没有发表日期时，年份仍会退到记录创建日期（`crossref_work` 原有的行为），这里没有改。\n\n## 验证\n\n- `cargo test`、`cargo clippy --all-targets` 通过。新测试：`complete` 模块四个（请求地址、题目比较、多来源候选与失败、字段写入），`pdftext::the_title_of_a_first_page`，`tools::records_by_title`。\n- 窗口里用一篇首页没有 DOI 的真实 PDF（arXiv 1706.03762）走完整个流程：首页读出题目 → 三个来源返回 → 选中 arXiv 的记录 → 写入 7 个字段。过程中发现并修了三处：Crossref 请求多了一个不被接受的字段（HTTP 400）；词序不同的题目被算成「题目一致」（现在按词序比较，只有同一个题目才是 1）；题目只是相近的记录被默认全选。\n- 没有在窗口里看过的：候选已是库里另一篇文献时的红字提示、来源全部失败时的提示、取消勾选单个字段。前两种情况在工具的测试里有覆盖（`inLibrary`、全部来源失败时报错），窗口里的显示和勾选没有测试。\n\n调试步骤新增 `modal:complete` 和 `candidate:<n>`。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n",
+    "createdAt": "2026-11-12T03:16:13Z",
+    "headRefName": "complete-by-title",
+    "headRefOid": "9058d3cfa8e1b623148fe666ea9e48176b6145c0",
+    "mergeCommit": {
+      "oid": "20d19aa52f058375f118017ba0bbf988354ea75e"
+    },
+    "mergedAt": "2026-11-12T03:39:09Z",
+    "number": 44,
+    "state": "MERGED",
+    "title": "按题目补全：没有 DOI 的文献按题目查候选，人工核对后写入",
+    "updatedAt": "2026-11-13T08:01:40Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/44"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Closes #40。这是 #29 里说过可以单开的那一条：用户自己写的斜杠命令，只是提示模板，不是 Skill 运行时。\n\n## 做了什么\n\n- **设置 › 命令**（新的一页）：添加、编辑、删除自己的命令，每条有名称、说明和模板。修改即时写入 `settings.json`（`Settings::commands`），不请求模型。页面下方列出内置命令供对照。\n- **名称**：小写字母、数字、汉字、`-` 和 `_`，最多 32 个字；与内置命令或自己的其他命令重名会被拒绝，原因写在输入框旁，上一个可用的名称继续生效。\n- **内置优先**：`ai::read_input` 先找内置命令，手改 `settings.json` 写了同名命令也替换不了它们。\n- **模板**：`{}` 处换成命令后面的内容，这时不写内容会提示补上；不写 `{}` 的模板可以单独使用，后面写了内容就接在末尾。没有表达式、脚本或文件插值，参数里的花括号不会被再读一遍。\n- **提问框**：输入 `/` 时自定义命令和内置命令一起出现，带「自定义」标记，可按名称或说明筛选。选中后只写出 `/名称 `，按 Enter 才发送。材料范围、模型、工具确认和引文核对都走原来的流程。\n- **历史不被改写**：每个问题保存当时实际发出的提示（`Said::User::prompt`，与输入相同时不存），恢复对话时直接用它。旧记录没有这份快照：内置命令按现有规则重新展开，其余按原样发送，不猜当时的模板。\n\n顺带的行为变化：带 PDF 选中原文的提问，恢复对话时现在也按当时发出的内容重放，以前会丢掉前面的说明句。\n\n## 没有做的\n\n- **发送前预览展开后的提示**：模板是用户自己写的，设置页里随时能看；加预览会让发送多一步。\n- **停用**：只有删除（删除前确认）。\n- 导入导出、多个变量、每条命令专用的模型：issue 里也列为后置。\n\n## 验证\n\n- `cargo test`、`cargo clippy --all-targets` 通过；新测试 `own_commands`（展开、缺参数、空模板、内置优先、名称规则、列表顺序），`load_save` 里加了命令的保存与读回。\n- 窗口里用假模型发了一次 `/style-check …`：气泡显示原输入，库里存下了展开后的提示；弹窗和设置页截图看过。\n- 没有在窗口里看过的两处：修改模板后从历史恢复对话的重放，名称不合法时的红字提示。\n\n调试步骤新增 `settings:commands` 和 `command:<n>`。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-12T02:36:58Z",
+    "headRefName": "custom-slash-commands",
+    "headRefOid": "6b7a8adbc1126d0555e0840ec33c63630f7e00a6",
+    "mergeCommit": {
+      "oid": "464d1a9e8082e2bdc9b1e8b065c2676d8370582a"
+    },
+    "mergedAt": "2026-11-12T02:47:09Z",
+    "number": 43,
+    "state": "MERGED",
+    "title": "自定义斜杠命令：把常用的提问存成提示模板",
+    "updatedAt": "2026-11-13T08:01:40Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/43"
+  },
+  {
+    "baseRefName": "main",
+    "body": "## 做了什么\n\n参考 BiblioCell 的做法：每条 AI 建议都记下它是按哪个目标给出的；换了目标可以重跑；人工判断不会被改动。\n\n- 筛选页的输入框有了标题 **筛选目标**。目标为空时会写明按主题判断，主题也一并显示。目标边输入边保存到 `library.json`。\n- 每条建议记下它是按哪个目标判断的（`screening_suggestions` 新增 `criteria` 列，旧库打开时由 `store::add_columns` 补上，不需要升级数据库版本；旧建议这一列为空，算作按当前目标给出的）。\n- **换了目标**：已有的建议变成灰色的「旧目标：…」，单独成一组「按旧目标的建议」，「全部采纳」不会采纳它们。主按钮变成「按当前目标判断 N 篇」，会把这些文献重新判断。\n- **复核已判断的 M 篇**：已判断的文献也按当前目标再读一遍。看法和你不同的回到队列，归入「与你的判断不同」，行上并排显示「你的判断」和「建议」，按钮有「保持：…」和「采纳：…」。选任何一个，这篇就离开队列（以 `reviewed_at` 晚于建议时间为准）。保持时原理由也保留。\n- 外部 agent 能从 `library_status` 拿到 `screeningGoal`；`suggest_screening` 提交的建议会记下当时的目标。\n- 新增开发步骤 `goal:<text>`、`screen:decided`。教程、项目页、`docs/DATA.md` 里的「筛选标准」统一改为「筛选目标」，教程补了一段讲怎么换目标。\n\n没有做 BiblioCell 的一致率统计（按模型、按每一轮对比建议和人工判断）；那是单独的一步。\n\n本 PR 基于 main，不依赖 #38；两者都改了 CLAUDE.md 的开发步骤那一行，后合并的需要处理一下冲突。\n\n## 验证\n\n- 新测试：`store::tests::suggestions_of_an_earlier_build_gain_a_goal`（旧表补列），`suggestions_do_not_decide` 里加了目标的保存和比较。\n- `cargo test`、`cargo clippy --all-targets` 通过（macOS，`runtime_shaders`）。\n- 用演示库和 `mock_model` 在窗口里走了一遍（`shot:` 截图）：先按空目标判断，换目标后建议标为「按旧目标」，按钮变成「按当前目标判断 1 篇」；在另一个库里复核后，已纳入的《Attention Is All You Need》回到「与你的判断不同」；点「保持：已纳入」后它离开队列，数据库里的判断和理由「奠基性工作」都没变。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-12T02:03:44Z",
+    "headRefName": "screening-goal",
+    "headRefOid": "b21e9ae188430e5cea83f83bbb7c5c71e04ad9c8",
+    "mergeCommit": {
+      "oid": "f2ec1e8093bbc96d4a8edbed389be03d2704d1ba"
+    },
+    "mergedAt": "2026-11-12T02:23:27Z",
+    "number": 42,
+    "state": "MERGED",
+    "title": "筛选目标：可以换个目标重新筛选",
+    "updatedAt": "2026-11-13T08:01:42Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/42"
+  },
+  {
+    "baseRefName": "main",
+    "body": "新增「添加文献 › 从 Zotero 导入…」和建库向导入口，可从本机 Zotero 数据库迁移个人库、群组库的文献信息、标签、笔记及已下载的 PDF。分类路径转为标签；按现有规则去重，保留 Wisp Paper 已编辑的记录并补充附件，回收站中的文献不会恢复。\n\n源数据库以只读事务打开并读取已提交的 WAL 数据，附件复制到目标文献库。导入在后台逐条执行，进度与结果明细显示重复记录、缺失附件及失败原因。新增 `docs/ZOTERO.md`，说明操作步骤、字段映射、重复导入和常见问题，并更新 README、功能、开发及隐私文档的入口。\n\n## 范围\n\n这是一次本地复制，不是持续同步。相对链接 PDF 需要手动处理；独立笔记、独立附件、PDF 批注及非 PDF 附件不迁移，教程和界面说明已注明。\n\n## 验证\n\n- `cargo test --workspace`：124 项通过，1 项联网测试按原配置跳过；新增 5 项 Zotero 测试覆盖字段映射、来源不变、附件复制、重复导入、保留编辑、回收站、缺失文件、WAL 和路径处理。\n- `cargo clippy --workspace --all-targets -- -D warnings`：通过。\n- `cargo check --workspace --all-targets`、`cargo build -p wisp_paper`：通过。\n- 文档相对链接检查和 `git diff --check`：通过。\n- 已查看导入说明窗口；端到端界面验证中途停止，尚未完成。没有使用实际用户的 Zotero 数据。\r\n",
+    "createdAt": "2026-11-12T01:55:19Z",
+    "headRefName": "codex/zotero-import",
+    "headRefOid": "b62d4729c20edfb1ded9ee8b84cd029d1ac733f6",
+    "mergeCommit": {
+      "oid": "42af935bd52fb3563730176138b96bcb1a5e180d"
+    },
+    "mergedAt": "2026-11-12T02:02:44Z",
+    "number": 41,
+    "state": "MERGED",
+    "title": "feat: 支持 Zotero 本地导入并添加迁移教程",
+    "updatedAt": "2026-11-13T08:01:39Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/41"
+  },
+  {
+    "baseRefName": "main",
+    "body": "## 做了什么\n\n- 「添加文献」菜单新增 **导入文件夹…**；把文件夹直接拖进窗口也一样。\n- 文件夹里各层的 PDF 都会导入。PDF 所在的每一层子文件夹各成一个标签：选了 `论文`，`论文/植物/免疫/a.pdf` 带上「植物」「免疫」两个标签；直接放在 `论文` 里的 PDF 不带标签（所选文件夹本身的名字常是「下载」之类，不作标签）。\n- 库里已有的文献（按 DOI 等去重）把 PDF 附到原条目，并把新标签并入原有标签；回收站里的不动。\n- 跳过隐藏的文件和文件夹（如 `.cache`），不跟随链接的文件夹（避免绕回上层）；按路径排序导入。\n- 文件夹里没有 PDF 时提示一句。\n- 开发步骤 `import:<folder>` 走同一条路，空库提示、底栏提示、引导页、`docs/TUTORIAL.md`、`CLAUDE.md` 已更新。\n\n核心在 `wisp_core::import::folder_pdfs`，窗口里 `import_paths` 展开文件夹，导入队列带上标签交给 `add_pdf`。\n\n## 验证\n\n- 新测试 `import::tests::folder_levels_become_tags`（多层、隐藏、大小写扩展名、同名嵌套去重）。\n- `cargo test`、`cargo clippy --all-targets -- -D warnings` 通过。\n- 用 `WISP_PAPER_DEV=open:0,import:<folder>` 在窗口里导入一个三层的文件夹（4 个 PDF，另有一个藏在 `.cache`）：标签分别是「植物」「植物、免疫」「驯化」和无，隐藏目录跳过；再从另一个文件夹 `复习/` 导入同一篇，原条目的标签变为「植物、免疫、复习」。截图看过菜单项和侧栏的标签。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-12T01:28:58Z",
+    "headRefName": "import-folder-tags",
+    "headRefOid": "a1675cb458537553d2dee848d1fed1ece93be2d7",
+    "mergeCommit": {
+      "oid": "1b5cdde88ba5bcf7b728962c87364a67244853dc"
+    },
+    "mergedAt": "2026-11-12T03:50:36Z",
+    "number": 38,
+    "state": "MERGED",
+    "title": "从文件夹导入：子文件夹成为标签",
+    "updatedAt": "2026-11-13T08:01:40Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/38"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Releases so far had one `macos-universal.dmg`. From now on there are two, named like the Windows and Linux files:\n\n- `WispPaper-v<版本>-macos-arm64.dmg`: Apple 芯片\n- `WispPaper-v<版本>-macos-x64.dmg`: Intel\n\nChanges:\n- `scripts/package-macos.sh` takes `--arch arm64` and `--arch x64`. `universal` and `host` stay for local use.\n- `release.yml`: the macOS job is a matrix over arm64 and x64 on `macos-latest`, with Intel cross-compiled. Each is signed and notarized on its own. The check fails if a binary holds the other architecture. `wisp help` runs under Rosetta where the runner has it, otherwise a warning. Publishing expects the two DMGs.\n- Project page: two buttons in the macOS card, Apple 芯片 and Intel, and a line on how to tell which Mac you have. For releases that still have only the universal DMG, both buttons lead to it.\n- README and DEVELOPMENT.md list the two files.\n\nChecked locally: `--arch arm64` and `--arch x64` both package, and `lipo -archs` gives only `arm64` and only `x86_64` respectively. The signed path runs only on a tag; this PR runs the unsigned rehearsal.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-12T00:38:53Z",
+    "headRefName": "macos-arm64-release",
+    "headRefOid": "b531cca41ccdc2d912eca79cf7fd06c56dcc1408",
+    "mergeCommit": {
+      "oid": "d55efa75d022a9b8236bc60550c818f7f4623f6c"
+    },
+    "mergedAt": "2026-11-12T01:05:46Z",
+    "number": 37,
+    "state": "MERGED",
+    "title": "Release macOS as two DMGs: arm64 and x64",
+    "updatedAt": "2026-11-13T08:01:41Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/37"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The library's sidebar was a fixed 224 px. It now has a width of its own and can be hidden, both kept in `settings.json`.\n\n## What changes for the reader\n\n- **Put away / bring back**: a button at the top left, beside macOS's traffic lights, and the shortcut `⌘B` / `Ctrl+B` (listed under 设置 › 快捷键, can be changed). With the sidebar away, the button and 「所有文献库」 stay where they were, over the list.\n- **Width**: drag the sidebar's right edge, between 176 and 420 px (at most 40% of the window). Pulled in past half the narrowest width the sidebar is put away; it returns when the pointer goes back out without letting go.\n- **Double click on the edge**: puts the sidebar away.\n- A sidebar too narrow for 「所有文献库」 keeps the arrow alone.\n- The top-left buttons sit level with the traffic lights; they were 4 px low.\n\n## In the code\n\n- `Settings::sidebar_width` (0 is `SIDEBAR_W`) and `Settings::sidebar_hidden`; widths come from `Workspace::sidebar_width`, not from the constant, so the detail panel's limits follow.\n- `Workspace::resizing` is now `Option<Edge>` (`Sidebar` or `Detail`); the layer over the window sends the moves to `drag_sidebar` or `drag_detail`.\n- Both edges also hear their own mouse-up. A tap is over before the layer that follows the pointer is drawn, which left the edge held and swallowed the second click of a double click (the detail panel's edge had this too).\n- `Cmd::ToggleSidebar`, shortcut `sidebar`, icon `panel-left` (Lucide).\n- Dev steps: `sidebar`, `sidebar:<px>`, `click2:x;y` (the second click of a double click).\n\n## Checked\n\n- `cargo clippy --all-targets` without warnings of its own, `cargo test` passing (macOS).\n- Driven by script and looked at off screen (`shot:`): dragging the edge, dragging it in until the sidebar goes and back out, double click, the button, the narrow sidebar, the dark theme, the row on the shortcuts page.\n\n## Not checked\n\n- The buttons beside the real traffic lights: the off-screen picture does not draw them, so the alignment is worked out from a screenshot, not seen.\n- The key `⌘B` itself (only the command it runs).\n- Windows and Linux.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T23:19:16Z",
+    "headRefName": "sidebar-collapse",
+    "headRefOid": "02b5a500d9cf615df9601a5e9bcd3f0d0e4cf3c3",
+    "mergeCommit": {
+      "oid": "a3a007cfa1bd0632556a2f0d170ecdf035728c25"
+    },
+    "mergedAt": "2026-11-11T23:26:07Z",
+    "number": 36,
+    "state": "MERGED",
+    "title": "A sidebar that can be put away, dragged wider, and closed with a double click",
+    "updatedAt": "2026-11-13T08:01:43Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/36"
+  },
+  {
+    "baseRefName": "main",
+    "body": "`docs/CLI.md` lists the tools by name and 0.4.0 added one without a row there: `find_pdf`. One line; it was pushed to the 0.4.0 branch a moment after that branch was merged, so it comes on its own.\n\nNo code. Not needed for the v0.4.0 tag: the release notes are a file of their own.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-11T23:15:37Z",
+    "headRefName": "docs-cli-find-pdf",
+    "headRefOid": "3b6e60d4d33d3db2429ac4b483cec21c271ff4b3",
+    "mergeCommit": {
+      "oid": "50a6d6d20ffad9c2b52059187b44165b23499fad"
+    },
+    "mergedAt": "2026-11-11T23:21:38Z",
+    "number": 35,
+    "state": "MERGED",
+    "title": "CLI.md: find_pdf",
+    "updatedAt": "2026-11-13T08:01:40Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/35"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The second round of issues, and two things asked for while it was being built: when asking about a paper, the conversation in the middle with the PDF to its right; and pieces of a PDF page as pictures for a question.\n\nCloses #19, closes #20, closes #23, closes #28, closes #32.\n\n## What changed\n\n**Conversation and PDF side by side** (#28)\n- Asking about a paper shows the paper's PDF to the right of the conversation when the detail panel is at least 760 px wide (`Library::split`, on by default); 「对照 PDF」 widens a narrow panel, the × on the PDF puts it away.\n- A citation followed from the paper's conversation moves the PDF and leaves the conversation where it is.\n\n**Selecting in a PDF** (#20)\n- The worker hands out a page's glyphs once the page is drawn (`pdftext::page_marks`); `mark_at`, `mark_boxes` and `marks_text` in core turn a drag into a stretch of them, its boxes and its text. Within one page.\n- Copy (⌘/Ctrl+C or the bar under the selection), or add to a conversation: the passage stands over the question box with its page, and goes to the model written as answers cite (`ai::quoted_passage`).\n- 「截图提问」: a rectangle dragged on a page is cut out of the page's picture and attached to the question.\n\n**Quotations checked** (#28)\n- `ai::check_quote` looks a quotation up in the stored page text: found, on another page, only its beginning (and how much of it), missing, no text. The chips under an answer say so, and lead to where the sentence really is.\n- Citations in the text of an answer can be clicked (`ai::citation_spans`). `/verify` is a new slash command; it stands alone for the last answer.\n\n**Selecting in an answer** (#23)\n- `markdown::render` keeps the `TextLayout` of every piece it draws and reports the pointer as a place (piece, byte); the selection is drawn as a ground over the marks. Copy with ⌘/Ctrl+C or 「复制所选」; 「引用到输入框」 puts it into the box as a quotation.\n\n**The papers behind a question** (#19)\n- 「文献」 on the library's question page lists the papers in scope: before the first question the current list, afterwards with the labels of the conversation, what each was handed over as (`ai::Context::given`), how many pages, whether its text is readable. A row opens the paper beside the conversation.\n\n**Open full texts** (#32)\n- `openaccess.rs`: candidates from the arXiv number, OpenAlex and Europe PMC, and from the publisher's own address for Springer / BMC, Nature and Frontiers once an index says the paper is open access. No login, no way round a wall, no service that wants the asker's address.\n- Tool `find_pdf` (writes; the assistant asks first). The tools take a `Download` beside `Fetch`. A reply that is not a PDF is not kept; a fetched file's origin is in the new `file_origins` table.\n- In the window: a banner on the 缺 PDF view, a button on a paper without a PDF, a run with progress in the sidebar, a report.\n\n**Smaller**\n- A page is drawn coarse first, then at the size it is shown at. A file's row says how many of its pages gave text (#26).\n\n## For the reviewer\n\n- **Tested here:** core 102 tests, the other crates' tests, clippy with `-D warnings`. In the debug app with a real model and the network: quotations checked on real answers; a citation followed into the split view; the materials list before and after a question; `find_pdf` from the command line and from the 缺 PDF view (one paper fetched from arXiv, one publisher answering 403, two without an open copy); text selected on a PDF page, added to the conversation and answered about; a piece of a page cut out and answered about; text selected in an answer and quoted into the box.\n- **How:** the window was looked at through the off-screen `shot:` step, and the pointer was fed by dev steps. A window off the screen draws no frames, so pointer steps were interleaved with shots. No real mouse or trackpad was used.\n- **Not checked:** Windows and Linux beyond CI; dark mode for the new pieces; ⌘C itself (the copy buttons were used); a selection across the two columns of a page (it follows the drawing order, which may run into the other column or a footnote).\n- **Left out:** selection across pages; double click for a word; tabs between table cells when copying from an answer; publishers that hand PDFs to browsers only are reported as not fetched.\n- Schema: one new table, `file_origins`, no version bump (an older build ignores it).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-11T14:25:58Z",
+    "headRefName": "release-0.4",
+    "headRefOid": "ddf124e1a83bf6b68c14376dc2cf05f6fcac3b21",
+    "mergeCommit": {
+      "oid": "d6d84b6ea97330507d49192ce9b9d5ca6e1b5973"
+    },
+    "mergedAt": "2026-11-11T14:51:47Z",
+    "number": 34,
+    "state": "MERGED",
+    "title": "0.4.0: reading and asking side by side",
+    "updatedAt": "2026-11-11T14:51:47Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/34"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The first round of issues from a reader of v0.2.0, and the version bump for a release that also carries the writing page (#31) and the kept conversations (#16).\n\nCloses #17, closes #18, closes #21, closes #22, closes #26, closes #27, closes #30.\n\n## What changed\n\n**Importing PDFs** (#17, #22)\n- An import of several PDFs is a run (`Library::import`): three files are read side by side (most of the wait is the two services asked about each DOI), the sidebar shows how far it is on every page, and then a summary that stays until it is put away. 「查看明细」 lists every file with what came of it; a row opens the paper.\n- One file alone is still one sentence, now saying when no text came of it.\n\n**Full texts that gave no text** (#22, #26)\n- `Paper::fulltext` has a fourth value, `textless`: shown in the list, a filter, and in the scope line of a library question.\n- The reasons are told apart and kept as constants in `fulltext.rs`: a password, both readers failing (which is not called a scan any more), fonts without an encoding, no text layer, a file that cannot be opened. `failure_kind` knows the messages of earlier builds too.\n- `read_fulltext` says what is known and asks the model not to guess; `search_fulltext` names the papers it could not see into. The chat instructions say the same.\n- The detail panel shows the reason under the file with 「重新读取」 and 「让模型读页面」 (the run the writing page already had, for one file).\n\n**Reading** (#18, #27)\n- The edge between list and detail panel can be dragged; `Settings::detail_width` keeps it, a double click resets it.\n- `PdfView` has a `Zoom`: fit width, fit page, 25 to 500 %. Toolbar buttons and a menu of sizes, ⌘/Ctrl with `+` `-` `0` (changeable), ⌘/Ctrl with the wheel about the pointer, sideways scroll for pages wider than the panel. Pages are rendered for the size they are shown at, in a few steps, within 24 million pixels a page and 240 MB in all.\n\n**Questions** (#21, #30)\n- The history is listed and read without a model configured; 新对话 says the last conversation was kept, and tries once more to keep one whose save failed.\n- 「存为笔记」 under an answer about a paper: `ai::note_from_answer` drops the labels of the conversation, the text is shown for a look, and is added after the paper's notes.\n\n## For the reviewer\n\n- **Tested here:** core 94 tests, the other crates' tests, clippy with `-D warnings`. In the debug app on a demo library, with four open-access papers, an image-only PDF and a file that is no PDF: the import run and its report, the `textless` filter and the detail panel's reasons, a real model reading the page of an image-only PDF, zoom by command, by ⌘-wheel and sideways by Shift-wheel, the edge dragged (synthetic pointer events), an answer of a real model saved as a note, 新对话 and the paper's history, the chat page without a key.\n- **How the window was looked at:** the screen could not be captured, so debug builds got a dev step that renders the window off the screen to a PNG (`shot:`), and steps that feed pointer events (`press`, `move`, `release`, `click`, `wheel`). Steps can be delayed (`8@shot:…`). macOS only.\n- **Not checked:** Windows and Linux beyond CI; a real mouse and trackpad (the events were synthetic); a password-protected PDF (the kind is tested by its message, not with a file); dark mode for the new pieces.\n- **Left out:** pinch to zoom (GPUI 0.2.2 delivers no such gesture); per-file page coverage and garbled-page detection from #26.\n- No schema change. `settings.json` gains `detailWidth`.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-11T13:31:56Z",
+    "headRefName": "release-0.3",
+    "headRefOid": "2e98723d3c77214759de6e5f1d45425d64eafd97",
+    "mergeCommit": {
+      "oid": "9957bdca79209071bb6cef1ba92c010fe6c86c98"
+    },
+    "mergedAt": "2026-11-11T13:40:31Z",
+    "number": 33,
+    "state": "MERGED",
+    "title": "0.3.0: import progress, readable failures, PDF zoom, and notes from answers",
+    "updatedAt": "2026-11-13T08:01:41Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/33"
+  },
+  {
+    "baseRefName": "main",
+    "body": "写作: a page where the manuscript is written one part at a time, with the sentences the library's papers have in the same part beside it. That needs PDFs read and sorted into the parts of a paper, which is most of this change.\n\n## What changed\n\n**The writing page** (`src/write.rs`, state in `Writing`)\n- Five parts: abstract, introduction, methods, results, discussion. One draft per part, kept in the library (`drafts`) as it is typed.\n- Candidates beside the draft: how each paper opens the part while nothing is written, then the sentences closest to the paragraph at the caret, or to the words in the find box.\n- A candidate can be cited at the caret (`(Zhu et al., 2025)`), copied, or shown where it stands in its PDF, highlighted.\n- Text written in Chinese is first put into English search words by the translation model.\n\n**Reading PDFs** (`crates/core/src/pdftext.rs`)\n- `fulltext::file_pages` now reads a PDF with hayro's interpreter first: glyphs with their place, size and weight become lines, and a blank line marks every break the page shows, so a heading stands alone. Raised citation numbers are left out, ligatures spelled out.\n- pdf-extract is the second try. It panicked on 5 of the 14 papers this was tried on (Cell Press, Nature Plants, Frontiers), which also left them without text for questions and search.\n\n**Sorting into parts** (`crates/core/src/structure.rs`)\n- Page text becomes paragraphs and headings; a heading that names a part starts it; without an \"Introduction\" the text before the paper's first own heading is the introduction; a review's own headings are `other`. The kept paragraphs are cut into sentences.\n- `Store::save_fulltext_pages` does this for every text: `sentences` rows and one `structures` row per file. A file without such a row is read again, so existing libraries catch up when they are opened or searched.\n- Where no heading names the part, a model can sort the text's outline; the rules keep the paragraphs they were sure of (`assign_sure`, `merge`).\n- A file that gives no text can have its pages read by a model that sees pictures (`pdf::page_pictures`, `ai::read_page_request`).\n- Both are a run like the screening one, with a model of their own: 设置 › AI › 整理全文 (`Task::Structure`).\n\n**Tools**\n- `find_sentences` (part, optional query, optional paper): BM25 over stemmed words, at most three sentences per paper. The window, `wisp`, MCP and the new `/write` command use it.\n- `seed` takes further PDFs as papers with full text; the new `structure` example prints what the reader and the rules make of a PDF.\n\n## For the reviewer\n\n- **Tested here:** 93 core tests, the other crates' tests and clippy pass. The reader and the rules ran over 14 real papers (Nature, Nature Plants, Communications Biology, Molecular Plant, Genome Biology, BMC Plant Biology, Plant Methods, Frontiers): all give text, and each gets sensible parts. In the app on a demo library with a live model, sorting handled the 5 papers that needed it in about 30 seconds, and reading a one-page image-only PDF gave its text.\n- **Not checked:** the look of the writing page. The window was started and ran its steps without a panic, but nobody has looked at it yet.\n- **Schema:** three new tables (`sentences`, `structures`, `drafts`), no version bump: an older build ignores them.\n- **Dependency:** `wisp_core` now depends on `hayro-interpret` (already in the lockfile through `hayro`), so `wisp` and the Linux CI build it too.\n- Page text of a PDF already in a library is replaced by the new reader's the first time the library is opened; page numbers stay the same.\n\nKnown and left alone: ranking is by words, not by meaning; some journals' run-in subheadings still open a sentence (Molecular Plant methods); a word broken at a line end can lose a real hyphen; a small model at low effort sorted a three-page opinion piece poorly.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-11T12:11:35Z",
+    "headRefName": "writing-page",
+    "headRefOid": "276f342e17bfb924bca995c210321ef36417b842",
+    "mergeCommit": {
+      "oid": "098e154f36bddc1db0dbb8507531bfb78f9c3ab3"
+    },
+    "mergedAt": "2026-11-11T12:20:49Z",
+    "number": 31,
+    "state": "MERGED",
+    "title": "A writing page with candidate sentences from the library's papers",
+    "updatedAt": "2026-11-13T08:01:44Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/31"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The chat gets the four things it was missing: a popup for slash commands, a history of conversations, pictures in questions, and an agent loop that can be stopped, asks before it changes the library, and survives a busy service. The page is drawn anew around them: the question as a quiet bubble at the right, a run of tool calls folded into one line, one card to write in.\n\n## What changed\n\n- **Slash commands on offer.** Typing `/` opens the list over the box; more letters narrow it (by name, or by a word of the Chinese description), ↑↓ choose, Enter or Tab take, Esc closes. `ai::SLASH` is now a table of name, description, hint and template; `/review` (a short cited review of a topic), `/compare` (several papers side by side) and `/new` join `/search` and `/cite`.\n- **History.** A conversation is kept in its library from the first question on (`conversations` holds an `ai::Transcript` as JSON, `conversation_images` the pictures). 历史 lists them, for the library or for the selected paper; one can be taken up again or deleted. What the model read is not stored: a reopened conversation builds its context from the library as it is then, and `ai::build_context` takes the transcript's sources as `known`, so `[P4]` in an old answer still names the same paper.\n- **Pictures.** Pasting into the box or the `+` button attaches up to 8 pictures. `picture::prepare` makes each one a model takes: PNG, JPEG, GIF or WebP, scaled down to 2048 px, TIFF and BMP converted. `ai::user_message_with` writes them the way each of the three protocols wants.\n- **The loop.**\n  - An answer can be stopped. The conversation stays valid: calls in flight are answered as stopped, the text so far stays as the model's turn.\n  - `ToolDef::confirm` marks `run_search`, `undo_import` and `remove_search`; the window's assistant runs them only after the person agreed (once, for the rest of the conversation, or not at all, in which case the model is told so).\n  - A turn whose calls only read runs them side by side, each on its own `Store` connection; a turn that writes runs in order.\n  - `wisp_net::stream_chat` sends a request again, up to twice, on 408, 409, 429, 5xx or a failed connection, honouring `retry-after`.\n  - 24 steps per question instead of 16, and with the results before the last one the model is told to answer from what it has.\n- **The page.** Tool calls of a run fold into one line that unfolds (`检索全文 ×2 · 读取全文 ›`); what is running shows a turning mark and the seconds; a finished answer has a copy button; the composer is one rounded card with the thumbnails inside.\n\nNo schema version bump: the two tables are new, and an older build does not read them.\n\n## Checked\n\n- `cargo clippy --all-targets` without warnings; `cargo test`: 82 in core, 7 in net, 3 in the app, 3 in the CLI. New tests cover the slash table and popup, picture messages for the three protocols, labels kept across a reopened conversation, transcripts, stored conversations, retries against a canned server, and picture preparation.\n- In the window, on demo data, light and dark: the popup with keys and clicks, a question with two pictures, folded tool lines, the consent card (refused), stop and a question after it, history across a restart, a reopened conversation continued with a real model through an OpenAI-compatible gateway (it described the pictures and cited a full-text page under the old labels).\n\n## Left out\n\n- Pasting a picture with ⌘V was not tried by hand; it reaches the same code as the `+` button, which was.\n- Pictures over the Claude Messages protocol were checked against `mock_model` only, not the real API.\n- Context editing and server-side compaction are not used: they are beta parameters of the Claude API that could not be verified here.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-11T09:40:26Z",
+    "headRefName": "chat-history-and-pictures",
+    "headRefOid": "3244e34c40bec81f34f550a6f66ba35f3cb855d0",
+    "mergeCommit": {
+      "oid": "4cbb98fd6b2a6539f41f52d29ebfd403e3e02ae4"
+    },
+    "mergedAt": "2026-11-11T10:11:21Z",
+    "number": 16,
+    "state": "MERGED",
+    "title": "Conversations that are kept, take pictures, and offer their commands",
+    "updatedAt": "2026-11-13T08:01:38Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/16"
+  },
+  {
+    "baseRefName": "main",
+    "body": "The page for https://xuzhougeng.github.io/WispPaper/.\n\n## What is on it\n\n- **The example**: the tutorial's run (a library on plant single-cell transcriptomics), with its own numbers. Where the 355 papers went, the eight steps with their screenshots, and one real suggestion from that run that the visitor can decide.\n- **The design rules**: seven of them, each with where it sits in the product. The one about sources has a small demonstration: a citation that marks the quoted sentence on a page (the page is `docs/DATA.md`).\n- **The tools**: `wisp`, MCP, and the table of tools with the writing ones marked.\n- **Downloads**: one card per system, the visitor's own marked.\n\nIt is laid out as a paper: an abstract, numbered figures, vertical section labels in the margin, and citations of its own figures that can be clicked.\n\n## How it is built\n\n- `site/` is three hand-written files. System font stacks, no web fonts, no analytics, nothing from another host. Light and dark follow the system; the colours are `theme.rs`'s.\n- `site/build.sh` adds the screenshots from `docs/images` and the icon, so neither is kept twice.\n- `.github/workflows/pages.yml` deploys on a push to main that touches the page, and after every published release. It writes `release.json` (the latest release's files) next to the page; the download buttons read it. Without it, or without JavaScript, they lead to the release page and every step is shown one under the other.\n\nIt is in `site/` and not `scripts/`, so that a change to it does not rehearse the packaging.\n\n## Checked\n\nIn the browser at 1360px and 375px, light and dark: the step tabs, the figure citations, the decision buttons, the citation demo, the download cards filled from a `release.json`. No horizontal scroll at 375px.\n\nNot checked: Windows, where the headline falls back to SimSun.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T09:22:26Z",
+    "headRefName": "site",
+    "headRefOid": "3813a65572070b8b2e90d42ff14d3869b6c18c1c",
+    "mergeCommit": {
+      "oid": "5bb91ac0f7a598c64e59c25d8da16c0c56744020"
+    },
+    "mergedAt": "2026-11-11T09:24:12Z",
+    "number": 15,
+    "state": "MERGED",
+    "title": "A project page, laid out as a paper",
+    "updatedAt": "2026-11-13T08:01:43Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/15"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Version 0.2.0. It comes out of one run of the whole flow against a live model (a new library on plant single-cell transcriptomics: 355 papers imported and screened, then a question to the library), which found what the mock model never showed, and it prepares the first signed release.\n\n## What changed\n\n**Answers drawn as Markdown** (`3a98f2a`)\n- A real model writes Markdown; the chat showed it as plain text, stars and table pipes included. `wisp_core::markdown::parse` now reads headings, lists, tables, quotes, code and inline marks, with the rules ported from quiet-md's reader, and `src/markdown.rs` draws them.\n- What does not close stays as written, since an answer is drawn while it streams. Citations like `[P3 p.5 \"…\"]` stay ordinary text.\n- Under an answer the first 8 sources are shown and the rest on request: one answer in the run cited about 90 papers.\n\n**A tutorial** (`26096d0`)\n- `docs/TUTORIAL.md`: the run step by step, 17 screenshots, with the numbers it actually gave.\n\n**Signed releases** (`fdd0509`)\n- The signing follows BiblioCell's release workflow and is merged into the workflow from #11 rather than replacing it.\n- macOS: one universal DMG, Developer ID signed, app and DMG notarized and stapled (`scripts/package-macos.sh`, which now also builds).\n- Windows: both exes signed through SSL.com eSigner, then zipped (`scripts/package-windows.ps1`, `scripts/sign-windows-esigner.ps1` from BiblioCell).\n- Linux: the tar.gz as before, unsigned.\n- A tag is never published unsigned: with one of the ten secrets missing the run stops before building. A pull request touching the packaging rehearses it unsigned; a manual run builds an existing tag signed and publishes only when asked to.\n- The four crates are 0.2.0, with notes in `.github/release-notes/v0.2.0.md`. README puts downloads first.\n\n## For the reviewer\n\n- **Tested here:** 76 core tests and clippy with `-D warnings` pass. The Markdown rendering was looked at in the real window with a live model. The macOS script ran for this machine's architecture with an ad hoc signature: the app and the DMG verify, the app starts and shows 0.2.0.\n- **Not run anywhere yet:** the universal build and `lipo`, signing with a certificate, notarization, both PowerShell scripts (no `pwsh` on the machine they were written on), and the workflow itself. The Release run on this pull request is their first real run, unsigned.\n- **Before tagging `v0.2.0`:** the repository has none of the ten secrets yet (`MAC_CERT_P12_BASE64`, `MAC_CERT_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`, `ESIGNER_CREDENTIAL_ID`, `ESIGNER_USERNAME`, `ESIGNER_PASSWORD`, `ESIGNER_TOTP_SECRET`, `ESIGNER_PIN`; the same names as in BiblioCell). A manual Release run on the tag with publish off shows the signatures before anything is published.\n- The macOS package changes from two zips (arm64, x64) to one universal DMG; the bundle identifier stays `com.wisp.paper`.\n- `scripts/sign-windows-esigner.ps1` keeps BiblioCell's Chinese comments, unlike the rest of the code.\n\nSeen in the run and left alone: no progress while the guide composes its searches (about a minute), the topic on a library card is cut without an ellipsis, and the screening queue keeps its scroll position when the group changes.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-11T08:31:46Z",
+    "headRefName": "release-0.2",
+    "headRefOid": "fdd0509c8cc7ebdbbcf47bc2bddfb03e0d469242",
+    "mergeCommit": {
+      "oid": "baecbe81fcecce488432751cc52c7b5f74d8397e"
+    },
+    "mergedAt": "2026-11-11T08:52:53Z",
+    "number": 14,
+    "state": "MERGED",
+    "title": "0.2.0: signed releases, answers drawn as Markdown, and a tutorial",
+    "updatedAt": "2026-11-13T08:01:41Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/14"
+  },
+  {
+    "baseRefName": "main",
+    "body": "设置 › AI holds any number of model services now. Questions, batch screening and translation each use the one chosen for them, and every model has its own thinking setting, so a small model that does not think can translate while a stronger one answers questions. Modelled on BiblioCell's task models, translation cache and batch screening.\n\n## What changed\n\n- **Models per task.** Profiles get an id; `Settings::tasks` binds 提问, 批量筛选 and 翻译 to one. A task without a model of its own uses the one for questions, and that one the first profile. An older `settings.json` is read as before: `activeProfile` becomes the model for questions.\n- **Thinking per model.** `Profile::effort`: the service's default (nothing is sent), off, or one of five levels. `ai::apply_effort` is the one place that knows how each protocol, model and service spells it. Claude models that cannot stop thinking (Opus 5.5, Fable, Mythos) get the lowest effort for \"off\"; Sonnet 5.5 gets `between_tools`.\n- **Translation.** 翻译 beside the abstract translates the title and the abstract. Translations are kept in the library (`translations` table, keyed by text and instructions), so a text is requested once. The instructions can be changed in the settings.\n- **Screening in batches.** The assistant reads 1 to 8 papers at a time, with a progress panel (a bar that fills, a sheet being scanned, the papers being read), a spinner on the rows in flight and suggestions fading in. A paper without a usable answer no longer ends the run; three in a row do.\n- **Deciding a group at once.** The queue can be looked at one suggested verdict at a time, and such a group taken as suggested in one go, after a confirmation. The decision is still made in the window, by the person.\n- **The AI page** is a list of models whose open row shows its fields, then the tasks, then the translation instructions.\n- `mock_model` answers side by side after an optional delay, translates, and prints each request's model and thinking setting.\n\n## Checked\n\n- `cargo test` (81 tests) and `cargo clippy --all-targets`: clean apart from the vendored `xattr` warnings that were there before. Run locally with `cargo +stable … --features gpui/runtime_shaders`, because this machine's pinned toolchain has no cargo and Xcode has no Metal Toolchain; CI is the first run on the pinned toolchain.\n- In the window, against `mock_model`: a screening run of 16 papers on the screening model (`claude-haiku-5-5`, effort low), translation on the translation model with `thinking: disabled`, a group of 9 suggestions accepted at once, models added, opened and bound to tasks.\n\n## Not done, and not verified\n\n- **No live model service was tried.** The thinking parameters are covered by request-shape tests only. For OpenAI-compatible services \"off\" is sent three ways by host (OpenAI: `reasoning_effort: none`; 百炼 and 硅基流动: `enable_thinking: false`; the rest: `thinking: disabled`); a service that knows none of them answers with an error, and 默认 sends nothing.\n- No translation tool for `wisp` and MCP: the tool layer has no access to a model.\n- Translation covers the title and the abstract, not a selection in the PDF.\n- A wrapping text field in the settings column is measured at 240px; the translation instructions get a pixel width as a workaround (noted in `CLAUDE.md`), the cause is not found.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-11T07:43:35Z",
+    "headRefName": "task-models",
+    "headRefOid": "cb891f7b732ecb55edb1c30c5a32021896d520e8",
+    "mergeCommit": {
+      "oid": "0f7d0e2ffa412cd6a72596a4d27e0567a151817b"
+    },
+    "mergedAt": "2026-11-11T07:49:04Z",
+    "number": 13,
+    "state": "MERGED",
+    "title": "A model per task, translation, and screening in batches",
+    "updatedAt": "2026-11-13T08:01:43Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/13"
+  },
+  {
+    "baseRefName": "main",
+    "body": "## What changed\n\nThe README is rebuilt after the layout of [quiet-md](https://github.com/s1dashu/quiet-md)'s: a centred icon, title and tagline, badges, navigation links, a screenshot, an early-stage note, four reasons to use the app, install steps, a short feature list, a table of the documents, credits and the licence.\n\nEverything the old README said in detail now lives under `docs/`:\n\n| File | Content |\n|---|---|\n| `docs/FEATURES.md` | the full feature notes and the settings pages |\n| `docs/DATA.md` | where the data is, what leaves the machine (now a table), API keys |\n| `docs/CLI.md` | `wisp` usage, the tool table, MCP configuration, scheduled sync |\n| `docs/DEVELOPMENT.md` | building, debugging environment variables, code layout |\n| `docs/images/library.png` | the screenshot, taken from the `seed` example's data |\n\n## Where it differs from quiet-md\n\n- No download buttons, release badge or CI badge: there are no releases and no CI here, so \"Download\" became \"安装\" (build from source).\n- No performance, contributors or recent-updates sections: there is nothing to put in them yet.\n- The status badge says `alpha`. That wording is a choice made in this PR, not something the repository stated before.\n\n## Corrections made while moving text\n\n- The `ai` module was described as building requests for two protocols; it is three.\n- The 提问 section listed the clickable `[P3 p.5]` citation twice; merged into one item.\n- The settings module's page list was missing 网络.\n\n## For the reviewer\n\n- Documentation only; no code changed, so no tests were run.\n- The screenshot is from a debug build made with stable 1.99.0 and `--features gpui/runtime_shaders`, not the pinned toolchain. The picture is not affected.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T06:35:19Z",
+    "headRefName": "readme-rework",
+    "headRefOid": "80290cbbdcdd4743b0579c25d72426b6e77440e2",
+    "mergeCommit": {
+      "oid": "8001ec97259abb97795ff4435924c3a69d8b8acd"
+    },
+    "mergedAt": "2026-11-11T06:35:51Z",
+    "number": 12,
+    "state": "MERGED",
+    "title": "README in the quiet-md layout, details moved to docs/",
+    "updatedAt": "2026-11-13T08:01:41Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/12"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Sets up continuous integration and the release build, for publishing v0.1.0.\n\n## CI (`.github/workflows/ci.yml`)\n\nOn every push to `main` and every pull request:\n\n- **Windows and macOS**: `cargo clippy --all-targets -- -D warnings` and `cargo test` for the whole workspace.\n- **Linux**: the same for `wisp_core`, `wisp_net` and `wisp_cli`. The window is not built there, since Linux is not a supported target for the app.\n\n## Release (`.github/workflows/release.yml`)\n\nPushing a tag `v<version>` builds three packages and publishes a GitHub release with them:\n\n| Package | Contents |\n|---|---|\n| `WispPaper-v<version>-windows-x64.zip` | `WispPaper.exe`, `wisp.exe`, licence files, README |\n| `WispPaper-v<version>-macos-arm64.zip` | `Wisp Paper.app` (with `wisp` in `Contents/MacOS`) |\n| `WispPaper-v<version>-macos-x64.zip` | the same for Intel |\n\n- The build fails if the tag does not match the version in `Cargo.toml`.\n- Release notes come from `.github/release-notes/v<version>.md` when it exists (v0.1.0 is included), otherwise GitHub generates them.\n- Nothing is signed with a certificate. The macOS bundle gets an ad-hoc signature, which Apple silicon requires to run a binary at all; it does not satisfy Gatekeeper. The release notes and README tell users how to open the app the first time.\n- Release builds are now stripped of debug symbols.\n\n## Testing\n\nNothing in here can be run locally. This pull request is the first run of the CI workflow; I will merge only once it is green, and fix what it finds here. The release workflow first runs when the `v0.1.0` tag is pushed after the merge.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T06:14:57Z",
+    "headRefName": "ci-release",
+    "headRefOid": "9b853f0e33a8c3f3237ae83c56501443668df860",
+    "mergeCommit": {
+      "oid": "792f13569aee089ef16f9ae9929298cb76eb9675"
+    },
+    "mergedAt": "2026-11-11T06:52:58Z",
+    "number": 11,
+    "state": "MERGED",
+    "title": "CI, and releases built from a tag",
+    "updatedAt": "2026-11-13T08:01:38Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/11"
+  },
+  {
+    "baseRefName": "main",
+    "body": "## What changes for the user\n\n- **设置 › 网络** (new page): a global proxy address. Literature searches, DOI / PMID lookups, the update check and model requests all go through it. It is saved as typed and takes effect with the next request. Schemes: `http`, `https`, `socks4`, `socks4a`, `socks5`, `socks5h`.\n- **设置 › AI**: a 代理 row for the model service. Empty uses the global proxy, an address overrides it, `direct` means no proxy for this service.\n- Empty everywhere keeps today's behaviour: the environment's `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` (and `NO_PROXY`).\n- `wisp` (command line and MCP) reads the same setting.\n- A malformed address is flagged where it is typed. A malformed global address is not applied; the last valid one stays in force.\n\n## How it is built\n\n- `Settings::proxy` and `Profile::proxy` in `settings.json`; `settings::proxy_problem` checks an address.\n- `wisp_net::set_proxy` holds the global proxy for the process; `HttpRequest::proxy` carries a profile's own. `proxy_for` decides per request, and a proxy address that cannot be used is an error rather than a silent direct connection.\n- ureq's `socks-proxy` feature is enabled.\n\n## Things to know\n\n- The address, including any user name and password in it, is stored in plain text in `settings.json`, like the API key. The page says so.\n- With `direct` on a profile, `NO_PROXY` is irrelevant: no proxy is used at all. With an explicit global proxy, the environment variables are not consulted.\n- Only one model profile is editable in the settings today, so \"a proxy per protocol\" means the proxy stays with that profile when its interface is switched.\n\n## Testing\n\n`cargo test` passes (67 core, 3 CLI, 6 net, 1 app); clippy is clean. A net test sends a model request through a local fake proxy (the CONNECT tunnel is asked for and the request arrives inside it), checks that `direct` connects straight, and that a bad address is reported. With the built `wisp`: a dead proxy address in `settings.json` made a Europe PMC search fail at the proxy, and clearing it made the search succeed. Not tested: a real proxy server, SOCKS in particular, and the two settings pages on screen (the app window was behind other windows when I tried to capture it), so their layout is unverified.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T05:50:30Z",
+    "headRefName": "network-proxy",
+    "headRefOid": "3aab5e9bd56d69f7fc610bf8f58f2e736aa6145c",
+    "mergeCommit": {
+      "oid": "9a41999de77d2963043bb369a506e5aca6440819"
+    },
+    "mergedAt": "2026-11-11T05:51:08Z",
+    "number": 10,
+    "state": "MERGED",
+    "title": "A global proxy, and one per model service",
+    "updatedAt": "2026-11-11T05:51:17Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/10"
+  },
+  {
+    "baseRefName": "main",
+    "body": "A model profile can now use OpenAI's Responses API (`POST {address}/responses`) in addition to the Claude Messages API and chat completions. Everything that talks to a model goes through it: questions with tool calls, the guide's query suggestions, screening.\n\n## How it works\n\n- The request carries `instructions`, `input`, flat function tools, `stream: true`, and `store: false` with `include: [\"reasoning.encrypted_content\"]`. Nothing is kept on the service; the whole conversation is sent each time.\n- The stream reader takes text from `response.output_text.delta` and whole items from `response.output_item.done`. A turn's items (reasoning, message, function calls) are appended to the conversation unchanged, then one `function_call_output` per call, matched by `call_id`.\n- `response.incomplete` maps to the existing \"cut off\" and \"declined\" handling; `response.failed` and `error` events surface their message.\n- In 设置 › AI, 接口 has a third option, OpenAI Responses. Switching between the two OpenAI interfaces keeps the address and model; the key falls back to `OPENAI_API_KEY`.\n\n## Testing\n\n`cargo test` passes (66 core, 3 CLI, 5 net, 1 app); clippy is clean. Covered by tests: the request body, a streamed turn with reasoning, text and a function call, the follow-up request, cut-off and failure events, and one exchange against a local fake server. Not tested: the real OpenAI service (no API key on this machine) and third-party servers that implement `/responses`; a server that rejects `store` or `include` will fail with its own error. I could not confirm the settings page visually this time, because other windows covered the app during the capture.\n\nThe event names and item shapes follow OpenAI's function-calling guide; the `store: false` plus encrypted reasoning pattern is from memory of the reasoning guide, not re-read today.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T05:37:36Z",
+    "headRefName": "responses-api",
+    "headRefOid": "1ea07756e92b31d46e2d40c979c96df972be597f",
+    "mergeCommit": {
+      "oid": "1495c4a6ce57e35c1cef17c2770f162b394f63b8"
+    },
+    "mergedAt": "2026-11-11T05:38:05Z",
+    "number": 9,
+    "state": "MERGED",
+    "title": "OpenAI's Responses API as a third protocol",
+    "updatedAt": "2026-11-11T05:38:09Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/9"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Step 7, the last of the roadmap.\n\n## What changes for the user\n\n- The assistant can cite a sentence, not only a page: `[P3 p.5 \"the sentence\"]`. The chip under the answer shows the quotation; clicking it opens the paper's PDF at that page with the sentence highlighted and scrolled into view.\n- The quoted excerpt of a screening suggestion (筛选 page) does the same.\n- If the sentence is not on the cited page, the neighbouring pages and then the rest of the file are searched. If it is nowhere, the view stays on the cited page and says 已跳到引用的页，但没有在 PDF 里找到这句原文。\n- Matching compares letters and digits only, so line breaks, hyphenation, punctuation and ligatures do not get in the way.\n\n## How it is built\n\n- hayro already hands every glyph to a `Device` while interpreting a page. A small device in `pdf.rs` records each glyph's Unicode text and its place; no new dependency.\n- `fulltext::find_quote` finds the quotation among the glyph texts (whole, else its first 80, 40 or 20 characters); `fulltext::line_boxes` merges the glyph boxes into one per line. Both are pure and tested in core.\n- The view draws translucent boxes over the page image. Glyph advances are not exposed by hayro, so a glyph's box is half an em wide; neighbours close the gaps, and the last glyph of a line may be marked slightly short or long.\n- `ai::citations` now returns label, page and quotation. A quotation may contain commas and brackets.\n\n## Also fixed here\n\nThe PDF worker used to keep only the newest of several queued page requests and silently drop the others, which could leave a page blank after fast scrolling. It now renders the newest three and reports the rest back, so the view asks again when they come into view.\n\n## Testing\n\n`cargo test` passes (65 core, 3 CLI, 4 net, 1 app); clippy is clean. In the window, on the arXiv PDF of \"Attention Is All You Need\" with the debug step `quote:<page>|<sentence>`: a sentence on the given page was highlighted exactly; a two-line passage given with the wrong page (7) and without its commas was found on page 2 and both lines marked; a sentence that is not in the paper showed the notice. Not tested: a citation with a quotation produced by a real model (no API key here), scanned PDFs (no text layer, so nothing will be found), and vertical or right-to-left text.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T05:29:07Z",
+    "headRefName": "pdf-highlight",
+    "headRefOid": "b68186e1962e536a792796857512ccfe4fbe78bc",
+    "mergeCommit": {
+      "oid": "72cda9c74a38de3862a48e26ae68de116b90f31c"
+    },
+    "mergedAt": "2026-11-11T05:29:29Z",
+    "number": 8,
+    "state": "MERGED",
+    "title": "Citations that open the PDF at the quoted sentence",
+    "updatedAt": "2026-11-11T05:29:33Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/8"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Step 6 of the roadmap: scheduled updates.\n\n## What changes for the user\n\n- 检索与导入 has an 自动更新 control: 关闭 (default), 每 6 小时, 每天, 每周. It is per library and saved in `library.json`.\n- While the app is open it checks once a minute (first check about 20 seconds after launch) and runs the enabled searches whose turn has come, in every library that has auto update on, not only the open one. Searches missed while the app was closed are due at that first check.\n- A run that failed is tried again after an hour at most.\n- New papers arrive as 待判断; the open library reloads and shows a toast with the count.\n- Each saved search has a 停用 / 启用 button; disabled searches are skipped by auto update and by 全部运行.\n\n## Without the window\n\n`wisp sync_searches` runs what is due and prints what it did, so a system scheduler (Task Scheduler, cron) can keep libraries updated while the app is closed. `--force` ignores the interval, `-l` limits it to one library. It is also an MCP tool, marked as writing.\n\n## How it is built\n\n- `tools::due_searches` is the rule: enabled, and never run or last run at least the interval ago (an hour for a failed run).\n- `sync_searches` is a root-level tool like `list_libraries`; one search failing does not stop the others.\n- `Workspace::watch_searches` calls that tool on the background executor. Looks do not overlap: the next one waits for the current runs.\n\n## Testing\n\n`cargo test` passes (63 core, 3 CLI, 4 net, 1 app); clippy is clean. Live: with auto update set to daily and a PubMed search never run, the running app imported 5 papers at its first check and the page and sidebar counts updated; `wisp sync_searches` before enabling and after the run both did nothing, as they should. Not exercised: clicking the interval chips and the 停用 button in the window (I set the interval by editing `library.json`), and the hourly retry over real time (covered by the unit test of the rule).\n\nIf the app and `wisp sync_searches` run at the same moment, a search can run twice; the second run finds everything already in the library and adds nothing.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T05:17:40Z",
+    "headRefName": "scheduled-sync",
+    "headRefOid": "c19ca9f1bbdad006c61fe231fde0cf9cee51dd66",
+    "mergeCommit": {
+      "oid": "eb9f4be8dcaaab57b7e100bb2fe2f799b85b6152"
+    },
+    "mergedAt": "2026-11-11T05:17:57Z",
+    "number": 7,
+    "state": "MERGED",
+    "title": "Saved searches that run on their own",
+    "updatedAt": "2026-11-11T05:18:03Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/7"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Step 5 of the roadmap: the second half of 鲸吞法. Import broadly by query (#4, #5), let the assistant judge, and the person decides.\n\n## What changes for the user\n\n- A new page, 筛选, lists the papers still 待判断. **让助手判断 N 篇** has the assistant read each one and suggest 已纳入 / 相关 / 不相关 / 证据不足, with a reason, a sentence quoted from the paper and how sure it is.\n- Selecting a row opens the suggestion and four decision buttons; the suggested one reads 采纳：…. The usual detail panel (abstract, PDF) is beside the list, and a quotation with a page number opens the PDF at that page.\n- Deciding moves to the next paper. Agreeing with the suggestion stores its reason as the screening reason; choosing otherwise leaves the reason empty.\n- An optional 筛选标准 is saved with the library; without it the library's topic is the standard.\n\n## Rules this keeps\n\n- A suggestion never changes a paper's screening decision. Only the window writes it.\n- A quotation is shown as evidence only if it is found in the abstract or the full text (letters and digits compared, so PDF line breaks do not matter). Otherwise it is dropped.\n- A paper with neither abstract nor full text is marked 证据不足 without asking the model.\n- The run asks about three papers at a time and stops at the first failure, so a wrong key does not fail every paper in turn. Starting again continues with the papers that have no suggestion yet.\n\n## For other agents\n\n`suggest_screening` is the same thing as a tool (`wisp`, MCP, in-app chat): an outside agent reads the paper and proposes; `get_paper` and `list_papers` show the suggestion beside the decision. It is marked as a writing tool, so `wisp mcp --read-only` leaves it out.\n\n## Also in here\n\nTitles and abstracts now decode numeric character entities (`&#x2009;`), which PubMed records contain.\n\n## Testing\n\n`cargo test` passes (62 core, 3 CLI, 4 net, 1 app); clippy is clean. In the window, with eight papers imported from live PubMed and the mock model: the run produced nine suggestions (one without asking, for the paper with no abstract), the queue ordered them, and a selected row showed reason, quotation and buttons. Not exercised: clicking a decision button in the window, a quotation with a page number (no PDF in the demo data), and a real model, so the quality of the suggestions is untested.\n\nNo keyboard shortcuts for the decisions yet, and no view comparing suggestions with decisions; the data for the latter is kept.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T05:12:07Z",
+    "headRefName": "ai-screening",
+    "headRefOid": "c7f3ecb4b2b0996473687c141a8dc21da532254e",
+    "mergeCommit": {
+      "oid": "ce6734c21681691281ba3ce8ba14b8e7bf239888"
+    },
+    "mergedAt": "2026-11-11T05:12:39Z",
+    "number": 6,
+    "state": "MERGED",
+    "title": "Screening suggestions that the person confirms",
+    "updatedAt": "2026-11-11T05:12:42Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/6"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Step 4 of the roadmap.\n\n## What changes for the user\n\n- Creating a library now opens it on a guide with three ways to start: **从检索文献开始** (recommended), 导入已有的文献, 先空着.\n- Starting from a search: write the topic or keywords (pre-filled from the library's topic), choose databases, and the assistant proposes a few queries per database with different aims, for example one broad and one focused. Each is tried immediately and shows its hit count and newest titles.\n- The person selects the queries whose hits look right; **保存并导入所选** saves them as searches and runs them. Nothing is selected by default.\n- The same page is reachable for an existing library from 检索与导入 → 让助手拟检索式. Without a model configured, 自己写检索式 opens the plain dialog.\n\n## How it is built\n\n- `ai::query_prompt` gives the model each database's syntax and asks for a JSON array; `ai::parse_queries` reads it out of whatever surrounds it and drops entries it cannot use. `ai::plain_request` is a request with its own instructions and no library documents.\n- `wisp_net::complete` waits for a whole streamed answer.\n- Trials reuse the `search_online` tool from #4 through `Workspace::library_tool`.\n- `list_searches` now also returns the query syntax per database, so an external agent can compose queries without the guide.\n\n## Found while testing\n\nTwo PubMed trials started together were refused with HTTP 429 (NCBI allows three requests a second without a key). `wisp_net::get_text` now spaces requests to NCBI 400 ms apart across the process and retries a 429 twice. After that both trials came back.\n\n## Testing\n\n`cargo test` passes (58 core, 3 CLI, 4 net, 1 app); clippy is clean. I ran the window with `WISP_PAPER_DEV=open:0,guide:new` and `guide:go`: the choice screen renders, and with the mock model proposing two PubMed queries both were tried against live PubMed (182 and 28 hits). Not exercised: clicking 选用 and 保存并导入所选 in the window, and query generation by a real model (no API key on this machine), so how good the proposed queries are is untested.\n\nSaved guide searches fetch the newest 200 records per run, the current maximum; a query with more hits than that is not imported in full.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T05:02:48Z",
+    "headRefName": "guide-page",
+    "headRefOid": "494e437a6f9fcb248f65f33c091bc15740017053",
+    "mergeCommit": {
+      "oid": "05abcb7d26cc8999bd2ddb9a214d4358d5cf6fcc"
+    },
+    "mergedAt": "2026-11-11T05:03:07Z",
+    "number": 5,
+    "state": "MERGED",
+    "title": "A guide for a new library that starts from a search",
+    "updatedAt": "2026-11-11T05:03:13Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/5"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Step 3 of the roadmap: getting papers into a library by query, with a look before importing and a way back afterwards.\n\n## What changes for the user\n\n- A new page, 检索与导入, in the library sidebar. A saved search is a query for PubMed, Europe PMC, Crossref or arXiv.\n- **试检索** runs it without writing anything: the database's hit count, the newest 20 records, and which of them the library already holds (with the screening decision).\n- **运行并导入** adds the new records as 待判断 and skips known ones (DOI, PMID, title; trashed papers count).\n- Every run is on the import record and can be undone as a whole. Papers someone has worked on since (decision, reading progress, star, notes, tags, fields, files, trash) stay.\n- The same operations are `wisp` subcommands, MCP tools and tools of the in-app assistant. The assistant is told to use the writing ones only when asked.\n\n## How it is built\n\n- **`sources.rs`** (core): URLs and parsers for the four databases. It takes the fetching function as an argument, so core still has no socket and tests pass a closure. PubMed and arXiv reply in XML, read by a small element extractor rather than a new dependency.\n- **`store.rs`**: tables `searches`, `import_batches`, `batch_papers`. They are additive, so the schema version stays at 1.\n- **`tools.rs`**: seven new tools; `ToolDef::writes` marks the four that change a library. `wisp mcp --read-only` leaves those out and refuses them if called.\n- **`crates/net`** (`wisp_net`): `src/net.rs` moved here so `wisp` can reach the network too; `get_text` is new.\n- **App**: `src/searches.rs` renders the page; `Workspace::library_tool` runs a tool on the background executor with its own connection.\n\n## Testing\n\n`cargo test` passes (57 core, 3 CLI, 4 net, 1 app) and clippy is clean. Against the live services I ran trial searches on PubMed, Europe PMC and Crossref, and on PubMed the whole path: save, run (5 added of 90 hits), run again (5 skipped), undo (5 removed). I opened the page in the window with a live trial.\n\nNot verified live: **arXiv**, which rate-limited or timed out from this machine during testing; only its parser is covered, by a fixture. Also unclicked in the window: the new-search dialog's save, 运行并导入 and 撤销 buttons (their handlers call the same store and tool functions the tests and the CLI run exercised).\n\nOne fix found by the live run: Crossref rejects `institution` in `select`, so preprints from Crossref searches may have an empty journal where a DOI lookup fills it.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T04:53:36Z",
+    "headRefName": "search-sources",
+    "headRefOid": "3ac15a2b900a3431052894ad9b51c57556888532",
+    "mergeCommit": {
+      "oid": "f4699d640c17fdba7a11cae0c99f54de70b0c9e9"
+    },
+    "mergedAt": "2026-11-11T04:54:05Z",
+    "number": 4,
+    "state": "MERGED",
+    "title": "Literature searches: trial runs, saved searches, undoable imports",
+    "updatedAt": "2026-11-11T04:54:09Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/4"
+  },
+  {
+    "baseRefName": "main",
+    "body": "Step 2 of the roadmap. A question to the library (or to one paper) may now take several requests: the model calls the tools from #2, reads their results and continues until it answers.\n\n## What changes for the user\n\n- The assistant can search the stored full text, read pages and look up records across the whole library, not only what was put in front of it. Each call appears in the conversation as one line with its result.\n- `/search <words>` and `/cite <text>` in the question box. `/cite` goes sentence by sentence and uses the new `find_citations` tool.\n- Papers the tools find outside the current list get a label too, so their citations are clickable.\n\n## How it is built\n\n- **`ai.rs`**: tool definitions in the request for both protocols; `TurnReader` turns one streamed turn into text, tool calls and the message to send back. For Claude that message is the content blocks as received, thinking and signatures included; blocks before a `fallback` block are dropped as the API requires. `tool_results` builds the reply (one user message for Claude, one message per call for OpenAI-compatible services).\n- **`tools.rs`**: `find_citations`; `library_catalog()` without the `library` argument; a title per tool and one-line summaries for the window; results over 60 KB are cut with a note.\n- **`app.rs`**: `ask` → `chat_step` → `run_tools` → `chat_step`. The transcript (`Chat::wire`) is append-only. Tools run on the background executor with their own database connection. A question takes at most 16 requests; calls that do not run (step limit, truncated turn) still get an error result so the conversation stays valid.\n- `find_citations` is also a `wisp` subcommand and an MCP tool, like everything in the catalog.\n\n## Things to know\n\n- OpenAI-compatible services that reject the `tools` parameter will now fail with their own error message; there is no setting to turn tools off yet.\n- On Anthropic's own API the request also sets top-level `cache_control`, so the growing transcript is cached between steps. Proxies do not get it.\n- When the context is rebuilt mid-conversation (library topic edited, protocol switched), earlier turns are replayed as plain text.\n\n## Testing\n\n`cargo test` passes (52 core, 3 CLI, 5 app) and clippy is clean. New tests cover both protocols' streamed tool calls, the fallback and truncation cases, and a two-request round trip against a local fake server. I ran the window against `examples/mock_model` with `WISP_PAPER_DEV=open:1,page:ask,ask:…` and saw the two tool lines, the answer and its citation chip. Not tested: a real model service (no API key on this machine), so Claude's actual tool-use and thinking round trip and any OpenAI-compatible server are unverified.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T04:34:00Z",
+    "headRefName": "agent-loop",
+    "headRefOid": "b4422812a3670e87d2cc9ecfd820074e7e2490d2",
+    "mergeCommit": {
+      "oid": "c047804db4da701afd2180380520d322b88d9261"
+    },
+    "mergedAt": "2026-11-11T04:34:19Z",
+    "number": 3,
+    "state": "MERGED",
+    "title": "The chat as an agent loop over the library's tools",
+    "updatedAt": "2026-11-11T04:34:24Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/3"
+  },
+  {
+    "baseRefName": "main",
+    "body": "First step towards the agent work: one table of tools, reachable from the command line and over MCP, and later from the in-app assistant.\n\n## What is in here\n\n- **`wisp_core::tools`**: the catalog (name, description, JSON Schema) and `call`. Six read-only tools: `list_libraries`, `library_status`, `list_papers`, `get_paper`, `search_fulltext`, `read_fulltext`.\n- **`wisp_core::mcp`**: the JSON-RPC replies for `initialize`, `ping`, `tools/list` and `tools/call`. No stream handling in core.\n- **`crates/cli`**: the `wisp` binary. `wisp <tool> [flags]` prints JSON; `wisp mcp` is the MCP server on stdin/stdout. Flags are read off each tool's schema, so a new tool needs a catalog entry and one match arm, nothing in the CLI.\n- `default_root` / `settings_file` moved from `src/app.rs` into `wisp_core::settings`, so the app and `wisp` resolve the same data folder. `wisp_core` now depends on `dirs`.\n- README and CLAUDE.md describe the command line, the MCP configuration and the roadmap.\n\n## Behaviour worth knowing\n\n- `list_papers` follows the window's list: papers marked 不相关 appear only when asked for, trashed papers never.\n- `search_fulltext` ignores case and line breaks, ranks a whole-phrase hit above scattered words, and drops pages holding fewer than half of the words. It reports how many papers it could and could not search.\n- The first full-text search extracts the text of PDFs that have none cached and stores it in the library, as the app does. That is the only write.\n- With several libraries, a tool call without `library` is an error that lists their names.\n\n## Testing\n\n`cargo test` passes (46 core, 3 CLI, 4 app) and `cargo clippy --all-targets` is warning-free. I also ran the built `wisp` against the seed data: the tool subcommands and an MCP `initialize` / `tools/call` exchange over a pipe. Not tried: a real MCP client, and full-text search over a real PDF (the tests use text files and cached pages).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+    "createdAt": "2026-11-11T03:52:40Z",
+    "headRefName": "tools-cli-mcp",
+    "headRefOid": "20bbbe3da167a0b4db62aee2b95cf9528c9c48ad",
+    "mergeCommit": {
+      "oid": "e945b7daa5707294dd200244561821f495eadfe5"
+    },
+    "mergedAt": "2026-11-11T04:17:52Z",
+    "number": 2,
+    "state": "MERGED",
+    "title": "Tool layer with the wisp command line and an MCP server",
+    "updatedAt": "2026-11-13T08:01:43Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/2"
+  },
+  {
+    "baseRefName": "main",
+    "body": "## 改了什么\n\n设置从弹窗改成独立的整页视图（左侧导航 + 右侧分组卡片，布局参照 quiet-md），改动即时保存，没有「保存」按钮。\n\n- **通用**：数据目录（更改 / 在资源管理器中显示 / 恢复默认）、自动检查更新开关、当前版本与「检查更新」。\n- **外观**：跟随系统 / 浅色 / 深色（新增深色主题）；文献列表标准 / 紧凑行高。\n- **快捷键**：8 个可改键的快捷键，可移除或恢复默认；与其他快捷键或文本编辑键冲突时拒绝并说明原因。\n- **AI**：接口类型、服务地址、模型、API Key，边改边存。\n- **关于**：版本、更新状态、项目主页、开源许可。\n\n## 自动更新的范围\n\n只做「检查并提示」：启动 10 秒后和之后每 12 小时读取 GitHub `releases/latest` 的跳转地址取版本号，有新版本时提示并打开发布页。**不会自动下载或安装**——仓库目前没有发布打包和签名，不验签就自动安装不安全。没有用 GitHub JSON API，因为它按 IP 限流。\n\n## 行为变化\n\n- 新增默认快捷键：Ctrl+, 设置、Ctrl+Shift+H 回到所有文献库、Ctrl+Shift+N 新建文献库、Ctrl+N 添加文献、Ctrl+O 导入 PDF、Ctrl+L 提问、Ctrl+E 展开详情（macOS 上为 ⌘）。\n- 更改数据目录会关闭当前打开的文献库。\n- 没有保存过模型配置时按默认的 Claude 配置处理，只设 `ANTHROPIC_API_KEY` 环境变量即可提问。\n\n## 验证\n\n- `cargo clippy --all-targets` 无警告；`cargo test` 通过（core 38 个，app 4 个，含新增的版本跳转解析和快捷键规则测试）。\n- Windows 上用临时数据目录启动，逐页截图检查了浅色、深色、快捷键录制状态和「新版本可用」状态（后者对接本地测试服务器）。\n- **未验证**：真实按键录制、文件夹选择对话框、按钮点击没有手动操作过；macOS / Linux 没有运行过。\n\n另外本 PR 带上了新增的 `CLAUDE.md`。\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+    "createdAt": "2026-11-11T03:41:11Z",
+    "headRefName": "settings-page",
+    "headRefOid": "8259a4fe25ab863e1edc4721c000860f016cb866",
+    "mergeCommit": {
+      "oid": "a6bf567f8f8c6765ec83a330170f9566cbc10aed"
+    },
+    "mergedAt": "2026-11-11T03:41:50Z",
+    "number": 1,
+    "state": "MERGED",
+    "title": "设置改为独立页面：通用、外观、快捷键、AI、关于",
+    "updatedAt": "2026-11-13T08:01:43Z",
+    "url": "https://github.com/xuzhougeng/WispPaper/pull/1"
+  }
+]

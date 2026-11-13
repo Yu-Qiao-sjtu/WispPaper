@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "snapshot": "snapshots/2026-11-13",
+  "totals": {
+    "prs": 57,
+    "issues": 21,
+    "added": 48045,
+    "deleted": 5608,
+    "hunks": 4246,
+    "files": 736
+  },
+  "statuses": {
+    "v0.6.0 已包含": 43,
+    "v0.6.0 后已合并": 12,
+    "未合并／提案": 2
+  },
+  "anchors": 31,
+  "all_text_lines_verified_against_git_blobs": true
+}

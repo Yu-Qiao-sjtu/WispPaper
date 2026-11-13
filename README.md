@@ -101,6 +101,7 @@ WISP_PAPER_HOME=/tmp/wisp-demo cargo run
 | [数据与隐私](docs/DATA.md) | 文件放在哪里，哪些数据会离开本机 |
 | [命令行与 MCP](docs/CLI.md) | `wisp` 的用法、工具一览、MCP 配置 |
 | [开发](docs/DEVELOPMENT.md) | 构建、测试、代码结构 |
+| [上游演进与 fork 构想追踪](docs/upstream/README.md) | 承接上游 #29，区分发布／合并／提案，定位每个 PR 的源码变更行 |
 
 ## 致谢
 

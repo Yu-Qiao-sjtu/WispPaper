@@ -1,0 +1,281 @@
+[
+  {
+    "id": "pdf-read",
+    "version": "release",
+    "path": "crates/core/src/fulltext.rs",
+    "needle": "pub fn file_pages(",
+    "lines": 43,
+    "title": "PDF 文本提取链路",
+    "finding": "先用 hayro 解释字形与布局，再回退 pdf-extract；加密、编码、解析、无文本层等失败分开报告。浏览器可选中文字不等于本解析器一定提取正确，也不是已接入 Doc2X。"
+  },
+  {
+    "id": "pdf-title",
+    "version": "release",
+    "path": "crates/core/src/pdftext.rs",
+    "needle": "pub fn title_guess(",
+    "lines": 28,
+    "title": "首页标题猜测",
+    "finding": "这是标题候选启发式，不能据此声称已从首页可靠提取全部作者和发表年份。"
+  },
+  {
+    "id": "metadata-api",
+    "version": "release",
+    "path": "crates/core/src/complete.rs",
+    "needle": "pub fn crossref_url(",
+    "lines": 20,
+    "title": "无标识符记录按题目查候选",
+    "finding": "Crossref、Europe PMC、arXiv API 生成候选；不是浏览器桥接。用户核对身份和字段后写回。"
+  },
+  {
+    "id": "metadata-write",
+    "version": "release",
+    "path": "src/app.rs",
+    "needle": "fn complete_apply(",
+    "lines": 45,
+    "title": "元数据人工接受与并发核对",
+    "finding": "定位实际应用候选的入口；原始记录变化、标识冲突等安全条件见完整 #44 diff。"
+  },
+  {
+    "id": "metadata-year",
+    "version": "release",
+    "path": "crates/core/src/lookup.rs",
+    "needle": "pub fn crossref_work(",
+    "lines": 45,
+    "title": "Crossref 年份的遗留限制",
+    "finding": "旧通用解析仍允许缺少发表日期时回退记录创建时间；该值不能保证是论文发表年份。"
+  },
+  {
+    "id": "pdf-zoom",
+    "version": "release",
+    "path": "src/pdf.rs",
+    "needle": "pub fn zoom_to(",
+    "lines": 23,
+    "title": "PDF 缩放",
+    "finding": "放大、缩小、指定比例和适应宽度等已经存在；不等价于已支持触控板双指缩放。"
+  },
+  {
+    "id": "pdf-locate-release",
+    "version": "release",
+    "path": "src/pdf.rs",
+    "needle": "pub fn find(",
+    "lines": 38,
+    "title": "原文引用定位（发布版）",
+    "finding": "已有页码与引句定位；因此后续需求应描述交互和定位准确性增强，而非从零新增。"
+  },
+  {
+    "id": "paper-notes",
+    "version": "release",
+    "path": "crates/core/src/ai.rs",
+    "needle": "pub fn note_from_answer(",
+    "lines": 22,
+    "title": "单篇问答转笔记",
+    "finding": "已可把回答、问题、来源整理成笔记；不等价于每篇论文拥有可开关、分层检索的独立知识库。"
+  },
+  {
+    "id": "custom-command",
+    "version": "release",
+    "path": "crates/core/src/ai.rs",
+    "needle": "pub fn read_input(",
+    "lines": 14,
+    "title": "自定义斜杠命令",
+    "finding": "模板展开为提示文本，内置命令优先；不是可执行 Skill、脚本运行环境或 wisp-science Skill 无缝兼容层。"
+  },
+  {
+    "id": "intent-queries",
+    "version": "release",
+    "path": "crates/core/src/retrieval.rs",
+    "needle": "pub fn queries_system(",
+    "lines": 9,
+    "title": "意图检索生成查询组",
+    "finding": "模型将用户段落／想表达的意思转成文献语言的 3–5 组术语、论述功能和同义表达；不是只做逐字翻译。"
+  },
+  {
+    "id": "intent-search",
+    "version": "release",
+    "path": "src/write_find.rs",
+    "needle": "pub fn write_find(",
+    "lines": 18,
+    "title": "写作检索入口",
+    "finding": "由选区／当前段落触发按需检索；进一步的查询生成、排名与候选上下文见该文件及 #47。"
+  },
+  {
+    "id": "ai-write",
+    "version": "release",
+    "path": "src/write_assist.rs",
+    "needle": "pub fn assist_start(",
+    "lines": 42,
+    "title": "AI 辅助写作",
+    "finding": "模型已参与改写、翻译、润色和自定义操作，接收文献候选例句并流式给出卡片预览。"
+  },
+  {
+    "id": "ai-accept",
+    "version": "release",
+    "path": "src/write_assist.rs",
+    "needle": "pub fn assist_use(",
+    "lines": 41,
+    "title": "AI 结果采纳",
+    "finding": "替换／插入是明确操作；需核对原文范围与快照，不应解读为后台自动覆盖整份稿件。"
+  },
+  {
+    "id": "citation",
+    "version": "release",
+    "path": "crates/core/src/cite.rs",
+    "needle": "pub fn convert_ai_citations(",
+    "lines": 35,
+    "title": "引用转换与定位信息",
+    "finding": "将原生文献标签转成稳定稿件引用键并保留页码；引用语法正确不能证明论据支持结论。"
+  },
+  {
+    "id": "citation-export",
+    "version": "release",
+    "path": "crates/core/src/cite.rs",
+    "needle": "pub fn reference_list(",
+    "lines": 23,
+    "title": "参考文献与 BibTeX",
+    "finding": "已有参考文献文本／Markdown、BibTeX 输出函数。尚不能据此认定已有完整 CSL 期刊样式系统或 Word 动态域。"
+  },
+  {
+    "id": "review-evidence",
+    "version": "release",
+    "path": "crates/core/src/review.rs",
+    "needle": "pub fn cited_evidence(",
+    "lines": 48,
+    "title": "从引用派生证据记录",
+    "finding": "v0.6.0 使用 #61 后的实现：提取相邻论断与引用并保存核对记录；不是 #59 的早期手工证据存储方案。"
+  },
+  {
+    "id": "review-validity",
+    "version": "release",
+    "path": "crates/core/src/review.rs",
+    "needle": "fn evidence_fingerprint(",
+    "lines": 38,
+    "title": "核对记录与来源变化",
+    "finding": "来源指纹及可用性参与核对状态；引句出现与是否支持论断分别处理，仍需人工判断。"
+  },
+  {
+    "id": "figure-library",
+    "version": "release",
+    "path": "crates/core/src/figure.rs",
+    "needle": "pub fn add_figure(",
+    "lines": 45,
+    "title": "图片库持久化",
+    "finding": "PDF 截图与元数据持久保存。图片库已经落地；截图收藏不等价于机制图生成或可编辑 PPTX。"
+  },
+  {
+    "id": "figure-caption",
+    "version": "release",
+    "path": "crates/core/src/figure.rs",
+    "needle": "pub fn caption(",
+    "lines": 25,
+    "title": "截图关联图注",
+    "finding": "按页面字形布局寻找图注；视觉模型结果仍须用户接受。复杂多栏、跨页图注仍需验证。"
+  },
+  {
+    "id": "find-pdf",
+    "version": "release",
+    "path": "crates/core/src/tools.rs",
+    "needle": "fn find_pdf(",
+    "lines": 44,
+    "title": "查找全文工具",
+    "finding": "已有标准文献来源下的查找全文入口。工具可用不代表已授权任意网页下载或保证获取全部文献。"
+  },
+  {
+    "id": "main-framework",
+    "version": "main",
+    "path": "crates/core/src/review.rs",
+    "needle": "pub fn framework_settled(",
+    "lines": 8,
+    "title": "综述范式确认",
+    "finding": "发布后 #71 增加已有综述框架的确认阶段，并保持旧记录兼容；v0.6.0 安装包不含这一提交。"
+  },
+  {
+    "id": "main-docx-read",
+    "version": "main",
+    "path": "crates/core/src/docx.rs",
+    "needle": "pub fn read(bytes: &[u8]) -> Result<Read>",
+    "lines": 32,
+    "title": "DOCX 解析",
+    "finding": "读取原始 OOXML 与段落／批注信息，编辑模型并非通用所见即所得 Word 引擎。"
+  },
+  {
+    "id": "main-docx-write",
+    "version": "main",
+    "path": "crates/core/src/docx.rs",
+    "needle": "pub fn rewrite(source:",
+    "lines": 84,
+    "title": "DOCX 保真写回与修订",
+    "finding": "对齐段落，保留未改 XML，改动处生成修订／批注。不能承诺全部公式、表格、图片和版式都可在编辑器中编辑或百分之百往返兼容。"
+  },
+  {
+    "id": "main-docx-export",
+    "version": "main",
+    "path": "src/manuscripts.rs",
+    "needle": "fn export_manuscript(",
+    "lines": 35,
+    "title": "稿件实际导出路径",
+    "finding": "正文 Markdown／DOCX 导出与引用列表函数是不同路径；不要因存在 cite::reference_list 就声称所有导出已自动附期刊格式参考文献。"
+  },
+  {
+    "id": "main-annotations",
+    "version": "main",
+    "path": "crates/core/src/annotation.rs",
+    "needle": "pub fn add_pdf_annotation(",
+    "lines": 27,
+    "title": "PDF 高亮／下划线／笔记",
+    "finding": "按论文、附件、页码、矩形与引文保存标记，源 PDF 不改写。"
+  },
+  {
+    "id": "main-annotation-tool",
+    "version": "main",
+    "path": "crates/core/src/tools.rs",
+    "needle": "fn list_pdf_annotations(",
+    "lines": 37,
+    "title": "助手读取 PDF 标记",
+    "finding": "只读工具读取标记；用户笔记需与论文原文区分，不能当作原文证据。"
+  },
+  {
+    "id": "main-page-highlight",
+    "version": "main",
+    "path": "src/pdf.rs",
+    "needle": "pub fn find(",
+    "lines": 43,
+    "title": "仅页码引用与异步定位修复",
+    "finding": "#73 区分页码边框与带引句的句子高亮，并阻止旧搜索结果覆盖新导航。"
+  },
+  {
+    "id": "main-fields",
+    "version": "main",
+    "path": "crates/core/src/tools.rs",
+    "needle": "fn suggest_field(",
+    "lines": 32,
+    "title": "自定义字段提取建议",
+    "finding": "助手提出字段候选，由用户接受后写入；不能据此声称模型直接改变筛选决定。"
+  },
+  {
+    "id": "main-append",
+    "version": "main",
+    "path": "crates/core/src/manuscript.rs",
+    "needle": "pub fn append_to_section(",
+    "lines": 18,
+    "title": "助手回答写入指定稿件段落",
+    "finding": "有持久化、引用键与快照边界；AI 写作能力已超出早期仅人工输入的定位。"
+  },
+  {
+    "id": "main-apparatus",
+    "version": "main",
+    "path": "crates/core/src/structure.rs",
+    "needle": "pub fn apparatus(",
+    "lines": 38,
+    "title": "候选语料过滤表格装置",
+    "finding": "#76 在入库／检索中过滤表格数字行及注释，提高语料质量；不是全新的 PDF 表格结构解析器。"
+  },
+  {
+    "id": "fork-writing",
+    "version": "fork",
+    "path": "docs/AI-WRITING.md",
+    "needle": "# 从中文意图寻找原句，以及从草稿出发的 AI 写作（本 fork）",
+    "lines": 8,
+    "title": "我们 fork 的 AI 写作基线",
+    "finding": "fork v0.5.0 与上游同名版本不是同一个版本；既有草稿生成、意图搜索和候选翻译需单独评估，不能按版本号自动判定已同步。"
+  }
+]
